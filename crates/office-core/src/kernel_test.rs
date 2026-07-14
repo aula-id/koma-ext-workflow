@@ -640,6 +640,54 @@ fn park_that_stucks_the_line_halts_the_project() {
 }
 
 #[test]
+fn draining_last_task_after_a_park_still_halts() {
+    // t1 and t2 are independent (no blocked_by between them), both mid-review.
+    // t1's reviewer fails over budget first -> Parked, but t2 is still Review
+    // (running) so check_halt at that moment sees the line as not-yet-stuck.
+    // t2's reviewer later passes -> Done. That drain must re-check halt: with
+    // t1 Parked and nothing left running, the line is now stuck and must Halt.
+    let mut t1 = task(
+        "t1",
+        TaskState::Review {
+            binding: Some(reviewer_binding(3, 0)),
+            attempt: 2,
+        },
+        0,
+        &[],
+    );
+    t1.bounces = 3; // already at budget
+    let t2 = task(
+        "t2",
+        TaskState::Review {
+            binding: Some(reviewer_binding(5, 0)),
+            attempt: 1,
+        },
+        0,
+        &[],
+    );
+    let mut p = project(ProjectPhase::Running, vec![t1, t2]);
+    p.config.bounce_budget = 3;
+
+    // t1's reviewer fails over budget -> park t1. t2 is still running, so no halt yet.
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_FAIL.into() }), 1000, 0);
+    assert!(matches!(
+        find_task(&p, "t1").state,
+        TaskState::Parked {
+            reason: ParkReason::ReviewBounceBudget,
+            ..
+        }
+    ));
+    assert!(matches!(p.phase, ProjectPhase::Running));
+
+    // t2's reviewer passes -> Done. Now t1 (Parked) is the only unfinished task
+    // and nothing is running: the line must be recognized as stuck and Halted.
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 5, text: REVIEW_PASS.into() }), 2000, 0);
+    assert!(matches!(find_task(&p, "t2").state, TaskState::Done { .. }));
+    assert!(matches!(p.phase, ProjectPhase::Halted { .. }));
+    assert!(fx.iter().any(|e| matches!(e, Effect::QueueChatPrompt { .. })));
+}
+
+#[test]
 fn a_ready_task_keeps_the_line_unstuck() {
     // Same as above but t3 is independently ready -> no halt after t1 parks.
     let mut p = project(

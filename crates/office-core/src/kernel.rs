@@ -573,6 +573,7 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
             p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
             ctx.dirty = true;
             maybe_complete_project(p, now_ms);
+            check_halt(p, now_ms, ctx);
         }
         Verdict::Fail | Verdict::Unparseable => {
             p.tasks[idx].bounces += 1;
