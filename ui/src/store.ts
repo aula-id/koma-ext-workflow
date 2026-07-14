@@ -1,6 +1,14 @@
 import { create } from 'zustand';
 import { Snapshot } from './bridge';
 
+export interface ProjectConfig {
+  maxWorkers?: number;
+  bounceBudget?: number;
+  workerModel?: string;
+  reviewerModel?: string;
+  keepDesks?: boolean;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -11,6 +19,7 @@ export interface Project {
   parkedCount?: number;
   lastNotice?: string;
   truncated?: boolean;
+  config?: ProjectConfig;
   [key: string]: any;
 }
 

@@ -5,6 +5,7 @@ import { bridge } from '../bridge';
 
 interface DashboardProps {
   onProjectClick?: (projectId: string) => void;
+  onSettings?: () => void;
 }
 
 const ProgressRing: React.FC<{
@@ -130,7 +131,7 @@ const HaltIndicator: React.FC<{ halted: boolean }> = ({ halted }) => {
   );
 };
 
-export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick }) => {
+export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings }) => {
   const { projects, snapshot } = useStore();
   const [haltedProjects, setHaltedProjects] = useState(0);
 
@@ -159,14 +160,30 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick }) => {
   return (
     <div className="min-h-screen p-6" style={{ backgroundColor: 'var(--wf-bg)' }}>
       <div className="max-w-7xl mx-auto">
-        <h1 className="text-3xl font-bold mb-2" style={{ color: 'var(--wf-fg)' }}>
-          Workflow
-        </h1>
-        <p className="text-sm mb-6" style={{ color: 'var(--wf-fg-secondary)' }}>
-          {projects.length === 0
-            ? 'No projects yet'
-            : `${projects.length} project${projects.length === 1 ? '' : 's'} active`}
-        </p>
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h1 className="text-3xl font-bold mb-2" style={{ color: 'var(--wf-fg)' }}>
+              Workflow
+            </h1>
+            <p className="text-sm" style={{ color: 'var(--wf-fg-secondary)' }}>
+              {projects.length === 0
+                ? 'No projects yet'
+                : `${projects.length} project${projects.length === 1 ? '' : 's'} active`}
+            </p>
+          </div>
+          {onSettings && (
+            <button
+              onClick={onSettings}
+              className="px-4 py-2 rounded transition-colors"
+              style={{
+                backgroundColor: 'var(--wf-bg-secondary)',
+                color: 'var(--wf-fg)',
+              }}
+            >
+              Settings
+            </button>
+          )}
+        </div>
 
         <HaltIndicator halted={globalHalted} />
 

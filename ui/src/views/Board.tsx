@@ -107,11 +107,12 @@ export function guardCardMove(state: TaskStateKey, to: ColumnKey, killWorker: bo
 export interface BoardProps {
   projectId: string;
   onBack?: () => void;
+  onSettings?: () => void;
 }
 
 type Tab = 'board' | 'drilldown' | 'depmap' | 'prd';
 
-export const Board: React.FC<BoardProps> = ({ projectId, onBack }) => {
+export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _onSettings }) => {
   const rawProject = useStore((s) => s.getProject(projectId));
   const project = rawProject as unknown as Project | undefined;
 
