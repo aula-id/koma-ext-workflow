@@ -66,7 +66,11 @@ pub fn root() -> PathBuf {
             return PathBuf::from(v);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    // HOME is unix; Windows uses USERPROFILE. Same tri-platform resolution order
+    // everywhere so the MCP writer and the daemon reader can never disagree.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".koma-workflow")
 }
 

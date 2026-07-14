@@ -10,9 +10,25 @@ mkdir -p dist
 
 echo "=== Building Workflow extension ==="
 
+# Tri-platform: build for the NATIVE platform by default, or a cross target via
+# `PACK_TARGET=<rust-triple> ./pack.sh` (e.g. x86_64-pc-windows-msvc — needs the
+# matching toolchain/linker installed). Windows binaries carry .exe INSIDE the
+# staging tree too, matching the manifest runtime.exec written below.
+PACK_TARGET="${PACK_TARGET:-}"
+TARGET_FLAG=""
+TARGET_DIR="target/release"
+if [ -n "$PACK_TARGET" ]; then
+  TARGET_FLAG="--target $PACK_TARGET"
+  TARGET_DIR="target/$PACK_TARGET/release"
+fi
+case "${PACK_TARGET:-$(uname -s)}" in
+  *windows*|*Windows*|MINGW*|MSYS*|CYGWIN*) BIN_EXT=".exe" ;;
+  *) BIN_EXT="" ;;
+esac
+
 # Build the Rust daemon + the MCP server (both shipped in the zip's bin/)
-echo "Building office-daemon + workflow-mcp (release)..."
-cargo build --release -p office-daemon -p workflow-mcp
+echo "Building office-daemon + workflow-mcp (release${PACK_TARGET:+, $PACK_TARGET})..."
+cargo build --release -p office-daemon -p workflow-mcp $TARGET_FLAG
 
 # Build the UI
 echo "Building UI..."
@@ -33,8 +49,8 @@ else
 fi
 
 manifest_src="manifest.json"
-binary_src="target/release/office-daemon"
-mcp_binary_src="target/release/workflow-mcp"
+binary_src="$TARGET_DIR/office-daemon$BIN_EXT"
+mcp_binary_src="$TARGET_DIR/workflow-mcp$BIN_EXT"
 
 # Create temp staging directory
 stage_dir=$(mktemp -d)
@@ -43,23 +59,23 @@ trap "rm -rf '$stage_dir'" EXIT
 # Create bin directory in staging
 mkdir -p "$stage_dir/bin"
 
-# Copy and modify manifest.json
+# Copy and modify manifest.json (runtime.exec carries .exe on a windows target)
 if [ "$JSON_TOOL" = "jq" ]; then
-  jq ".runtime.exec = \"bin/office-daemon\"" "$manifest_src" > "$stage_dir/manifest.json"
+  jq ".runtime.exec = \"bin/office-daemon$BIN_EXT\"" "$manifest_src" > "$stage_dir/manifest.json"
 else
   python3 -c "
 import json
 with open('$manifest_src', 'r') as f:
   data = json.load(f)
-data['runtime']['exec'] = 'bin/office-daemon'
+data['runtime']['exec'] = 'bin/office-daemon$BIN_EXT'
 with open('$stage_dir/manifest.json', 'w') as f:
   json.dump(data, f, indent=2)
 "
 fi
 
 # Copy release binaries (the daemon + the MCP server, side by side in bin/)
-cp "$binary_src" "$stage_dir/bin/office-daemon"
-cp "$mcp_binary_src" "$stage_dir/bin/workflow-mcp"
+cp "$binary_src" "$stage_dir/bin/office-daemon$BIN_EXT"
+cp "$mcp_binary_src" "$stage_dir/bin/workflow-mcp$BIN_EXT"
 
 # Copy the UI dist folder
 cp -r "ui/dist" "$stage_dir/ui"
