@@ -191,11 +191,33 @@ impl Store {
         self.state_dir(slug).join("lease.json")
     }
 
+    /// Path to a project's `state.json.lock` — the advisory flock every state.json writer
+    /// (holder persists AND non-holder comment adds) contends on (4.4).
+    fn lock_path(&self, slug: &str) -> PathBuf {
+        self.state_dir(slug).join("state.json.lock")
+    }
+
     // -- state.json ----------------------------------------------------------
 
     /// Atomically write ONLY `state.json` for a project. Does not touch the registry.
     /// Exposed so the driver (and tests) can model the create/archive ordering precisely.
+    ///
+    /// Takes the SAME advisory `flock` on `state.json.lock` that `with_state_lock` uses, so
+    /// the lease holder's persists contend with a non-holder's flock'd comment adds (4.4).
+    /// Without this the lock is one-sided and enforces nothing: a holder rename could land
+    /// inside a non-holder's locked window and silently clobber a committed update.
     pub fn put_state(&self, p: &Project) -> io::Result<()> {
+        let slug = p.id.0.as_str();
+        fs::create_dir_all(self.state_dir(slug))?;
+        let lock = File::create(self.lock_path(slug))?;
+        lock.lock()?; // symmetric advisory flock; released when `lock` drops (end of fn)
+        self.put_state_inner(p)
+    }
+
+    /// Serialize + atomically write `state.json` WITHOUT taking the advisory flock. Callers
+    /// that ALREADY hold `state.json.lock` (`with_state_lock`) use this to avoid re-locking
+    /// the same path from the same process, which would self-deadlock.
+    fn put_state_inner(&self, p: &Project) -> io::Result<()> {
         let slug = p.id.0.as_str();
         fs::create_dir_all(self.state_dir(slug))?;
         let sf = StateFile {
@@ -419,13 +441,13 @@ impl Store {
         F: FnOnce(&mut Project) -> R,
     {
         fs::create_dir_all(self.state_dir(slug))?;
-        let lock_path = self.state_dir(slug).join("state.json.lock");
-        let lock = File::create(&lock_path)?;
+        let lock = File::create(self.lock_path(slug))?;
         lock.lock()?; // exclusive advisory flock; released when `lock` drops
         let bytes = fs::read(self.state_path(slug))?;
         let mut project = parse_state(&bytes)?;
         let r = f(&mut project);
-        self.put_state(&project)?;
+        // Already holding the flock — use the un-locked writer to avoid a self-deadlock.
+        self.put_state_inner(&project)?;
         Ok(r)
     }
 }

@@ -284,6 +284,76 @@ fn load_all_keeps_already_registered_projects() {
 }
 
 // ---------------------------------------------------------------------------
+// symmetric flock (ARCHITECTURE.md 4.4): the lease holder's put_state must contend
+// on the SAME state.json.lock a non-holder's with_state_lock takes. Otherwise the lock
+// is one-sided and a holder rename can land inside a non-holder's locked window,
+// silently clobbering a committed update (the two-session lease safety scenario).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn holder_put_state_serializes_with_non_holder_lock() {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let (_dir, store) = store();
+    let mut v1 = project("race");
+    v1.seq = 1;
+    store.save_project(&v1).unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+
+    // Non-holder B: takes the flock, reads v1, then (once released) adds a comment and
+    // persists v1+comment. It holds the flock for the WHOLE window between the two signals.
+    let b_store = store.clone();
+    let b = thread::spawn(move || {
+        b_store
+            .with_state_lock("race", |p| {
+                entered_tx.send(()).unwrap(); // flock held, v1 loaded
+                proceed_rx.recv().unwrap(); // stay inside the locked window until released
+                p.tasks[0].comments.push(Comment {
+                    id: CommentId(1),
+                    author: CommentAuthor::User,
+                    text: "late comment".to_string(),
+                    created_ms: 42,
+                    receipt: Receipt::Pending,
+                });
+            })
+            .unwrap();
+    });
+
+    // Wait until B holds the flock and has read v1.
+    entered_rx.recv().unwrap();
+
+    // Holder A: persist v2 (task Done). With a symmetric flock this BLOCKS until B releases,
+    // so A writes last from its own truth. Without the flock A writes immediately and B's
+    // later rename clobbers v2 — A's committed completion is silently lost.
+    let a_store = store.clone();
+    let mut v2 = v1.clone();
+    v2.seq = 2;
+    v2.tasks[0].state = TaskState::Done { at_ms: 99 };
+    let a = thread::spawn(move || {
+        a_store.put_state(&v2).unwrap();
+    });
+
+    // Give A time to reach (and, once fixed, block on) the flock, then release B.
+    thread::sleep(Duration::from_millis(200));
+    proceed_tx.send(()).unwrap();
+
+    b.join().unwrap();
+    a.join().unwrap();
+
+    // A's committed persist must survive: the two writers serialized on the shared flock.
+    let final_state = store.load_project("race").unwrap();
+    assert_eq!(final_state.seq, 2, "holder's committed persist was clobbered (one-sided flock)");
+    assert!(
+        matches!(final_state.tasks[0].state, TaskState::Done { .. }),
+        "holder's task-done state was lost to a concurrent non-holder comment add",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // prd mirror
 // ---------------------------------------------------------------------------
 
