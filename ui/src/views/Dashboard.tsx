@@ -59,15 +59,16 @@ const ProjectCard: React.FC<{
   onClick?: () => void;
 }> = ({ project, onClick }) => {
   const phaseColors: Record<string, string> = {
-    Drafting: 'bg-gray-600',
-    Ready: 'bg-blue-600',
-    Running: 'bg-green-600',
-    Interrupted: 'bg-yellow-600',
-    Halted: 'bg-red-600',
-    Done: 'bg-green-800',
+    drafting: 'bg-gray-600',
+    ready: 'bg-blue-600',
+    running: 'bg-green-600',
+    interrupted: 'bg-yellow-600',
+    halted: 'bg-red-600',
+    done: 'bg-green-800',
   };
 
-  const phaseColor = phaseColors[project.phase] || 'bg-gray-600';
+  const phaseKind = project.phase.kind;
+  const phaseColor = phaseColors[phaseKind] || 'bg-gray-600';
 
   return (
     <motion.div
@@ -83,9 +84,9 @@ const ProjectCard: React.FC<{
         <div className="flex-1">
           <h3 className="text-lg font-semibold text-white truncate">{project.name}</h3>
           <span
-            className={`inline-block mt-1 px-2 py-1 text-xs font-semibold rounded ${phaseColor} text-white`}
+            className={`inline-block mt-1 px-2 py-1 text-xs font-semibold rounded ${phaseColor} text-white capitalize`}
           >
-            {project.phase}
+            {phaseKind}
           </span>
         </div>
         <div className="ml-2">
@@ -151,7 +152,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
   }, []);
 
   useEffect(() => {
-    const halted = projects.filter((p) => p.phase === 'Halted').length;
+    const halted = projects.filter((p) => p.phase.kind === 'halted').length;
     setHaltedProjects(halted);
   }, [projects]);
 

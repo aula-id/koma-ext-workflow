@@ -9,10 +9,19 @@ export interface ProjectConfig {
   keepDesks?: boolean;
 }
 
+/** Project lifecycle phase, per docs/PANEL_PROTOCOL.md 2.1 and office-core
+ * digest.rs `phase_value`: serialized as an object `{ kind, reason?, atMs? }`
+ * with a lowercase `kind`, never a bare string. */
+export interface ProjectPhase {
+  kind: 'drafting' | 'ready' | 'running' | 'interrupted' | 'halted' | 'done';
+  reason?: string;
+  atMs?: number;
+}
+
 export interface Project {
   id: string;
   name: string;
-  phase: 'Drafting' | 'Ready' | 'Running' | 'Interrupted' | 'Halted' | 'Done';
+  phase: ProjectPhase;
   taskCount?: number;
   doneCount?: number;
   runningCount?: number;
@@ -21,6 +30,19 @@ export interface Project {
   truncated?: boolean;
   config?: ProjectConfig;
   [key: string]: any;
+}
+
+/** Coerce a snapshot's `phase` into the frozen object shape. The daemon always
+ * sends `{ kind, reason?, atMs? }`; this also defends against a missing/legacy
+ * bare-string phase so consumers can safely read `phase.kind`. */
+function normalizePhase(raw: any): ProjectPhase {
+  if (raw && typeof raw === 'object' && typeof raw.kind === 'string') {
+    return raw as ProjectPhase;
+  }
+  if (typeof raw === 'string' && raw) {
+    return { kind: raw.toLowerCase() as ProjectPhase['kind'] };
+  }
+  return { kind: 'drafting' };
 }
 
 interface StoreState {
@@ -41,7 +63,7 @@ export const useStore = create<StoreState>((set, get) => ({
         ...p,
         id: p.id || p.projectId || `project-${Math.random()}`,
         name: p.name || 'Untitled Project',
-        phase: p.phase || 'Drafting',
+        phase: normalizePhase(p.phase),
         taskCount: p.tasks ? p.tasks.length : 0,
         doneCount: p.tasks ? p.tasks.filter((t: any) => t.state?.Done).length : 0,
         runningCount: p.tasks ? p.tasks.filter((t: any) => t.state?.OnProgress).length : 0,

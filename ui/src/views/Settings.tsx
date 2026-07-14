@@ -246,7 +246,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                     }}
                   >
                     <div className="font-semibold text-sm">{project.name}</div>
-                    <div className="text-xs opacity-70">{project.phase}</div>
+                    <div className="text-xs opacity-70 capitalize">{project.phase.kind}</div>
                   </button>
                 ))}
               </div>
