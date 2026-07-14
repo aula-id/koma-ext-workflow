@@ -722,6 +722,28 @@ The driver polls the inbox each tick (1s), consumes files (move to
 model's file tools are allowed to do, so this works identically in TUI and GUI. It is
 ugly and it is documented as the host-API workaround it is.
 
+**MCP front door (`workflow-mcp`).** The extension also ships a second binary, a stdio MCP
+server registered in koma's `mcp_servers`, so the model can reach the office through TYPED
+tools (`mcp__workflow__workflow_brief`/`_status`/`_authorize`/`_comment`/`_interrupt`/
+`_resume`) instead of hand-writing files. The command tools do NOT open their own channel to
+the daemon — they write the SAME `{ "op": ... }` inbox files this section describes, via the
+shared `office_core::inboxmsg` builders, so the whole pipeline, ack path, and durability are
+reused unchanged (a cross-crate roundtrip test pins the builders to the parser).
+`workflow_status` instead reads the store directly and returns a plain-text digest inline,
+never writing.
+
+Because an MCP call has no workspace in scope, `workflow-mcp` resolves its inbox in order —
+an explicit `workspace` arg, `$WORKFLOW_WORKSPACE`, the cwd if it already holds a
+`koma-workflow/` dir, else a GLOBAL inbox at `~/.koma-workflow/inbox` (alongside the state
+root, so `$WORKFLOW_HOME` is honored and the writer and reader always agree). The driver polls
+this global inbox each tick IN ADDITION to the per-workspace inbox, with OWNERSHIP-AWARE
+claiming: because the global inbox is shared across every koma instance, a poller claims only
+files addressed to a project it owns (a brief with an absent/unknown project id mints locally;
+a comment resolves ownership via the task's `<project>/...` prefix; authorize/interrupt/resume
+via the project id), leaves everything else in place for the owning instance, and makes the
+claim race-safe by treating the atomic rename into `processed/`/`rejected/` as the claim (the
+race loser's rename fails and is skipped silently). The per-workspace inbox path is unchanged.
+
 ### 6.5 `chat.prompt` discipline (office speaks up)
 
 Notices (`project done`, `task parked`, `line halted`, `office needs a human`) go through

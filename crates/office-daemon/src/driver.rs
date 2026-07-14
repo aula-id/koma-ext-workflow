@@ -351,6 +351,7 @@ impl<H: Host> Driver<H> {
             self.last_reconcile_ms = now_ms;
         }
         self.poll_inbox(now_ms);
+        self.poll_global_inbox(now_ms);
         for i in self.owned_running_indices() {
             self.step(i, kernel::Input::Host(kernel::HostEvent::Tick), now_ms);
         }
@@ -552,6 +553,109 @@ impl<H: Host> Driver<H> {
                 }
             }
         }
+    }
+
+    /// Poll the GLOBAL inbox (`<state-root>/inbox`) — the dir the `workflow-mcp` server
+    /// writes to when no workspace is in scope — with ownership-aware, race-safe claiming.
+    /// Runs AFTER `poll_inbox` in the tick, so the per-workspace inbox behavior above is
+    /// untouched. Because the global inbox is SHARED across every koma instance, this
+    /// instance claims only files addressed to a project it OWNS — plus new/unknown-project
+    /// briefs (which it mints locally) and undeterminable-malformed files (which it rejects)
+    /// — and LEAVES everything else in place for the owning instance. Claimed files are
+    /// routed through the same `handle_command` + `chat.prompt` acknowledgement path as the
+    /// workspace inbox. Independent of `self.workspace`, so it works pre-bootstrap too.
+    fn poll_global_inbox(&mut self, now_ms: u64) {
+        let dir = self.store.root_dir().join("inbox");
+        // The registry lets `global_claim` tell an UNKNOWN project id (a brief may mint it)
+        // from a KNOWN one owned by a DIFFERENT instance (leave it). Snapshot it once.
+        let known: std::collections::HashSet<String> = self
+            .store
+            .registry()
+            .map(|rows| rows.into_iter().map(|r| r.project_id).collect())
+            .unwrap_or_default();
+
+        // The ownership predicate borrows `self` immutably; it (and its borrow) is dropped
+        // when `poll_global` returns, before the mutable `handle_command` loop below.
+        let outcomes = inbox::poll_global(&dir, inbox::MAX_FILES_PER_TICK, |target| {
+            self.global_claim(target, &known)
+        });
+
+        for outcome in outcomes {
+            match outcome {
+                InboxOutcome::Accepted { command, ack, .. } => {
+                    self.handle_command(command, now_ms);
+                    self.host.call("chat.prompt", json!({ "text": ack }));
+                }
+                InboxOutcome::Rejected { file, reason } => {
+                    self.host.call(
+                        "chat.prompt",
+                        json!({ "text": format!("workflow: could not process {file}: {reason}") }),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The ownership verdict for a global-inbox file's peeked [`inbox::Target`]. Owner-only
+    /// for project/task-addressed ops (`authorize`/`interrupt`/`resume`/`comment`); a brief
+    /// with an absent or registry-UNKNOWN project is claimable by anyone (it mints locally);
+    /// an undeterminable target is claimable (to reject). `known` is the set of project ids
+    /// in the registry, used to distinguish an unknown project (mintable) from one owned by
+    /// a DIFFERENT instance (leave it). Read-only over `self` so it can be the `poll_global`
+    /// predicate closure.
+    fn global_claim(
+        &self,
+        target: &inbox::Target,
+        known: &std::collections::HashSet<String>,
+    ) -> inbox::Claim {
+        use inbox::{Claim, Target};
+        match target {
+            Target::Brief { project } => match project {
+                // No id: a "get started" brief -> mint locally, claimable by anyone.
+                None => Claim::Claim,
+                Some(id) => {
+                    if self.owned_project_by_id(id).is_some() {
+                        Claim::Claim // we own it: continue the conversation
+                    } else if known.contains(id) {
+                        Claim::Leave // known but owned elsewhere: leave for that instance
+                    } else {
+                        Claim::Claim // unknown project id: mint locally
+                    }
+                }
+            },
+            Target::Project { project } => match project {
+                // Project-less op is only ever `status` (a global no-op query); let the
+                // rename race pick a single claimant. A project-less authorize/interrupt/
+                // resume also lands here, but `parse` rejects it (undeterminable-target
+                // reject), which any instance may do.
+                None => Claim::Claim,
+                Some(id) => {
+                    if self.owned_project_by_id(id).is_some() {
+                        Claim::Claim
+                    } else {
+                        Claim::Leave
+                    }
+                }
+            },
+            // A comment is owner-only, resolved via the task's project prefix.
+            Target::Task { task } => {
+                if self.owns_task_project(task) {
+                    Claim::Claim
+                } else {
+                    Claim::Leave
+                }
+            }
+            // Undeterminable target (unreadable / not JSON / no op): any instance may reject.
+            Target::Unknown => Claim::Claim,
+        }
+    }
+
+    /// Whether this instance owns the project a task id belongs to. A task id is the full
+    /// hierarchical `<project>/<epic>/<story>/<task>` (kernel.rs `desk_dir` docs), so the
+    /// project is the segment before the first `/`.
+    fn owns_task_project(&self, task: &str) -> bool {
+        let project = task.split('/').next().unwrap_or("");
+        !project.is_empty() && self.owned_project_by_id(project).is_some()
     }
 
     // -- event routing ------------------------------------------------------

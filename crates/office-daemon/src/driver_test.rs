@@ -811,3 +811,74 @@ fn project_create_dedupes_colliding_slugs() {
     assert!(d.project("same-name-2").is_some(), "second create must not clobber the first");
     assert_eq!(d.projects.len(), 2, "both projects exist independently");
 }
+
+// ---------------------------------------------------------------------------
+// global inbox: ownership-aware claiming (shared ~/.koma-workflow/inbox)
+// ---------------------------------------------------------------------------
+
+fn write_global_file(store: &Store, name: &str, body: &str) {
+    let dir = store.root_dir().join("inbox");
+    std::fs::create_dir_all(&dir).expect("create global inbox");
+    std::fs::write(dir.join(name), body).expect("write global inbox file");
+}
+
+#[test]
+fn global_inbox_claims_file_for_owned_project() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    d.insert_for_test(project("mine", ProjectPhase::Running, vec![]), 1_000);
+    assert!(d.holds_lease("mine"));
+
+    write_global_file(&d.store, "1-resume.json", r#"{"op":"resume","project":"mine"}"#);
+    d.poll_global_inbox(2_000);
+
+    // Consumed into processed/, and an acknowledgement chat.prompt was sent.
+    let inbox = d.store.root_dir().join("inbox");
+    assert!(inbox.join("processed").join("1-resume.json").exists());
+    assert!(!inbox.join("1-resume.json").exists());
+    assert!(call_count(&d.host, "chat.prompt") >= 1, "an ack is sent for a claimed file");
+}
+
+#[test]
+fn global_inbox_leaves_file_for_unowned_project() {
+    let (store, _dir) = temp_store();
+    // "other" is in the store (registry) but this driver never acquires its lease, so it
+    // is owned by no one here — it must be left for the instance that does own it.
+    store
+        .save_project(&project("other", ProjectPhase::Running, vec![]))
+        .expect("seed other");
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    assert!(!d.holds_lease("other"), "we must not own 'other'");
+
+    write_global_file(&d.store, "1-resume.json", r#"{"op":"resume","project":"other"}"#);
+    d.poll_global_inbox(2_000);
+
+    // Left in place; no ack for a file we did not claim.
+    let inbox = d.store.root_dir().join("inbox");
+    assert!(inbox.join("1-resume.json").exists(), "an unowned file is left in place");
+    assert!(!inbox.join("processed").join("1-resume.json").exists());
+    assert_eq!(call_count(&d.host, "chat.prompt"), 0);
+}
+
+#[test]
+fn global_inbox_claims_unknown_project_brief_and_mints_locally() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+
+    // No projects owned or known. A brief naming a brand-new project id is claimable by
+    // anyone (it is not owned elsewhere) and mints a fresh Drafting project locally.
+    write_global_file(
+        &d.store,
+        "1-brief.json",
+        r#"{"op":"brief","project":"brandnew","message":"build a thing"}"#,
+    );
+    d.poll_global_inbox(2_000);
+
+    assert!(d.project("brandnew").is_some(), "an unknown-project brief mints locally");
+    let inbox = d.store.root_dir().join("inbox");
+    assert!(inbox.join("processed").join("1-brief.json").exists());
+    assert!(call_count(&d.host, "chat.prompt") >= 1);
+}

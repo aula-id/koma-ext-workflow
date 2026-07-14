@@ -34,7 +34,7 @@ unzip -q "$ZIP_FILE" -d "$INSTALL_DIR"
 echo "Extension files extracted."
 
 # Verify the installation
-if [ ! -f "$INSTALL_DIR/manifest.json" ] || [ ! -f "$INSTALL_DIR/bin/office-daemon" ] || [ ! -f "$INSTALL_DIR/ui/index.html" ]; then
+if [ ! -f "$INSTALL_DIR/manifest.json" ] || [ ! -f "$INSTALL_DIR/bin/office-daemon" ] || [ ! -f "$INSTALL_DIR/bin/workflow-mcp" ] || [ ! -f "$INSTALL_DIR/ui/index.html" ]; then
   echo "Error: Installation verification failed. Missing required files."
   exit 1
 fi
@@ -69,7 +69,52 @@ if [ -f "$CONFIG_FILE" ]; then
       "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
     mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 
-    echo "Configuration updated."
+    # Also register the MCP server (workflow-mcp) in `.mcp_servers` so koma's MCP client
+    # spawns it and advertises its tools as mcp__workflow__workflow_*. `mcp_servers` is an
+    # ARRAY of McpServerEntry (koma src-agent/src/model/app_config.rs):
+    # uuid/name/enabled/transport/command/args/env/url, transport serde wire value "stdio".
+    # Upsert by name "workflow", preserving an existing entry's uuid when present (mirrors
+    # the installed_extensions upsert above).
+    MCP_CMD="$INSTALL_DIR/bin/workflow-mcp"
+    MCP_UUID=$(jq -r '(.mcp_servers // []) | map(select(.name == "workflow")) | (.[0].uuid // empty)' "$CONFIG_FILE")
+    if [ -z "$MCP_UUID" ]; then
+      if command -v uuidgen &> /dev/null; then
+        MCP_UUID=$(uuidgen)
+      elif command -v python3 &> /dev/null; then
+        MCP_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
+      fi
+    fi
+
+    if [ -n "$MCP_UUID" ]; then
+      MCP_ENTRY=$(jq -cn --arg uuid "$MCP_UUID" --arg cmd "$MCP_CMD" '{
+        uuid: $uuid,
+        name: "workflow",
+        enabled: true,
+        transport: "stdio",
+        command: $cmd,
+        args: [],
+        env: [],
+        url: ""
+      }')
+    else
+      # No uuid tool available: omit uuid and let koma mint one (serde default new_uuid).
+      MCP_ENTRY=$(jq -cn --arg cmd "$MCP_CMD" '{
+        name: "workflow",
+        enabled: true,
+        transport: "stdio",
+        command: $cmd,
+        args: [],
+        env: [],
+        url: ""
+      }')
+    fi
+
+    jq --argjson entry "$MCP_ENTRY" \
+      '.mcp_servers = ((.mcp_servers // []) | map(select(.name != $entry.name))) + [$entry]' \
+      "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+
+    echo "Configuration updated (extension registry + MCP server)."
   else
     echo "Warning: jq not found. Please manually add the following to ~/.koma/config.json:"
     echo "  \"installed_extensions\": {"

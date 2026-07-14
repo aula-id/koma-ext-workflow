@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/office-core", "crates/office-store", "crates/office-daemon"]
+members = ["crates/office-core", "crates/office-store", "crates/office-daemon", "crates/workflow-mcp"]
 resolver = "2"
 
 [workspace.package]

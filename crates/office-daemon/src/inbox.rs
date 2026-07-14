@@ -203,6 +203,151 @@ fn opt_str_field(v: &Value, key: &str) -> Option<String> {
     str_field(v, key)
 }
 
+// ---------------------------------------------------------------------------
+// Global inbox: ownership-aware, race-safe claiming (ARCHITECTURE.md 6.4)
+// ---------------------------------------------------------------------------
+//
+// The workspace inbox above is per-session: exactly one daemon owns a given
+// `<workspace>/koma-workflow/inbox`, so `poll` may consume every file it finds. The GLOBAL
+// inbox (`~/.koma-workflow/inbox`, where the `workflow-mcp` server drops files when no
+// workspace is in scope) is SHARED across every koma instance, so a poller must claim only
+// the files addressed to a project IT owns and leave the rest for the owning instance —
+// and the claim must be race-safe against another process claiming the same file. The
+// `poll_global` function below is that additive sibling of `poll`; the workspace path
+// (`poll`/`consume_one`/`move_to`) is left byte-for-byte unchanged.
+
+/// The addressed target of an inbox file, extracted by a cheap peek (this does NOT fully
+/// validate — that stays [`parse`]'s job). Used only by [`poll_global`]: the target decides
+/// WHICH instance may consume a file; the subsequent `parse` decides accept vs reject.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    /// A `brief`: `project` is the addressed id (`None` = start a new project).
+    Brief { project: Option<String> },
+    /// A project-addressed op (`authorize`/`interrupt`/`resume`/`status`): the `project`
+    /// id (`status` may legitimately carry `None` = a global query).
+    Project { project: Option<String> },
+    /// A `comment` addressed to a task id (ownership resolves via the task's project prefix).
+    Task { task: String },
+    /// No determinable target: unreadable, not JSON, no `op`, an unknown op, or an op whose
+    /// required addressing field is absent. Any instance may claim such a file to reject it.
+    Unknown,
+}
+
+/// Peek at an inbox file body's addressed [`Target`] for the global-inbox ownership
+/// decision. Tolerant and allocation-cheap: anything it cannot classify is [`Target::Unknown`].
+pub fn peek_target(text: &str) -> Target {
+    let value: Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return Target::Unknown,
+    };
+    if !value.is_object() {
+        return Target::Unknown;
+    }
+    match value.get("op").and_then(Value::as_str) {
+        Some("brief") => Target::Brief {
+            project: opt_str_field(&value, "project"),
+        },
+        Some("authorize") | Some("interrupt") | Some("resume") | Some("status") => Target::Project {
+            project: opt_str_field(&value, "project"),
+        },
+        Some("comment") => match opt_str_field(&value, "task") {
+            Some(task) => Target::Task { task },
+            None => Target::Unknown,
+        },
+        _ => Target::Unknown,
+    }
+}
+
+/// The ownership verdict a [`poll_global`] caller returns for a peeked [`Target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// Consume it here: process if it parses, reject (with an `.error` sidecar) if malformed.
+    Claim,
+    /// Leave it in place for the instance that owns the addressed project.
+    Leave,
+}
+
+/// Poll a GLOBAL inbox with ownership-aware, race-safe claiming. For each `*.json` file
+/// (filename-sorted, capped at `max_files`): peek its [`Target`], and ask `owns` whether
+/// this instance may consume it. A [`Claim::Leave`] file is left untouched for its owner.
+/// A [`Claim::Claim`] file is consumed by ATOMICALLY renaming it into `processed/` (parsed
+/// OK) or `rejected/` (malformed) — the rename IS the claim, so if a racing instance
+/// already moved the file, this rename fails and the file is skipped silently (no outcome,
+/// no panic). Returns one outcome per file THIS instance actually claimed.
+pub fn poll_global<F>(inbox_dir: &Path, max_files: usize, owns: F) -> Vec<InboxOutcome>
+where
+    F: Fn(&Target) -> Claim,
+{
+    let mut out = Vec::new();
+
+    let entries = match fs::read_dir(inbox_dir) {
+        Ok(rd) => rd,
+        Err(_) => return out, // no global inbox yet: nothing to do
+    };
+
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+
+    for path in files.into_iter().take(max_files) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed.json")
+            .to_string();
+
+        // An unreadable file has an undeterminable target (Unknown) -> claimable-to-reject.
+        let text = fs::read_to_string(&path).ok();
+        let target = match &text {
+            Some(t) => peek_target(t),
+            None => Target::Unknown,
+        };
+        if owns(&target) == Claim::Leave {
+            continue; // addressed to a project another instance owns: leave in place
+        }
+
+        // Claimable. Re-parse (full validation) to decide processed vs rejected, then let
+        // the atomic rename be the actual claim.
+        let parsed = match &text {
+            Some(t) => parse(t, &name),
+            None => Err(format!("could not read file: {name}")),
+        };
+        match parsed {
+            Ok((command, ack)) => {
+                if claim_move(inbox_dir, &path, PROCESSED_DIR, &name) {
+                    out.push(InboxOutcome::Accepted { file: name, command, ack });
+                }
+                // else: lost the claim race -> skip silently
+            }
+            Err(reason) => {
+                if claim_move(inbox_dir, &path, REJECTED_DIR, &name) {
+                    write_error_note(inbox_dir, &name, &reason);
+                    out.push(InboxOutcome::Rejected { file: name, reason });
+                }
+                // else: lost the claim race -> skip silently
+            }
+        }
+    }
+
+    out
+}
+
+/// Atomic claim: ensure `sub/` exists, then rename the file into it. Returns whether THIS
+/// call won (the rename succeeded). A failure means a racing instance already claimed the
+/// file (its source is gone) or the destination slot is unusable — either way the caller
+/// skips it silently. Distinct from [`move_to`] (the workspace path's best-effort move,
+/// which must stay byte-for-byte unchanged): here the rename result IS the claim signal.
+fn claim_move(inbox_dir: &Path, path: &Path, sub: &str, name: &str) -> bool {
+    let dest_dir = inbox_dir.join(sub);
+    if fs::create_dir_all(&dest_dir).is_err() {
+        return false;
+    }
+    fs::rename(path, dest_dir.join(name)).is_ok()
+}
+
 #[cfg(test)]
 #[path = "inbox_test.rs"]
 mod inbox_test;

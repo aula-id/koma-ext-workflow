@@ -15,9 +15,10 @@ This guide covers local development, testing, and deployment of the Workflow ext
     BUILD_WAVES.md            # Wave-by-wave implementation plan
     PANEL_PROTOCOL.md         # Frozen panel message protocol
   crates/
-    office-core/              # Pure domain + kernel (no IO)
+    office-core/              # Pure domain + kernel (no IO) + inbox-command builders
     office-store/             # Durable store + lease
     office-daemon/            # The shipped binary (daemon kind)
+    workflow-mcp/             # Stdio MCP server: typed tools over the inbox pipeline
   ui/                         # React 19 + TS + Tailwind + Vite
 ```
 
@@ -42,6 +43,7 @@ cd /media/wangsa/project-x/agentic-kanban
 This produces `dist/workflow.zip` containing:
 - `manifest.json` with runtime.exec pointing to `bin/office-daemon`
 - `bin/office-daemon` (release binary)
+- `bin/workflow-mcp` (release binary; the stdio MCP server)
 - `ui/` (Vite-built dashboard)
 
 ### Building Individual Crates
@@ -96,6 +98,43 @@ To install the extension into your local koma for testing:
 ```
 
 After installation, the extension state root is at `~/.koma-workflow/` (outside the install dir, so upgrades don't wipe state).
+
+`dev-install.sh` also upserts an `.mcp_servers` entry (name `workflow`) into `~/.koma/config.json` pointing at `bin/workflow-mcp`, preserving an existing entry's `uuid`.
+
+## MCP tools
+
+Alongside the daemon, the extension ships a second binary, `bin/workflow-mcp`: a stdio MCP
+server that is a TYPED FRONT DOOR to the office. Because `dev-install.sh` registers it under
+`.mcp_servers`, koma's MCP client spawns it and advertises its tools to the model as
+`mcp__workflow__workflow_*` — usable even in `--daemon` sessions where contributed tools are
+invisible.
+
+Six tools:
+
+- `workflow_brief { message, project?, workspace? }` — start/continue the PRD conversation; a new/unknown project id mints a project.
+- `workflow_status { project? }` — READ-ONLY board digest, returned inline (never writes).
+- `workflow_authorize { project, delivery_path, workspace? }` — approve the PRD, start the line.
+- `workflow_comment { task, text, workspace? }` — comment on a task.
+- `workflow_interrupt { project, hard?, workspace? }` — interrupt (`hard` default true).
+- `workflow_resume { project, workspace? }` — resume an interrupted project.
+
+The five COMMAND tools don't talk to the daemon directly: they write a JSON file into the
+SAME file inbox the daemon already consumes (ARCHITECTURE.md 6.4) using the shared
+`office_core::inboxmsg` builders, so acks and replies come back as CHAT NOTICES, not in the
+tool result. `workflow_status` reads the store directly and returns the digest inline.
+
+Inbox directory resolution for a command tool (first match wins):
+
+1. an explicit `workspace` tool arg → `<ws>/koma-workflow/inbox`
+2. `$WORKFLOW_WORKSPACE` → `<env>/koma-workflow/inbox`
+3. the process cwd IF it already has a `koma-workflow/` dir → `<cwd>/koma-workflow/inbox`
+4. the global fallback → `~/.koma-workflow/inbox`
+
+Files are named `<unix-millis>-<counter>-mcp.json`. The daemon polls BOTH the per-workspace
+inbox and (added with this server) the global `~/.koma-workflow/inbox`; on the global inbox it
+claims only files addressed to a project it owns — plus new-project briefs (mint locally) and
+undeterminable-malformed files — and leaves everything else for the owning instance, with a
+race-safe atomic-rename claim.
 
 ## Demo Mode (No Live koma)
 

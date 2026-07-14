@@ -1,0 +1,26 @@
+[package]
+name = "workflow-mcp"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "workflow-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# rmcp 1.8 SERVER side + stdio transport. koma's MCP client is the same crate/version
+# (src-agent/Cargo.toml: rmcp 1.8, client), so the initialize/list/call handshake is
+# guaranteed compatible. `server` pulls the tool system + schemars; `transport-io` provides
+# the server-side `stdio()` transport (and enables tokio/io-std). No macros: the tools are
+# a hand-rolled ServerHandler so the JSON schemas and dispatch are explicit.
+rmcp = { version = "1.8", default-features = false, features = ["server", "transport-io"] }
+# Minimal tokio: the async runtime + the #[tokio::main] macro. stdio IO uses tokio's
+# blocking pool (rt-multi-thread), not the net/io driver.
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+office-core = { path = "../office-core" }
+office-store = { path = "../office-store" }
+
+[dev-dependencies]
+tempfile = "3"

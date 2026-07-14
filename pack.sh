@@ -10,9 +10,9 @@ mkdir -p dist
 
 echo "=== Building Workflow extension ==="
 
-# Build the Rust daemon
-echo "Building office-daemon (release)..."
-cargo build --release -p office-daemon
+# Build the Rust daemon + the MCP server (both shipped in the zip's bin/)
+echo "Building office-daemon + workflow-mcp (release)..."
+cargo build --release -p office-daemon -p workflow-mcp
 
 # Build the UI
 echo "Building UI..."
@@ -34,6 +34,7 @@ fi
 
 manifest_src="manifest.json"
 binary_src="target/release/office-daemon"
+mcp_binary_src="target/release/workflow-mcp"
 
 # Create temp staging directory
 stage_dir=$(mktemp -d)
@@ -56,8 +57,9 @@ with open('$stage_dir/manifest.json', 'w') as f:
 "
 fi
 
-# Copy release binary
+# Copy release binaries (the daemon + the MCP server, side by side in bin/)
 cp "$binary_src" "$stage_dir/bin/office-daemon"
+cp "$mcp_binary_src" "$stage_dir/bin/workflow-mcp"
 
 # Copy the UI dist folder
 cp -r "ui/dist" "$stage_dir/ui"
@@ -72,8 +74,21 @@ echo "Packaged: dist/workflow.zip"
 zip_path="dist/workflow.zip"
 if [ -f "$zip_path" ]; then
   size=$(du -h "$zip_path" | cut -f1)
+
+  # Verify both binaries made it into the zip before declaring success.
+  if ! unzip -l "$zip_path" | grep -q "bin/office-daemon"; then
+    echo "Error: bin/office-daemon missing from $zip_path"
+    exit 1
+  fi
+  if ! unzip -l "$zip_path" | grep -q "bin/workflow-mcp"; then
+    echo "Error: bin/workflow-mcp missing from $zip_path"
+    exit 1
+  fi
+
   echo ""
   echo "=== Summary ==="
   echo "Distributable package created:"
   echo "  $zip_path ($size)"
+  echo "Zip contents (bin/):"
+  unzip -l "$zip_path" | grep "bin/" | sed 's/^/  /'
 fi

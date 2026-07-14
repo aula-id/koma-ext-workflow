@@ -21,8 +21,13 @@ pub use office::{AuthError, BreakdownError, InvokePurpose};
 pub mod kernel;
 pub use kernel::{step, Command, Effect, HostEvent, Input};
 
+pub mod inboxmsg;
+
 #[cfg(test)]
 mod domain_test;
+
+#[cfg(test)]
+mod inboxmsg_test;
 
 #[cfg(test)]
 mod machine_test;
