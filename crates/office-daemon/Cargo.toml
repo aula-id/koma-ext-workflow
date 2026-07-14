@@ -1,0 +1,15 @@
+[package]
+name = "office-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "office-daemon"
+path = "src/main.rs"
+
+[dependencies]
+office-core = { path = "../office-core" }
+office-store = { path = "../office-store" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+koma-extension = { path = "/media/wangsa/project-x/simple-coders/src-extension" }

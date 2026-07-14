@@ -1,0 +1,102 @@
+{
+  "schema": "koma-extension/v0",
+  "id": "aula.workflow",
+  "name": "Workflow",
+  "version": "0.1.0",
+  "description": "Autonomous kanban office: PRD front desk, sub-agent workforce, review line, live dashboard.",
+  "tier": "free",
+  "kind": "daemon",
+  "runtime": { "exec": "bin/office-daemon", "args": [] },
+  "requires": [
+    "agents:orchestrate",
+    "sessions:manage",
+    "chat:prompt",
+    "models:invoke",
+    "context:publish"
+  ],
+  "contributes": {
+    "panels": [ { "id": "board", "title": "Workflow", "icon": "kanban" } ],
+    "events": [ "subagent.done", "agent.turn_end", "session.foreground_change" ],
+    "sub_agents": [
+      {
+        "name": "office-worker",
+        "description": "Workflow task implementer. Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt."
+      },
+      {
+        "name": "office-reviewer",
+        "description": "Workflow reviewer. Verifies one task against its acceptance criteria and files an OFFICE-REVIEW verdict.",
+        "prompt": "You are a Workflow reviewer. Judge ONE task against its acceptance criteria. You did not write this work. Be strict; a false pass ships broken work.\n\nRead every delivered file under the specified path. Verify each acceptance criterion. Run read-only checks where possible (build/typecheck allowed; nothing destructive; nothing outside the delivery path and desk).\n\nWhen done, end your message with the OFFICE-REVIEW block containing your verdict (pass or fail) and detailed reasons tied to each criterion."
+      }
+    ],
+    "tools": [
+      {
+        "name": "workflow_brief",
+        "description": "Talk to the Workflow front desk (requirements, PRD, negotiation). Input: message.",
+        "input_schema": {
+          "type": "object",
+          "properties": { "message": { "type": "string" } },
+          "required": ["message"]
+        }
+      },
+      {
+        "name": "workflow_status",
+        "description": "Board digest for one project or all projects.",
+        "input_schema": {
+          "type": "object",
+          "properties": { "project": { "type": "string" } }
+        }
+      },
+      {
+        "name": "workflow_authorize",
+        "description": "Authorize a project to start grinding. Requires delivery_path.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "project": { "type": "string" },
+            "delivery_path": { "type": "string" }
+          },
+          "required": ["project", "delivery_path"]
+        }
+      },
+      {
+        "name": "workflow_interrupt",
+        "description": "Interrupt a running project (mode: soft|hard, default hard).",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "project": { "type": "string" },
+            "mode": { "type": "string" }
+          },
+          "required": ["project"]
+        }
+      },
+      {
+        "name": "workflow_resume",
+        "description": "Resume an interrupted or halted project.",
+        "input_schema": {
+          "type": "object",
+          "properties": { "project": { "type": "string" } },
+          "required": ["project"]
+        }
+      },
+      {
+        "name": "workflow_comment",
+        "description": "Attach a comment to a task card; the task's agent will consume it.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "task": { "type": "string" },
+            "text": { "type": "string" }
+          },
+          "required": ["task", "text"]
+        }
+      },
+      {
+        "name": "workflow_projects",
+        "description": "List office projects with phase and progress.",
+        "input_schema": { "type": "object" }
+      }
+    ]
+  }
+}
