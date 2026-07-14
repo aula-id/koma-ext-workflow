@@ -1,0 +1,139 @@
+#[cfg(test)]
+mod tests {
+    use crate::domain::CommentId;
+    use crate::report::{parse_report, parse_review, ReportStatus, Verdict};
+
+    #[test]
+    fn parses_clean_complete_report() {
+        let text = "Did the work.\n\nOFFICE-REPORT\nstatus: complete\nsummary: added retry logic\ndelivered: /deliver/fetcher.rs\nack-comments: c17,c18\n";
+        let r = parse_report(text);
+        assert_eq!(r.status, ReportStatus::Complete);
+        assert_eq!(r.summary.as_deref(), Some("added retry logic"));
+        assert_eq!(r.delivered, vec!["/deliver/fetcher.rs".to_string()]);
+        assert_eq!(r.ack_comments, vec![CommentId(17), CommentId(18)]);
+        assert_eq!(r.blocked_reason, None);
+    }
+
+    #[test]
+    fn prose_after_the_block_is_ignored() {
+        let text = "OFFICE-REPORT\nstatus: complete\nsummary: done\n\nThanks for reading, have a nice day!";
+        let r = parse_report(text);
+        assert_eq!(r.status, ReportStatus::Complete);
+        assert_eq!(r.summary.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn markdown_fenced_block_still_parses() {
+        let text = "```\nOFFICE-REPORT\nstatus: complete\nsummary: fenced report\ndelivered: /deliver/a.rs\n```\n";
+        let r = parse_report(text);
+        assert_eq!(r.status, ReportStatus::Complete);
+        assert_eq!(r.summary.as_deref(), Some("fenced report"));
+        assert_eq!(r.delivered, vec!["/deliver/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn uppercase_key_and_marker_drift_still_parses() {
+        let text = "office-report\nSTATUS: Complete\nSummary: caps everywhere\n";
+        let r = parse_report(text);
+        assert_eq!(r.status, ReportStatus::Complete);
+        assert_eq!(r.summary.as_deref(), Some("caps everywhere"));
+    }
+
+    #[test]
+    fn duplicate_blocks_last_one_wins() {
+        let text = "OFFICE-REPORT\nstatus: blocked\nsummary: first attempt notes\nblocked-reason: need creds\n\nOFFICE-REPORT\nstatus: complete\nsummary: second block wins\n";
+        let r = parse_report(text);
+        assert_eq!(r.status, ReportStatus::Complete);
+        assert_eq!(r.summary.as_deref(), Some("second block wins"));
+        assert_eq!(r.blocked_reason, None);
+    }
+
+    #[test]
+    fn missing_block_is_unparseable() {
+        let r = parse_report("just some prose, no trailer at all");
+        assert_eq!(r.status, ReportStatus::Unparseable);
+        assert_eq!(r.summary, None);
+        assert!(r.delivered.is_empty());
+        assert!(r.ack_comments.is_empty());
+    }
+
+    #[test]
+    fn blocked_status_captures_blocked_reason() {
+        let text = "OFFICE-REPORT\nstatus: blocked\nsummary: could not proceed\nblocked-reason: need a decision on schema\n";
+        let r = parse_report(text);
+        assert_eq!(r.status, ReportStatus::Blocked);
+        assert_eq!(r.blocked_reason.as_deref(), Some("need a decision on schema"));
+    }
+
+    #[test]
+    fn ack_comments_list_parsed_with_c_prefix() {
+        let text = "OFFICE-REPORT\nstatus: complete\nack-comments: c1, c22,c333\n";
+        let r = parse_report(text);
+        assert_eq!(r.ack_comments, vec![CommentId(1), CommentId(22), CommentId(333)]);
+    }
+
+    #[test]
+    fn multiline_delivered_field_splits_into_paths() {
+        let text = "OFFICE-REPORT\nstatus: complete\ndelivered: /deliver/a.rs\n/deliver/b.rs\n/deliver/c.rs\n";
+        let r = parse_report(text);
+        assert_eq!(
+            r.delivered,
+            vec![
+                "/deliver/a.rs".to_string(),
+                "/deliver/b.rs".to_string(),
+                "/deliver/c.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unrecognized_status_value_is_unparseable_but_other_fields_survive() {
+        let text = "OFFICE-REPORT\nstatus: maybe\nsummary: unsure what happened\n";
+        let r = parse_report(text);
+        assert_eq!(r.status, ReportStatus::Unparseable);
+        assert_eq!(r.summary.as_deref(), Some("unsure what happened"));
+    }
+
+    // --- OFFICE-REVIEW ---------------------------------------------------
+
+    #[test]
+    fn parses_clean_pass_review() {
+        let text = "OFFICE-REVIEW\nverdict: pass\n";
+        let r = parse_review(text);
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.reasons, None);
+    }
+
+    #[test]
+    fn parses_fail_review_with_numbered_reasons() {
+        let text = "OFFICE-REVIEW\nverdict: fail\nreasons: 1. retries not exponential\n2. no tests added\n";
+        let r = parse_review(text);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(
+            r.reasons.as_deref(),
+            Some("1. retries not exponential\n2. no tests added")
+        );
+    }
+
+    #[test]
+    fn review_missing_block_is_unparseable() {
+        let r = parse_review("the reviewer forgot the trailer entirely");
+        assert_eq!(r.verdict, Verdict::Unparseable);
+    }
+
+    #[test]
+    fn review_duplicate_blocks_last_wins() {
+        let text = "OFFICE-REVIEW\nverdict: fail\nreasons: bad\n\nOFFICE-REVIEW\nverdict: pass\n";
+        let r = parse_review(text);
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.reasons, None);
+    }
+
+    #[test]
+    fn review_case_and_fence_tolerant() {
+        let text = "```\noffice-review\nVERDICT: Fail\nREASONS: strict is strict\n```\n";
+        let r = parse_review(text);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.reasons.as_deref(), Some("strict is strict"));
+    }
+}
