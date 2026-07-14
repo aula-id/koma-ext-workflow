@@ -34,6 +34,7 @@ use serde_json::{json, Value};
 
 use crate::handlers::{Command as DCmd, HostEvent as DEvt, Input as DInput};
 use crate::host::{is_grant_denied, Host};
+use crate::inbox::{self, InboxOutcome};
 
 /// The office self-caps its concurrent sub-agents at 4 so one of the host's 5
 /// per-session `MAX_SUBAGENTS` slots is always reserved for the user (5.2.3). This is
@@ -229,13 +230,14 @@ impl<H: Host> Driver<H> {
 
     // -- the loop tick ------------------------------------------------------
 
-    /// One `recv_timeout` tick: rate-limited reconcile, then a dispatch scan for every
-    /// owned Running project, then one outbox drain.
+    /// One `recv_timeout` tick: rate-limited reconcile, the inbox poll, a dispatch scan
+    /// for every owned Running project, then one outbox drain.
     pub fn on_tick(&mut self, now_ms: u64) {
         if now_ms.saturating_sub(self.last_reconcile_ms) >= RECONCILE_MS {
             self.reconcile(now_ms);
             self.last_reconcile_ms = now_ms;
         }
+        self.poll_inbox(now_ms);
         for i in self.owned_running_indices() {
             self.step(i, kernel::Input::Host(kernel::HostEvent::Tick), now_ms);
         }
@@ -338,6 +340,37 @@ impl<H: Host> Driver<H> {
                 self.projects[i].project = p;
             }
             self.push_board(now_ms, false);
+        }
+    }
+
+    // -- inbox (6.4) ----------------------------------------------------------
+
+    /// Poll `<workspace>/koma-workflow/inbox/` for files the main chat dropped (the
+    /// daemon-mode reach path, since contributed tools are invisible to the model in
+    /// `--daemon` sessions — Limitation 1). Accepted files are routed through the same
+    /// `handle_command` path a `tool.call` invoke would take; every consumed file
+    /// (accepted or rejected) gets a best-effort `chat.prompt` acknowledgement, since
+    /// an inbox drop has no synchronous caller to reply to directly (unlike
+    /// `tool.call`, whose ack is the invoke's own return value). No-ops before the
+    /// workspace is known (pre-bootstrap).
+    fn poll_inbox(&mut self, now_ms: u64) {
+        let Some(ws) = self.workspace.clone() else {
+            return;
+        };
+        let dir = ws.join("koma-workflow").join("inbox");
+        for outcome in inbox::poll(&dir, inbox::MAX_FILES_PER_TICK) {
+            match outcome {
+                InboxOutcome::Accepted { command, ack, .. } => {
+                    self.handle_command(command, now_ms);
+                    self.host.call("chat.prompt", json!({ "text": ack }));
+                }
+                InboxOutcome::Rejected { file, reason } => {
+                    self.host.call(
+                        "chat.prompt",
+                        json!({ "text": format!("workflow: could not process {file}: {reason}") }),
+                    );
+                }
+            }
         }
     }
 

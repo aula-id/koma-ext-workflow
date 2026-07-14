@@ -25,6 +25,7 @@
 mod driver;
 mod handlers;
 mod host;
+mod inbox;
 
 use driver::Driver;
 use handlers::Input;
