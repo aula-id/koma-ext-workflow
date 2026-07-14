@@ -65,9 +65,9 @@ export const useStore = create<StoreState>((set, get) => ({
         name: p.name || 'Untitled Project',
         phase: normalizePhase(p.phase),
         taskCount: p.tasks ? p.tasks.length : 0,
-        doneCount: p.tasks ? p.tasks.filter((t: any) => t.state?.Done).length : 0,
-        runningCount: p.tasks ? p.tasks.filter((t: any) => t.state?.OnProgress).length : 0,
-        parkedCount: p.tasks ? p.tasks.filter((t: any) => t.state?.Parked).length : 0,
+        doneCount: p.tasks ? p.tasks.filter((t: any) => t.state === 'done').length : 0,
+        runningCount: p.tasks ? p.tasks.filter((t: any) => t.state === 'onprogress').length : 0,
+        parkedCount: p.tasks ? p.tasks.filter((t: any) => t.state === 'parked').length : 0,
         lastNotice: p.outbox && p.outbox.length > 0 ? p.outbox[0].text : undefined,
       })),
     });
