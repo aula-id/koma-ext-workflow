@@ -508,3 +508,44 @@ fn invoke_pool_cap_is_honored_and_queue_drains_on_completion() {
     d.handle(invoke_done(1, Ok("done".to_string())), 1_100);
     assert_eq!(fake.jobs.lock().unwrap().len(), 3, "the queued invoke starts when a slot frees");
 }
+
+// ---------------------------------------------------------------------------
+// bootstrap lease acquisition (ARCHITECTURE.md 4.4: rebind is same-SESSION, not
+// same-bound-project)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bootstrap_never_steals_a_fresh_lease_held_under_a_different_daemon_session() {
+    let (store, _dir) = temp_store();
+    let slug = "auth";
+    store
+        .save_project(&project(slug, ProjectPhase::Running, vec![task("auth/t1", TaskState::Todo)]))
+        .expect("save project");
+
+    // Seed a live lease the way the REAL owning daemon would: instance "inst-owner",
+    // written under its OWN session "sess-x" (which the project also happens to be bound
+    // to, since it is the daemon actively dispatching it).
+    let lease_path = store.lease_path(slug);
+    lease::acquire(&lease_path, "inst-owner", Some("sess-x"), 900, 1_000)
+        .expect("seed lease io")
+        .expect("seed lease acquired");
+
+    // A second daemon boots against the same shared state root under a DIFFERENT session
+    // ("sess-y") with a brand-new instance id. It must never rebind a lease that belongs to
+    // another daemon's session -- only a same-session restart may rebind. Before the fix,
+    // `bootstrap` compared the project's `bound_session` ("sess-x") against itself instead
+    // of this daemon's own session, so the rebind clause was a tautology and this steal
+    // succeeded regardless of which session actually booted.
+    let mut host = FakeHost::new();
+    host.script("sessions.list", json!([{ "id": "sess-y", "workdir": "/ws" }]));
+    host.script("agents.list", json!([]));
+    let mut d = Driver::load(store, host, "inst-rival".to_string(), 111).expect("load driver");
+    d.bootstrap(2_000); // well within STALE_MS (60s) of the seeded heartbeat
+
+    assert!(
+        d.projects[0].lease.is_none(),
+        "a live lease bound to a different daemon session must not be stolen"
+    );
+    let on_disk = lease::read(&lease_path).unwrap().unwrap();
+    assert_eq!(on_disk.instance, "inst-owner", "the foreign live lease must be left untouched on disk");
+}

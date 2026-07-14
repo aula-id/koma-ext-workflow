@@ -315,11 +315,15 @@ impl<H: Host> Driver<H> {
         self.workspace = first_session_workdir(&sessions).map(PathBuf::from);
 
         // 9.1.2 — acquire or observe each lease. By index to avoid a self borrow clash.
+        // The `session` passed to `lease::acquire` is THIS DAEMON'S OWN session (4.4:
+        // "session == our local session"), never the project's `bound_session` — otherwise
+        // the same-session-rebind clause degenerates into a tautology (lease.session was
+        // itself written from a project's bound_session, so it always equals the project's
+        // current bound_session and any daemon can "rebind" any live foreign lease).
         for i in 0..self.projects.len() {
             let slug = self.projects[i].project.id.0.clone();
-            let bound = self.projects[i].project.bound_session.clone();
             let path = self.store.lease_path(&slug);
-            let lease = lease::acquire(&path, &self.instance, bound.as_deref(), self.pid, now_ms)
+            let lease = lease::acquire(&path, &self.instance, self.session.as_deref(), self.pid, now_ms)
                 .ok()
                 .flatten();
             self.projects[i].lease = lease;
@@ -1123,13 +1127,14 @@ impl<H: Host> Driver<H> {
             .any(|o| o.project.id.0 == slug && o.lease.is_some())
     }
 
-    /// Insert a project directly (tests): persists it and acquires its lease.
+    /// Insert a project directly (tests): persists it and acquires its lease. Mirrors
+    /// `bootstrap`'s acquire call, using this daemon's own session — never the project's
+    /// `bound_session` (see the comment in `bootstrap`).
     pub fn insert_for_test(&mut self, project: Project, now_ms: u64) {
         let _ = self.store.save_project(&project);
         let slug = project.id.0.clone();
-        let bound = project.bound_session.clone();
         let path = self.store.lease_path(&slug);
-        let lease = lease::acquire(&path, &self.instance, bound.as_deref(), self.pid, now_ms)
+        let lease = lease::acquire(&path, &self.instance, self.session.as_deref(), self.pid, now_ms)
             .ok()
             .flatten();
         self.projects.push(Owned { project, lease });
