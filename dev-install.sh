@@ -50,8 +50,23 @@ if [ -f "$CONFIG_FILE" ]; then
     # Create a backup
     cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
 
-    # Add or update the installed_extensions entry for this extension
-    jq ".installed_extensions[\"$EXT_ID\"] = {\"enabled\": true}" "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+    # `installed_extensions` is an ARRAY of InstalledExtension records (see koma
+    # src-agent/src/model/app_config.rs), NOT a map keyed by id. Build the full
+    # record from the manifest and upsert it: drop any existing entry with this
+    # id, then append.
+    ENTRY=$(jq -c '{
+      id: .id,
+      version: .version,
+      tier: (.tier // "free"),
+      granted: (.requires // []),
+      enabled: true,
+      kind: (.kind // "daemon"),
+      exec: (.runtime.exec // "bin/office-daemon")
+    }' "$INSTALL_DIR/manifest.json")
+
+    jq --argjson entry "$ENTRY" \
+      '.installed_extensions = ((.installed_extensions // []) | map(select(.id != $entry.id))) + [$entry]' \
+      "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
     mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 
     echo "Configuration updated."
