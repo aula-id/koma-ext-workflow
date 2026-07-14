@@ -253,14 +253,24 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
     let payload = params.get("payload").cloned().unwrap_or(Value::Null);
     let op = payload.get("op").and_then(Value::as_str).unwrap_or("");
 
-    let command = match op {
+    // Synchronous reads (PANEL_PROTOCOL.md 1.1): answered INLINE off the driver's
+    // snapshot cache, never enqueued and never touching a Koma handle (deadlock rule).
+    match op {
         "" => return error("panel.msg requires a payload 'op'"),
-        "hello" => Command::PanelHello {
-            ui_version: opt_str_field(&payload, "uiVersion"),
-        },
-        "state" => Command::PanelState {
-            project: opt_str_field(&payload, "project"),
-        },
+        "hello" | "state" => {
+            return serde_json::json!({ "ok": true, "snapshot": crate::driver::cache_snapshot() });
+        }
+        "prd_get" => {
+            let project = match str_field(&payload, "project") {
+                Some(p) if !p.is_empty() => p,
+                _ => return error("op 'prd_get' requires a non-empty 'project'"),
+            };
+            return serde_json::json!({ "ok": true, "prd": crate::driver::cache_prd(&project) });
+        }
+        _ => {}
+    }
+
+    let command = match op {
         "office_chat" => {
             let project = match str_field(&payload, "project") {
                 Some(p) if !p.is_empty() => p,
@@ -387,13 +397,6 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
                 _ => return error("op 'project_archive' requires a non-empty 'project'"),
             };
             Command::ProjectArchive { project }
-        }
-        "prd_get" => {
-            let project = match str_field(&payload, "project") {
-                Some(p) if !p.is_empty() => p,
-                _ => return error("op 'prd_get' requires a non-empty 'project'"),
-            };
-            Command::PrdGet { project }
         }
         "task_detail" => {
             let task = match str_field(&payload, "task") {

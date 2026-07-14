@@ -90,6 +90,7 @@ dependencies = [
  "office-store",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -22,14 +22,19 @@
 //!   DEADLOCK RULE); populated as the first thing `driver_entry` does once it has a
 //!   live `Koma`.
 
+mod driver;
 mod handlers;
 mod host;
 
+use driver::Driver;
 use handlers::Input;
+use host::KomaHost;
 use koma_extension::{run_daemon, DaemonDemo, Extension, ExtensionManifest, Koma};
+use office_store::Store;
 use serde_json::Value;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 /// Sending half of the driver's `mpsc` channel; set once in `main()` before
 /// `run_daemon` starts serving. `on_invoke`/`on_event` read this to enqueue.
@@ -73,11 +78,61 @@ impl Extension for Office {
 }
 
 /// Runs on its own thread with a live `Koma` handle (host mode) or a demo stub
-/// (demo mode) — see `koma_extension::sdk::run_daemon`. W6: no kernel tick loop yet
-/// (W7 replaces this body), so this only claims the write-only `Koma` clone and
-/// drains whatever `on_invoke`/`on_event` queued, discarding it for now.
+/// (demo mode) — see `koma_extension::sdk::run_daemon`. Host mode runs the full W7
+/// tick loop (kernel + store + effect execution + reconciliation); demo mode has no
+/// live socket, so it only drains whatever `main()`'s scripted invoke queued and
+/// returns (blocking forever there would hang `cargo run`).
 fn driver_entry(koma: &mut Koma) {
     let _ = KOMA_WRITE.set(Mutex::new(koma.try_clone()));
+    let _ = driver::CACHE.set(Mutex::new(driver::SnapshotCache::default()));
+
+    if std::env::var_os("KOMA_EXT_SOCKET").is_none() {
+        // Demo mode: bounded drain, no store side effects, exit cleanly.
+        if let Some(rx) = CMD_RX.get() {
+            if let Ok(rx) = rx.lock() {
+                for _input in rx.try_iter() {}
+            }
+        }
+        return;
+    }
+
+    run_host_driver(koma);
+}
+
+/// Host-mode driver: open the durable store, spawn the dedicated lease-heartbeat thread
+/// (own `try_clone`'d clock, no host calls — 4.4/5.1), bootstrap (bind session, lease,
+/// reconcile), then loop on `recv_timeout(1s)` feeding `Tick`/inputs into the kernel.
+fn run_host_driver(koma: &mut Koma) {
+    let store = match Store::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("workflow-driver: cannot open state root: {e}");
+            return;
+        }
+    };
+    let instance = driver::mint_instance();
+    let pid = std::process::id();
+
+    // Dedicated heartbeat thread: refreshes our leases every 10s so a slow host call on
+    // the driver can never age a lease past the 60s steal window (5.6).
+    {
+        let hb_store = store.clone();
+        let hb_instance = instance.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(10));
+            driver::heartbeat_owned(&hb_store, &hb_instance, driver::now_ms());
+        });
+    }
+
+    let host = KomaHost::new(koma.try_clone());
+    let mut d = match Driver::load(store, host, instance, pid) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("workflow-driver: load failed: {e}");
+            return;
+        }
+    };
+    d.bootstrap(driver::now_ms());
 
     let rx = CMD_RX
         .get()
@@ -85,18 +140,11 @@ fn driver_entry(koma: &mut Koma) {
         .lock()
         .expect("cmd channel mutex poisoned");
 
-    // Host mode: block for the life of the daemon, servicing every queued Input as
-    // it arrives. Demo mode has no live socket, so nothing more is ever sent after
-    // main()'s one scripted invoke — blocking forever there would just hang
-    // `cargo run`; drain what's already queued with `try_iter()` and return.
-    if std::env::var_os("KOMA_EXT_SOCKET").is_some() {
-        for _input in rx.iter() {
-            // W6: SDK glue only. W7 feeds this into `kernel::step` via the store +
-            // Host trait wired here.
-        }
-    } else {
-        for _input in rx.try_iter() {
-            // Same no-op, bounded drain for the demo-mode smoke run.
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(input) => d.handle(input, driver::now_ms()),
+            Err(mpsc::RecvTimeoutError::Timeout) => d.on_tick(driver::now_ms()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }

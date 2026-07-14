@@ -206,33 +206,48 @@ fn on_invoke_malformed_json_shapes_never_panic() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn panel_msg_hello_and_state() {
+fn panel_msg_hello_and_state_reply_inline_without_enqueue() {
+    // hello/state are synchronous reads (PANEL_PROTOCOL.md 1.1): the handler answers
+    // INLINE off the driver's snapshot cache and enqueues NOTHING. With the cache
+    // uninitialized (no driver booted in this unit test) the reply carries an empty
+    // envelope.
     let (tx, rx) = channel();
     let reply = on_invoke(
         "panel.msg",
         json!({ "panelId": "board", "payload": { "op": "hello", "uiVersion": "1.0.0" } }),
         &tx,
     );
-    assert_eq!(
-        recv_command(&rx),
-        Command::PanelHello {
-            ui_version: Some("1.0.0".to_string()),
-        }
-    );
-    assert_eq!(reply, json!({ "ok": true, "accepted": true }));
+    assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(true));
+    assert!(reply.get("snapshot").is_some(), "hello reply carries a snapshot inline");
+    assert!(rx.try_recv().is_err(), "hello must not enqueue a command");
 
     let (tx, rx) = channel();
-    on_invoke(
+    let reply = on_invoke(
         "panel.msg",
         json!({ "panelId": "board", "payload": { "op": "state", "project": "auth" } }),
         &tx,
     );
-    assert_eq!(
-        recv_command(&rx),
-        Command::PanelState {
-            project: Some("auth".to_string()),
-        }
+    assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(true));
+    assert!(reply.get("snapshot").is_some());
+    assert!(rx.try_recv().is_err(), "state must not enqueue a command");
+}
+
+#[test]
+fn panel_msg_prd_get_replies_inline() {
+    let (tx, rx) = channel();
+    let reply = on_invoke(
+        "panel.msg",
+        json!({ "panelId": "board", "payload": { "op": "prd_get", "project": "auth" } }),
+        &tx,
     );
+    assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(true));
+    assert!(reply.get("prd").is_some(), "prd_get reply carries a prd field inline");
+    assert!(rx.try_recv().is_err(), "prd_get must not enqueue a command");
+
+    // Missing project is a validation error, not a panic.
+    let (tx, _rx) = channel();
+    let err = on_invoke("panel.msg", json!({ "panelId": "board", "payload": { "op": "prd_get" } }), &tx);
+    assert!(err.get("error").is_some());
 }
 
 #[test]
@@ -356,10 +371,6 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
         &tx,
     );
     assert_eq!(recv_command(&rx), Command::ProjectArchive { project: "auth".to_string() });
-
-    let (tx, rx) = channel();
-    on_invoke("panel.msg", json!({ "panelId": "board", "payload": { "op": "prd_get", "project": "auth" } }), &tx);
-    assert_eq!(recv_command(&rx), Command::PrdGet { project: "auth".to_string() });
 
     let (tx, rx) = channel();
     on_invoke("panel.msg", json!({ "panelId": "board", "payload": { "op": "task_detail", "task": "t1" } }), &tx);
