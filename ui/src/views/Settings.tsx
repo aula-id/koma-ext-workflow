@@ -196,7 +196,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
               Appearance
             </h2>
             <div className="flex gap-3">
-              {(['dark', 'light', 'milk'] as const).map((t) => (
+              {(['dark', 'light'] as const).map((t) => (
                 <button
                   key={t}
                   onClick={() => handleThemeChange(t)}
@@ -288,7 +288,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                   animate={{ opacity: 1, y: 0 }}
                   className="p-3 rounded border"
                   style={{
-                    backgroundColor: 'rgba(217, 70, 70, 0.1)',
+                    backgroundColor: 'var(--wf-tint-error)',
                     borderColor: 'var(--wf-accent-pink)',
                     color: 'var(--wf-accent-pink)',
                   }}
@@ -303,7 +303,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                   animate={{ opacity: 1, y: 0 }}
                   className="p-3 rounded border"
                   style={{
-                    backgroundColor: 'rgba(166, 226, 46, 0.1)',
+                    backgroundColor: 'var(--wf-tint-success)',
                     borderColor: 'var(--wf-accent-green)',
                     color: 'var(--wf-accent-green)',
                   }}
@@ -437,7 +437,15 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                     >
                       <motion.div
                         layout
-                        className="absolute w-5 h-5 bg-white rounded-full top-0.5"
+                        className="absolute w-5 h-5 rounded-full top-0.5"
+                        style={{
+                          // Contrast partner for whichever surface the knob currently
+                          // sits on: `--wf-bg` against the accent-green "on" track
+                          // (same trick badges use to read against saturated accent
+                          // colors in both themes), `--wf-fg` against the neutral
+                          // `--wf-bg` "off" track.
+                          backgroundColor: formData.keepDesks ? 'var(--wf-bg)' : 'var(--wf-fg)',
+                        }}
                         animate={{
                           left: formData.keepDesks ? '1.5rem' : '0.25rem',
                         }}
@@ -462,7 +470,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                       className="px-6 py-2 rounded font-semibold transition-opacity"
                       style={{
                         backgroundColor: 'var(--wf-accent-green)',
-                        color: '#000',
+                        color: 'var(--wf-bg)',
                         opacity: loading ? 0.5 : 1,
                       }}
                     >

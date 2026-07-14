@@ -5,10 +5,10 @@ import { themeManager, Theme } from './theme';
 
 const params = new URLSearchParams(window.location.search);
 
-// Deterministic initial theme for screenshots/deep-links (?theme=dark|light|milk),
+// Deterministic initial theme for screenshots/deep-links (?theme=dark|light),
 // overriding whatever was previously saved to localStorage.
 const themeParam = params.get('theme');
-if (themeParam === 'dark' || themeParam === 'light' || themeParam === 'milk') {
+if (themeParam === 'dark' || themeParam === 'light') {
   themeManager.setTheme(themeParam as Theme);
 }
 

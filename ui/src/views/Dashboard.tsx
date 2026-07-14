@@ -54,21 +54,26 @@ const ProgressRing: React.FC<{
   );
 };
 
+// Project phase badge colors, mapped onto koma's status/accent roles (same roles
+// `--wf-status-*` uses for task cards): running -> info, done -> success,
+// interrupted -> warn, halted -> error, ready -> accent (actionable), drafting has
+// no strong status yet so it stays neutral.
+const PHASE_COLOR_VAR: Record<string, string> = {
+  drafting: 'var(--wf-fg-secondary)',
+  ready: 'var(--wf-accent-purple)',
+  running: 'var(--wf-accent-blue)',
+  interrupted: 'var(--wf-accent-orange)',
+  halted: 'var(--wf-accent-pink)',
+  done: 'var(--wf-accent-green)',
+};
+
 const ProjectCard: React.FC<{
   project: Project;
   onClick?: () => void;
 }> = ({ project, onClick }) => {
-  const phaseColors: Record<string, string> = {
-    drafting: 'bg-gray-600',
-    ready: 'bg-blue-600',
-    running: 'bg-green-600',
-    interrupted: 'bg-yellow-600',
-    halted: 'bg-red-600',
-    done: 'bg-green-800',
-  };
-
   const phaseKind = project.phase.kind;
-  const phaseColor = phaseColors[phaseKind] || 'bg-gray-600';
+  const phaseColorVar = PHASE_COLOR_VAR[phaseKind] || 'var(--wf-fg-secondary)';
+  const isNeutralPhase = phaseColorVar === 'var(--wf-fg-secondary)';
 
   return (
     <motion.div
@@ -78,13 +83,20 @@ const ProjectCard: React.FC<{
       exit={{ opacity: 0, scale: 0.95 }}
       transition={{ duration: 0.2 }}
       onClick={onClick}
-      className="p-4 rounded-lg border border-gray-700 bg-gray-900 cursor-pointer hover:bg-gray-800 transition-colors"
+      className="p-4 rounded-lg border cursor-pointer transition-colors hover:bg-[var(--wf-hover)]"
+      style={{ borderColor: 'var(--wf-border)', backgroundColor: 'var(--wf-bg-secondary)' }}
     >
       <div className="flex items-start justify-between mb-3">
         <div className="flex-1">
-          <h3 className="text-lg font-semibold text-white truncate">{project.name}</h3>
+          <h3 className="text-lg font-semibold truncate" style={{ color: 'var(--wf-fg)' }}>
+            {project.name}
+          </h3>
           <span
-            className={`inline-block mt-1 px-2 py-1 text-xs font-semibold rounded ${phaseColor} text-white capitalize`}
+            className="inline-block mt-1 px-2 py-1 text-xs font-semibold rounded capitalize"
+            style={{
+              backgroundColor: phaseColorVar,
+              color: isNeutralPhase ? 'var(--wf-fg)' : 'var(--wf-bg)',
+            }}
           >
             {phaseKind}
           </span>
@@ -95,22 +107,31 @@ const ProjectCard: React.FC<{
       </div>
 
       <div className="grid grid-cols-3 gap-2 mb-3 text-sm">
-        <div className="bg-gray-800 p-2 rounded">
-          <div className="text-xs text-gray-400">Running</div>
-          <div className="text-lg font-bold text-blue-400">{project.runningCount || 0}</div>
+        <div className="p-2 rounded" style={{ backgroundColor: 'var(--wf-bg)' }}>
+          <div className="text-xs" style={{ color: 'var(--wf-fg-secondary)' }}>Running</div>
+          <div className="text-lg font-bold" style={{ color: 'var(--wf-accent-blue)' }}>
+            {project.runningCount || 0}
+          </div>
         </div>
-        <div className="bg-gray-800 p-2 rounded">
-          <div className="text-xs text-gray-400">Parked</div>
-          <div className="text-lg font-bold text-orange-400">{project.parkedCount || 0}</div>
+        <div className="p-2 rounded" style={{ backgroundColor: 'var(--wf-bg)' }}>
+          <div className="text-xs" style={{ color: 'var(--wf-fg-secondary)' }}>Parked</div>
+          <div className="text-lg font-bold" style={{ color: 'var(--wf-accent-orange)' }}>
+            {project.parkedCount || 0}
+          </div>
         </div>
-        <div className="bg-gray-800 p-2 rounded">
-          <div className="text-xs text-gray-400">Total</div>
-          <div className="text-lg font-bold text-gray-300">{project.taskCount || 0}</div>
+        <div className="p-2 rounded" style={{ backgroundColor: 'var(--wf-bg)' }}>
+          <div className="text-xs" style={{ color: 'var(--wf-fg-secondary)' }}>Total</div>
+          <div className="text-lg font-bold" style={{ color: 'var(--wf-fg-secondary)' }}>
+            {project.taskCount || 0}
+          </div>
         </div>
       </div>
 
       {project.lastNotice && (
-        <div className="bg-gray-800 p-2 rounded text-xs text-gray-300 truncate">
+        <div
+          className="p-2 rounded text-xs truncate"
+          style={{ backgroundColor: 'var(--wf-bg)', color: 'var(--wf-fg-secondary)' }}
+        >
           {project.lastNotice}
         </div>
       )}
@@ -125,7 +146,12 @@ const HaltIndicator: React.FC<{ halted: boolean }> = ({ halted }) => {
     <motion.div
       initial={{ opacity: 0, y: -10 }}
       animate={{ opacity: 1, y: 0 }}
-      className="bg-red-900 border border-red-700 p-3 rounded-lg mb-4 text-red-200 text-sm"
+      className="border p-3 rounded-lg mb-4 text-sm"
+      style={{
+        backgroundColor: 'var(--wf-tint-error)',
+        borderColor: 'var(--wf-accent-pink)',
+        color: 'var(--wf-accent-pink)',
+      }}
     >
       All production lines halted: a parked task blocks all work.
     </motion.div>
@@ -213,7 +239,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
         )}
 
         {snapshot && snapshot.truncated && (
-          <div className="mt-4 text-xs text-gray-500 text-center">
+          <div className="mt-4 text-xs text-center" style={{ color: 'var(--wf-fg-secondary)' }}>
             Some data was truncated due to size limits. Refresh for full details.
           </div>
         )}
