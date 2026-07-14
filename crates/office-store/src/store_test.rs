@@ -247,6 +247,51 @@ fn corrupt_state_is_quarantined_and_dropped() {
 }
 
 #[test]
+fn newer_schema_state_is_not_quarantined_or_dropped_by_load_all() {
+    // A version-downgrade scenario: a v2 build wrote state.json with a newer schema major,
+    // then an older (v1) daemon runs load_all once. The project must NOT be treated as
+    // corrupt: no quarantine, no dropped registry row, and it must survive to reappear
+    // once a compatible build loads it again (ARCHITECTURE.md 4.2: newer majors are
+    // "refused", not conflated with "missing or corrupt").
+    let (_dir, store) = store();
+    let p = project("nu");
+    store.save_project(&p).unwrap();
+
+    // Bump the on-disk schema to a newer major (simulating a v2 write).
+    let sp = store.state_path("nu");
+    let mut v: Value = serde_json::from_slice(&fs::read(&sp).unwrap()).unwrap();
+    v["schema"] = json!("workflow/2");
+    fs::write(&sp, serde_json::to_vec(&v).unwrap()).unwrap();
+
+    let res = store.load_all().unwrap();
+
+    // Not loaded into memory (this build genuinely can't read a newer schema)...
+    assert!(res.projects.is_empty());
+    // ...but explicitly refused, not silently dropped or corrupted.
+    assert_eq!(res.newer_schema, vec!["nu".to_string()]);
+    assert!(res.quarantined.is_empty(), "must not be quarantined: it isn't corrupt");
+    assert!(res.dropped.is_empty(), "must not be dropped: version skew is transient");
+
+    // The state dir stays exactly where it was (not moved to .quarantine).
+    assert!(store.state_dir("nu").exists());
+    assert!(!store.root_dir().join("projects/.quarantine/nu").exists());
+    // The registry row survives the healed rewrite, so the project stays on the board
+    // (even though this build can't load its content).
+    let reg = store.registry().unwrap();
+    assert_eq!(reg.len(), 1);
+    assert_eq!(reg[0].project_id, "nu");
+
+    // Once schema support catches back up (simulating re-upgrading to v2), the project
+    // loads normally again from the very same on-disk files.
+    fs::write(&sp, serde_json::to_vec(&v).unwrap()).unwrap();
+    v["schema"] = json!("workflow/1");
+    fs::write(&sp, serde_json::to_vec(&v).unwrap()).unwrap();
+    let res2 = store.load_all().unwrap();
+    assert_eq!(res2.projects.len(), 1);
+    assert!(res2.newer_schema.is_empty());
+}
+
+#[test]
 fn archive_removes_row_before_dir_and_crash_readopts() {
     let (_dir, store) = store();
     let p = project("iota");

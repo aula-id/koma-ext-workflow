@@ -117,6 +117,11 @@ pub struct LoadResult {
     pub quarantined: Vec<String>,
     /// Registry slugs whose state dir was missing entirely; the row was dropped.
     pub dropped: Vec<String>,
+    /// Slugs whose `state.json` carries a schema major newer than this build supports.
+    /// Refused (not loaded into `projects`), but the dir and registry row are left in
+    /// place untouched — NOT quarantined, NOT dropped — so the project reappears as soon
+    /// as a build that understands the newer schema loads it (ARCHITECTURE.md 4.2).
+    pub newer_schema: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -307,14 +312,22 @@ impl Store {
     /// Load every project, reconciling the registry against what is on disk:
     /// - a valid `state.json` with no registry row is ADOPTED (row rebuilt),
     /// - a registry row whose `state.json` is corrupt is DROPPED and the dir QUARANTINED,
-    /// - a registry row whose state dir is missing entirely is DROPPED.
+    /// - a registry row whose state dir is missing entirely is DROPPED,
+    /// - a `state.json` with a schema major newer than this build supports is REFUSED but
+    ///   left in place (dir untouched, registry row preserved) — it is not corrupt, just
+    ///   unreadable by this build, and must reappear once a newer build runs (4.2).
     /// The healed registry is written back before returning.
     pub fn load_all(&self) -> io::Result<LoadResult> {
         let reg = self.read_registry_file()?;
         let reg_slugs: HashSet<String> = reg.projects.iter().map(|r| r.project_id.clone()).collect();
+        let reg_by_id: std::collections::HashMap<String, RegistryRow> =
+            reg.projects.iter().map(|r| (r.project_id.clone(), r.clone())).collect();
 
         let mut result = LoadResult::default();
         let mut seen_on_disk: HashSet<String> = HashSet::new();
+        // Registry rows for newer-schema projects, carried through untouched so the healed
+        // registry write below doesn't drop them.
+        let mut preserved_rows: Vec<RegistryRow> = Vec::new();
 
         let pdir = self.projects_dir();
         if pdir.exists() {
@@ -334,16 +347,38 @@ impl Store {
                     continue;
                 }
                 seen_on_disk.insert(name.clone());
-                match fs::read(&state_path).ok().and_then(|b| parse_state(&b).ok()) {
-                    Some(project) => {
+                let bytes = match fs::read(&state_path) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        // Unreadable file: corrupt, quarantine.
+                        self.quarantine(&name)?;
+                        result.quarantined.push(name);
+                        continue;
+                    }
+                };
+                if let Some(major) = peek_schema_major(&bytes) {
+                    if major > SCHEMA_MAJOR {
+                        // Newer-schema state: refuse to load, but this is a version-skew
+                        // condition, not corruption — leave the dir and registry row alone
+                        // so the project comes back once a compatible build runs.
+                        if let Some(row) = reg_by_id.get(&name) {
+                            preserved_rows.push(row.clone());
+                        }
+                        result.newer_schema.push(name);
+                        continue;
+                    }
+                }
+                match parse_state(&bytes) {
+                    Ok(project) => {
                         let slug = project.id.0.clone();
                         if !reg_slugs.contains(&slug) {
                             result.adopted.push(slug);
                         }
                         result.projects.push(project);
                     }
-                    None => {
-                        // Corrupt / unreadable / newer-schema state: quarantine the dir.
+                    Err(_) => {
+                        // Corrupt / unreadable state (missing schema, malformed JSON, etc):
+                        // quarantine the dir.
                         self.quarantine(&name)?;
                         result.quarantined.push(name);
                     }
@@ -359,9 +394,11 @@ impl Store {
             }
         }
 
-        // Write back the healed registry, rebuilt from the projects that survived.
+        // Write back the healed registry, rebuilt from the projects that survived, plus any
+        // newer-schema rows preserved untouched.
         let mut healed = RegistryFile::empty();
         healed.projects = result.projects.iter().map(row_for).collect();
+        healed.projects.extend(preserved_rows);
         self.write_registry_file(&healed)?;
 
         Ok(result)
@@ -512,6 +549,18 @@ pub type Migration = fn(Value) -> Value;
 
 /// Ordered migration table. Index i migrates major (i+1) -> (i+2). Empty for v1.
 pub const MIGRATIONS: &[Migration] = &[];
+
+/// Peek at a `state.json` buffer's schema major WITHOUT fully parsing/migrating it, so
+/// callers can distinguish "newer major, refuse" (version skew — leave the file alone)
+/// from "corrupt" (malformed JSON, missing/unrecognized schema — safe to quarantine).
+/// Returns `None` for anything that isn't at least a JSON object with a recognizable
+/// `"workflow/<major>"` schema string; those cases fall through to `parse_state`, whose
+/// error covers them as corrupt.
+fn peek_schema_major(bytes: &[u8]) -> Option<u32> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    let schema = v.get("schema")?.as_str()?;
+    parse_major(schema).ok()
+}
 
 /// Parse a `state.json` byte buffer into a `Project`, enforcing the schema contract:
 /// refuse a newer major, run the migration chain for an older one.
