@@ -102,36 +102,23 @@ export const Comments: React.FC<CommentsProps> = ({ taskId, comments, taskDone }
                 exit={{ opacity: 0 }}
                 data-testid="comment-row"
                 style={{
-                  background: 'var(--wf-bg)',
-                  borderRadius: 'var(--wf-radius)',
-                  padding: '0.5rem 0.6rem',
+                  borderBottom: '1px solid var(--wf-border)',
+                  padding: '0.35rem 0 0.45rem',
                 }}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem' }}>
-                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--wf-fg)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '0.5rem' }}>
+                  <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--wf-fg)' }}>
                     {AUTHOR_LABEL[c.author]}
                   </span>
-                  <span style={{ fontSize: '0.65rem', color: 'var(--wf-fg-secondary)' }}>
+                  <span style={{ fontSize: '0.65rem', color: 'var(--wf-dim)' }}>
                     {formatTime(c.createdMs)}
                   </span>
                 </div>
-                <p style={{ fontSize: '0.8rem', color: 'var(--wf-fg)', margin: '0.3rem 0' }}>{c.text}</p>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                  <span
-                    style={{
-                      fontSize: '0.6rem',
-                      fontWeight: 600,
-                      color: pill.colorVar,
-                      border: `1px solid ${pill.colorVar}`,
-                      borderRadius: 'var(--wf-radius)',
-                      padding: '0.02rem 0.35rem',
-                    }}
-                  >
-                    {pill.label}
-                  </span>
-                  {pill.flag && (
-                    <span style={{ fontSize: '0.65rem', color: 'var(--wf-accent-orange)' }}>{pill.flag}</span>
-                  )}
+                <p style={{ fontSize: '0.8rem', color: 'var(--wf-fg)', margin: '0.2rem 0' }}>{c.text}</p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.65rem' }}>
+                  <span className="wf-status-dot" style={{ background: pill.colorVar, width: 5, height: 5 }} />
+                  <span style={{ color: pill.colorVar }}>{pill.label}</span>
+                  {pill.flag && <span style={{ color: 'var(--wf-warn)' }}>{pill.flag}</span>}
                 </div>
               </motion.div>
             );
@@ -153,35 +140,13 @@ export const Comments: React.FC<CommentsProps> = ({ taskId, comments, taskDone }
             }
           }}
           placeholder="Add a comment for the agent..."
-          style={{
-            flex: 1,
-            background: 'var(--wf-bg)',
-            border: '1px solid var(--wf-fg-secondary)',
-            borderRadius: 'var(--wf-radius)',
-            padding: '0.4rem 0.5rem',
-            color: 'var(--wf-fg)',
-            fontSize: '0.8rem',
-          }}
+          style={{ flex: 1, fontSize: '0.8rem' }}
         />
-        <button
-          onClick={() => void submit()}
-          disabled={sending || !draft.trim()}
-          style={{
-            fontSize: '0.75rem',
-            fontWeight: 600,
-            borderRadius: 'var(--wf-radius)',
-            padding: '0.4rem 0.75rem',
-            border: '1px solid var(--wf-accent-blue)',
-            color: 'var(--wf-accent-blue)',
-            background: 'transparent',
-            cursor: sending || !draft.trim() ? 'not-allowed' : 'pointer',
-            opacity: sending || !draft.trim() ? 0.5 : 1,
-          }}
-        >
-          Send
+        <button onClick={() => void submit()} disabled={sending || !draft.trim()} className="wf-btn wf-btn-accent">
+          send
         </button>
       </div>
-      {error && <span style={{ fontSize: '0.7rem', color: 'var(--wf-accent-pink)' }}>{error}</span>}
+      {error && <span style={{ fontSize: '0.7rem', color: "var(--wf-error)" }}>{error}</span>}
     </div>
   );
 };

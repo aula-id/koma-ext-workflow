@@ -26,9 +26,9 @@ export function noticeStatus(n: Pick<OutboundNoticeView, 'sent' | 'paused'>): No
 }
 
 const STATUS_COLOR: Record<NoticeStatus, string> = {
-  sent: 'var(--wf-accent-green)',
-  paused: 'var(--wf-accent-orange)',
-  queued: 'var(--wf-fg-secondary)',
+  sent: 'var(--wf-success)',
+  paused: 'var(--wf-warn)',
+  queued: 'var(--wf-dim)',
 };
 
 export interface OfficeChatProps {
@@ -69,26 +69,18 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
         display: 'flex',
         flexDirection: 'column',
         gap: '0.6rem',
-        background: 'var(--wf-bg-secondary)',
-        borderRadius: 'var(--wf-radius)',
-        padding: '0.9rem 1rem',
+        borderLeft: '1px solid var(--wf-border)',
+        paddingLeft: '1rem',
         maxHeight: 520,
       }}
       data-testid="office-chat"
     >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <h3 style={{ margin: 0, fontSize: '0.85rem', color: 'var(--wf-fg)' }}>Office chat</h3>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '0.5rem' }}>
+        <h3 className="wf-section-title" style={{ margin: 0 }}>
+          PRD drafting
+        </h3>
         {folded && (
-          <span
-            title={project.officeSummary}
-            style={{
-              fontSize: '0.6rem',
-              color: 'var(--wf-accent-purple)',
-              border: '1px solid var(--wf-accent-purple)',
-              borderRadius: 'var(--wf-radius)',
-              padding: '0.05rem 0.4rem',
-            }}
-          >
+          <span title={project.officeSummary} style={{ fontSize: '0.62rem', color: 'var(--wf-dim)' }}>
             folded — earlier turns summarized
           </span>
         )}
@@ -111,7 +103,7 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
             // bubble made the panel read as a stack of loud outlined boxes. Color
             // weight is now carried by a single 3px left accent bar on an otherwise
             // neutral (or lightly tinted, for "You") bubble background.
-            const accentVar = isUser ? 'var(--wf-accent-blue)' : 'var(--wf-accent-purple)';
+            const accentVar = isUser ? 'var(--wf-info)' : 'var(--wf-accent)';
             return (
               <motion.div
                 key={i}
@@ -121,8 +113,8 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
                 style={{
                   alignSelf: isUser ? 'flex-end' : 'flex-start',
                   maxWidth: '85%',
-                  background: isUser ? 'var(--wf-tint-info)' : 'var(--wf-bg)',
-                  borderLeft: `3px solid ${accentVar}`,
+                  background: 'var(--wf-panel2)',
+                  borderLeft: `2px solid ${accentVar}`,
                   borderRadius: 'var(--wf-radius)',
                   padding: '0.4rem 0.6rem',
                 }}
@@ -162,35 +154,13 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
             }
           }}
           placeholder="Message the office..."
-          style={{
-            flex: 1,
-            background: 'var(--wf-bg)',
-            border: '1px solid var(--wf-fg-secondary)',
-            borderRadius: 'var(--wf-radius)',
-            padding: '0.4rem 0.5rem',
-            color: 'var(--wf-fg)',
-            fontSize: '0.8rem',
-          }}
+          style={{ flex: 1, fontSize: '0.8rem' }}
         />
-        <button
-          onClick={() => void submit()}
-          disabled={sending || !draft.trim()}
-          style={{
-            fontSize: '0.75rem',
-            fontWeight: 600,
-            borderRadius: 'var(--wf-radius)',
-            padding: '0.4rem 0.75rem',
-            border: '1px solid var(--wf-accent-purple)',
-            color: 'var(--wf-accent-purple)',
-            background: 'transparent',
-            cursor: sending || !draft.trim() ? 'not-allowed' : 'pointer',
-            opacity: sending || !draft.trim() ? 0.5 : 1,
-          }}
-        >
-          Send
+        <button onClick={() => void submit()} disabled={sending || !draft.trim()} className="wf-btn wf-btn-accent">
+          send
         </button>
       </div>
-      {error && <span style={{ fontSize: '0.7rem', color: 'var(--wf-accent-pink)' }}>{error}</span>}
+      {error && <span style={{ fontSize: '0.7rem', color: 'var(--wf-error)' }}>{error}</span>}
 
       <div>
         <h4 style={{ margin: '0 0 0.3rem', fontSize: '0.65rem', color: 'var(--wf-fg-secondary)', textTransform: 'uppercase' }}>
@@ -203,20 +173,10 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
             {outbox.map((n) => {
               const status = noticeStatus(n);
               return (
-                <div key={n.id} style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
-                  <span
-                    style={{
-                      fontSize: '0.6rem',
-                      fontWeight: 600,
-                      color: STATUS_COLOR[status],
-                      border: `1px solid ${STATUS_COLOR[status]}`,
-                      borderRadius: 'var(--wf-radius)',
-                      padding: '0.02rem 0.35rem',
-                    }}
-                  >
-                    {status}
-                  </span>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--wf-fg)' }}>{n.text}</span>
+                <div key={n.id} style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', fontSize: '0.72rem' }}>
+                  <span className="wf-status-dot" style={{ background: STATUS_COLOR[status], width: 5, height: 5 }} />
+                  <span style={{ color: STATUS_COLOR[status] }}>{status}</span>
+                  <span style={{ color: 'var(--wf-fg)' }}>{n.text}</span>
                 </div>
               );
             })}

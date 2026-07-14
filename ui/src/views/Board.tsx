@@ -7,6 +7,7 @@ import Drilldown from './Drilldown';
 import DepMap from '../components/DepMap';
 import TaskDetail from './TaskDetail';
 import Prd from './Prd';
+import ConfirmButton from '../components/ConfirmButton';
 
 /** Project shape, full mode, per docs/PANEL_PROTOCOL.md 2.1 (frozen W7 contract). */
 export interface ProjectPhase {
@@ -113,43 +114,6 @@ export function guardCardMove(state: TaskStateKey, to: ColumnKey, killWorker: bo
   return { legal: true };
 }
 
-/**
- * Two-step destructive button. wry webviews have NO native window.confirm /
- * alert / prompt (they silently return falsy), so every confirmation must be
- * in-UI: first click arms the button ("confirm <label>?"), second click within
- * 3.5s fires; it disarms automatically after the timeout.
- */
-const ConfirmButton: React.FC<{
-  label: string;
-  className: string;
-  onConfirm: () => void;
-  testId?: string;
-}> = ({ label, className, onConfirm, testId }) => {
-  const [armed, setArmed] = useState(false);
-  useEffect(() => {
-    if (!armed) return;
-    const t = setTimeout(() => setArmed(false), 3500);
-    return () => clearTimeout(t);
-  }, [armed]);
-  return (
-    <button
-      data-testid={testId}
-      className={className}
-      style={armed ? { fontWeight: 700 } : undefined}
-      onClick={() => {
-        if (armed) {
-          setArmed(false);
-          onConfirm();
-        } else {
-          setArmed(true);
-        }
-      }}
-    >
-      {armed ? `confirm ${label}?` : label}
-    </button>
-  );
-};
-
 export interface BoardProps {
   projectId: string;
   onBack?: () => void;
@@ -193,6 +157,13 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
     const t = setTimeout(() => setToast(null), 3500);
     return () => clearTimeout(t);
   }, [toast]);
+
+  // `initialTaskId` resolves asynchronously (App picks it after the first snapshot),
+  // usually AFTER this component mounted with `undefined` — a `useState` initial
+  // value alone would silently ignore the deep link. Apply it whenever it arrives.
+  useEffect(() => {
+    if (initialTaskId) setSelectedTaskId(initialTaskId);
+  }, [initialTaskId]);
 
   // Reset the task-detail selection on a genuine project switch, but not on the
   // initial mount — otherwise a deep-linked `initialTaskId` (?view=task) would be

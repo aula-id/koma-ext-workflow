@@ -3,28 +3,65 @@ import { motion } from 'framer-motion';
 import { bridge } from '../bridge';
 import type { Task } from '../components/Card';
 import Comments from '../components/Comments';
+import ConfirmButton from '../components/ConfirmButton';
 
+/** Compact timestamps: time-of-day for today, short date + time otherwise —
+ * the drawer used to repeat eight full `toLocaleString()` datetimes in a row. */
 function formatTime(ms: number): string {
   try {
-    return new Date(ms).toLocaleString();
+    const d = new Date(ms);
+    const now = new Date();
+    const sameDay =
+      d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (sameDay) return time;
+    return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
   } catch {
     return String(ms);
   }
 }
 
 const STATE_LABEL: Record<Task['state'], string> = {
-  backlog: 'Backlog',
-  todo: 'Todo',
-  onprogress: 'Running',
-  review: 'Review',
-  parked: 'Parked',
-  done: 'Done',
+  backlog: 'backlog',
+  todo: 'todo',
+  onprogress: 'running',
+  review: 'review',
+  parked: 'parked',
+  done: 'done',
+};
+
+const STATE_COLOR: Record<Task['state'], string> = {
+  backlog: 'var(--wf-dim)',
+  todo: 'var(--wf-dim)',
+  onprogress: 'var(--wf-status-running)',
+  review: 'var(--wf-status-review)',
+  parked: 'var(--wf-status-parked)',
+  done: 'var(--wf-status-done)',
 };
 
 export interface TaskDetailProps {
   task: Task;
   onClose?: () => void;
 }
+
+/** Section: small-caps title over a hairline — koma grammar, no boxes. */
+const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
+  <section style={{ borderTop: '1px solid var(--wf-border)', paddingTop: '0.55rem' }}>
+    <h3
+      style={{
+        fontSize: '0.65rem',
+        fontWeight: 600,
+        textTransform: 'uppercase',
+        letterSpacing: '0.08em',
+        color: 'var(--wf-dim)',
+        margin: '0 0 0.4rem',
+      }}
+    >
+      {title}
+    </h3>
+    {children}
+  </section>
+);
 
 /**
  * Full-body task view (ARCHITECTURE.md 10.3). The frozen snapshot (PANEL_PROTOCOL.md
@@ -57,8 +94,7 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({ task, onClose }) => {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const run = async (payload: Record<string, unknown>, confirmMsg?: string) => {
-    if (confirmMsg && !window.confirm(confirmMsg)) return;
+  const run = async (payload: Record<string, unknown>) => {
     setBusy(true);
     try {
       const res = await bridge.send(payload);
@@ -71,12 +107,8 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({ task, onClose }) => {
   };
 
   const savePriority = () => run({ op: 'edit_task', task: task.id, priority: priorityDraft });
-  const unpark = () => run({ op: 'unpark', task: task.id }, `Unpark "${task.title}" and send it back to Todo?`);
-  const killWorker = () =>
-    run(
-      { op: 'card_move', task: task.id, to: 'todo', killWorker: true },
-      `Kill the running worker for "${task.title}" and requeue it?`,
-    );
+  const unpark = () => run({ op: 'unpark', task: task.id });
+  const killWorker = () => run({ op: 'card_move', task: task.id, to: 'todo', killWorker: true });
 
   const history = (task.history ?? []).slice().sort((a, b) => a.atMs - b.atMs);
   const loaded = task.description !== undefined;
@@ -95,8 +127,8 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({ task, onClose }) => {
         width: 'min(420px, 100vw)',
         boxSizing: 'border-box',
         zIndex: 40,
-        background: 'var(--wf-bg-secondary)',
-        boxShadow: 'var(--wf-shadow)',
+        background: 'var(--wf-panel)',
+        borderLeft: '1px solid var(--wf-border)',
         padding: '1rem 1.25rem',
         display: 'flex',
         flexDirection: 'column',
@@ -109,32 +141,69 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({ task, onClose }) => {
       data-testid="task-detail"
     >
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '0.5rem' }}>
-        <div>
-          <span style={{ fontSize: '0.65rem', color: 'var(--wf-fg-secondary)' }}>{task.id}</span>
-          <h2 style={{ margin: '0.15rem 0 0', color: 'var(--wf-fg)', fontSize: '1.1rem' }}>{task.title}</h2>
-          <span style={{ fontSize: '0.7rem', color: 'var(--wf-accent-blue)' }}>{STATE_LABEL[task.state]}</span>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.5rem' }}>
+            <span style={{ fontSize: '0.68rem', color: 'var(--wf-dim)' }}>{task.id}</span>
+            <span className="wf-status" style={{ color: STATE_COLOR[task.state] }}>
+              <span className="wf-status-dot" style={{ background: STATE_COLOR[task.state] }} />
+              {STATE_LABEL[task.state]}
+            </span>
+          </div>
+          <h2 style={{ margin: '0.2rem 0 0', color: 'var(--wf-fg)', fontSize: '0.95rem', fontWeight: 700 }}>
+            {task.title}
+          </h2>
+          {/* meta line: priority editor inline, bounces only when present */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.4rem', fontSize: '0.75rem' }}>
+            <span style={{ color: 'var(--wf-dim)' }}>priority</span>
+            <input
+              type="number"
+              value={priorityDraft}
+              onChange={(e) => setPriorityDraft(Number(e.target.value))}
+              style={{ width: 54, padding: '0.15rem 0.35rem' }}
+              aria-label="priority"
+            />
+            {priorityDraft !== task.priority && (
+              <button onClick={() => void savePriority()} disabled={busy} className="wf-btn wf-btn-accent" style={{ padding: '0.15rem 0.5rem' }}>
+                save
+              </button>
+            )}
+            {task.bounces > 0 && (
+              <span style={{ color: 'var(--wf-warn)' }}>
+                {task.bounces} bounce{task.bounces === 1 ? '' : 's'}
+              </span>
+            )}
+          </div>
         </div>
         {onClose && (
-          <button onClick={onClose} style={closeButtonStyle} aria-label="close task detail">
+          <button onClick={onClose} className="wf-btn wf-btn-ghost" aria-label="close task detail">
             close
           </button>
         )}
       </div>
 
-      {!loaded && (
-        <p style={{ fontSize: '0.75rem', color: 'var(--wf-fg-secondary)' }}>Loading full detail…</p>
+      {!loaded && <p style={{ fontSize: '0.75rem', color: 'var(--wf-dim)', margin: 0 }}>Loading full detail…</p>}
+
+      {(task.state === 'parked' || task.state === 'onprogress') && (
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          {task.state === 'parked' && (
+            <ConfirmButton label="unpark" className="wf-btn wf-btn-accent" disabled={busy} onConfirm={() => void unpark()} testId="unpark-btn" />
+          )}
+          {task.state === 'onprogress' && (
+            <ConfirmButton label="kill worker" className="wf-btn wf-btn-danger" disabled={busy} onConfirm={() => void killWorker()} testId="kill-worker-btn" />
+          )}
+        </div>
       )}
 
       {task.description && (
-        <section>
-          <h3 style={sectionHeadStyle}>Description</h3>
-          <p style={{ fontSize: '0.85rem', color: 'var(--wf-fg)', whiteSpace: 'pre-wrap' }}>{task.description}</p>
-        </section>
+        <Section title="Description">
+          <p style={{ fontSize: '0.82rem', color: 'var(--wf-fg)', whiteSpace: 'pre-wrap', margin: 0 }}>
+            {task.description}
+          </p>
+        </Section>
       )}
 
       {task.acceptance && task.acceptance.length > 0 && (
-        <section>
-          <h3 style={sectionHeadStyle}>Acceptance criteria</h3>
+        <Section title="Acceptance criteria">
           <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
             {task.acceptance.map((a, i) => (
               <li key={i} style={{ fontSize: '0.8rem', color: 'var(--wf-fg)' }}>
@@ -142,156 +211,58 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({ task, onClose }) => {
               </li>
             ))}
           </ul>
-        </section>
+        </Section>
       )}
 
-      <section>
-        <h3 style={sectionHeadStyle}>Attempts &amp; bounces</h3>
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-          <span
-            style={{
-              fontSize: '0.75rem',
-              fontWeight: 600,
-              color: task.bounces > 0 ? 'var(--wf-accent-pink)' : 'var(--wf-fg-secondary)',
-            }}
-          >
-            bounces: {task.bounces}
-          </span>
-          <span style={{ fontSize: '0.75rem', color: 'var(--wf-fg-secondary)' }}>priority: p{task.priority}</span>
-        </div>
-      </section>
-
-      <section>
-        <h3 style={sectionHeadStyle}>Priority</h3>
-        <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
-          <input
-            type="number"
-            value={priorityDraft}
-            onChange={(e) => setPriorityDraft(Number(e.target.value))}
-            style={{
-              width: 70,
-              background: 'var(--wf-bg)',
-              border: '1px solid var(--wf-fg-secondary)',
-              borderRadius: 'var(--wf-radius)',
-              padding: '0.3rem 0.4rem',
-              color: 'var(--wf-fg)',
-              fontSize: '0.8rem',
-            }}
-          />
-          <button
-            onClick={() => void savePriority()}
-            disabled={busy || priorityDraft === task.priority}
-            style={actionButtonStyle('var(--wf-accent-blue)', busy || priorityDraft === task.priority)}
-          >
-            Save
-          </button>
-        </div>
-      </section>
-
-      <section>
-        <h3 style={sectionHeadStyle}>Actions</h3>
-        <div style={{ display: 'flex', gap: '0.5rem' }}>
-          {task.state === 'parked' && (
-            <button onClick={() => void unpark()} disabled={busy} style={actionButtonStyle('var(--wf-accent-green)', busy)}>
-              Unpark
-            </button>
-          )}
-          {task.state === 'onprogress' && (
-            <button onClick={() => void killWorker()} disabled={busy} style={actionButtonStyle('var(--wf-accent-pink)', busy)}>
-              Kill worker
-            </button>
-          )}
-          {task.state !== 'parked' && task.state !== 'onprogress' && (
-            <span style={{ fontSize: '0.75rem', color: 'var(--wf-fg-secondary)' }}>no actions available</span>
-          )}
-        </div>
-      </section>
-
       {task.lastReport && (
-        <section>
-          <h3 style={sectionHeadStyle}>Worker report</h3>
+        <Section title="Worker report">
           <pre style={monoBlockStyle}>{task.lastReport}</pre>
-        </section>
+        </Section>
       )}
 
       {task.lastReview && (
-        <section>
-          <h3 style={sectionHeadStyle}>Review verdict</h3>
+        <Section title="Review verdict">
           <pre style={monoBlockStyle}>{task.lastReview}</pre>
-        </section>
+        </Section>
       )}
 
-      <section>
-        <h3 style={sectionHeadStyle}>State history</h3>
+      <Section title="History">
         {history.length === 0 ? (
-          <p style={{ fontSize: '0.75rem', color: 'var(--wf-fg-secondary)' }}>No history yet.</p>
+          <p style={{ fontSize: '0.75rem', color: 'var(--wf-dim)', margin: 0 }}>No history yet.</p>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
             {history.map((h, i) => (
-              <div key={i} style={{ display: 'flex', gap: '0.5rem', fontSize: '0.75rem' }}>
-                <span style={{ color: 'var(--wf-fg-secondary)', minWidth: 130 }}>{formatTime(h.atMs)}</span>
+              <div key={i} style={{ display: 'flex', gap: '0.6rem', fontSize: '0.74rem' }}>
+                <span style={{ color: 'var(--wf-dim)', minWidth: 84, textAlign: 'right', flex: 'none' }}>
+                  {formatTime(h.atMs)}
+                </span>
                 <span style={{ color: 'var(--wf-fg)' }}>{h.event}</span>
               </div>
             ))}
           </div>
         )}
-      </section>
+      </Section>
 
-      <section>
-        <h3 style={sectionHeadStyle}>Comments</h3>
+      <Section title="Comments">
         <Comments taskId={task.id} comments={task.comments ?? []} taskDone={task.state === 'done'} />
-      </section>
+      </Section>
 
-      {toast && (
-        <span style={{ fontSize: '0.75rem', color: 'var(--wf-accent-orange)' }}>{toast}</span>
-      )}
+      {toast && <span style={{ fontSize: '0.75rem', color: 'var(--wf-warn)' }}>{toast}</span>}
     </motion.div>
   );
 };
 
-const sectionHeadStyle: React.CSSProperties = {
-  fontSize: '0.7rem',
-  fontWeight: 700,
-  textTransform: 'uppercase',
-  letterSpacing: '0.03em',
-  color: 'var(--wf-fg-secondary)',
-  margin: '0 0 0.35rem',
-};
-
 const monoBlockStyle: React.CSSProperties = {
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  fontFamily: 'inherit',
   fontSize: '0.75rem',
   color: 'var(--wf-fg)',
-  background: 'var(--wf-bg)',
+  background: 'var(--wf-panel2)',
+  border: '1px solid var(--wf-border)',
   borderRadius: 'var(--wf-radius)',
-  padding: '0.6rem',
+  padding: '0.5rem 0.6rem',
   overflowX: 'auto',
   whiteSpace: 'pre-wrap',
   margin: 0,
 };
-
-const closeButtonStyle: React.CSSProperties = {
-  fontSize: '0.7rem',
-  color: 'var(--wf-fg-secondary)',
-  background: 'transparent',
-  border: '1px solid var(--wf-fg-secondary)',
-  borderRadius: 'var(--wf-radius)',
-  padding: '0.2rem 0.5rem',
-  cursor: 'pointer',
-};
-
-function actionButtonStyle(colorVar: string, disabled: boolean): React.CSSProperties {
-  return {
-    fontSize: '0.75rem',
-    fontWeight: 600,
-    borderRadius: 'var(--wf-radius)',
-    padding: '0.35rem 0.7rem',
-    border: `1px solid ${colorVar}`,
-    color: colorVar,
-    background: 'transparent',
-    cursor: disabled ? 'not-allowed' : 'pointer',
-    opacity: disabled ? 0.5 : 1,
-  };
-}
 
 export default TaskDetail;
