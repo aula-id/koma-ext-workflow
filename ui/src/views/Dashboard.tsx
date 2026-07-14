@@ -8,17 +8,34 @@ interface DashboardProps {
   onSettings?: () => void;
 }
 
+/**
+ * Task-completion ring. `running` gates both the color and the semantics: a
+ * colored, "live" ring only appears while the project is actually running —
+ * showing the same active-green arc on a Halted or still-empty Drafting project
+ * (as the old always-green version did) reads as a stuck/broken loading spinner.
+ * Non-running projects get a static neutral ring instead.
+ *
+ * The done/total fraction used to be baked into the SVG as visible `<text>`,
+ * which (a) duplicated the "Total" stat tile below and (b) routinely overflowed
+ * the ring's own bounds at this size, making it look like loose text floating
+ * next to a broken arc. It's exposed as an accessible label instead — the
+ * numbers still live in the stat tiles, once, not twice.
+ */
 const ProgressRing: React.FC<{
   done: number;
   total: number;
+  running: boolean;
   size?: number;
-}> = ({ done, total, size = 40 }) => {
+}> = ({ done, total, running, size = 40 }) => {
   const radius = size / 2 - 2;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference - (done / Math.max(total, 1)) * circumference;
+  const ringColor = running ? 'var(--wf-accent-green)' : 'var(--wf-fg-secondary)';
+  const label = `${done} of ${total} task${total === 1 ? '' : 's'} complete`;
 
   return (
-    <svg width={size} height={size} className="inline-block">
+    <svg width={size} height={size} className="inline-block" role="img" aria-label={label}>
+      <title>{label}</title>
       <circle
         cx={size / 2}
         cy={size / 2}
@@ -32,7 +49,7 @@ const ProgressRing: React.FC<{
         cy={size / 2}
         r={radius}
         fill="none"
-        stroke="var(--wf-accent-green)"
+        stroke={ringColor}
         strokeWidth="2"
         strokeDasharray={circumference}
         strokeDashoffset={offset}
@@ -40,28 +57,23 @@ const ProgressRing: React.FC<{
         animate={{ strokeDashoffset: offset }}
         transition={{ duration: 0.5 }}
       />
-      <text
-        x={size / 2}
-        y={size / 2}
-        textAnchor="middle"
-        dy="0.3em"
-        fontSize="10"
-        fill="var(--wf-fg)"
-      >
-        {done}/{total}
-      </text>
     </svg>
   );
 };
 
-// Project phase badge colors, mapped onto koma's status/accent roles (same roles
-// `--wf-status-*` uses for task cards): running -> info, done -> success,
-// interrupted -> warn, halted -> error, ready -> accent (actionable), drafting has
-// no strong status yet so it stays neutral.
+// Project phase badge colors. `running` intentionally uses the same green as
+// `done`/success rather than the koma "info" blue role: this is the single
+// semantic-color source for a running project across the whole card — the
+// phase badge, the progress ring (see ProgressRing's `running` prop) and the
+// "Running" stat tile below all read from here (or its literal value) so the
+// same state never shows up in two colors on one card. interrupted/parked read
+// as the "amber" bucket, halted/blocked as the "red" bucket (accent-pink is
+// koma's error role, i.e. red), drafting has no strong status yet so it stays
+// neutral, ready keeps the purple accent as the actionable/next-step color.
 const PHASE_COLOR_VAR: Record<string, string> = {
   drafting: 'var(--wf-fg-secondary)',
   ready: 'var(--wf-accent-purple)',
-  running: 'var(--wf-accent-blue)',
+  running: 'var(--wf-accent-green)',
   interrupted: 'var(--wf-accent-orange)',
   halted: 'var(--wf-accent-pink)',
   done: 'var(--wf-accent-green)',
@@ -75,10 +87,17 @@ const ProjectCard: React.FC<{
   const phaseColorVar = PHASE_COLOR_VAR[phaseKind] || 'var(--wf-fg-secondary)';
   const isNeutralPhase = phaseColorVar === 'var(--wf-fg-secondary)';
 
+  const isRunning = phaseKind === 'running';
+
   return (
     <motion.div
       layout
-      initial={{ opacity: 0, scale: 0.95 }}
+      // Opacity stays pinned at 1 on entrance — only `scale` animates. A card
+      // whose *first painted frame* is opacity:0 means every label/number on it
+      // is briefly illegible, which is what design-critique round 1 caught as a
+      // "washed out" dashboard (worst-cased by whatever moment a screenshot
+      // landed on). The scale pop is still there; the text is always readable.
+      initial={{ opacity: 1, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.95 }}
       transition={{ duration: 0.2 }}
@@ -102,39 +121,47 @@ const ProjectCard: React.FC<{
           </span>
         </div>
         <div className="ml-2">
-          <ProgressRing done={project.doneCount || 0} total={project.taskCount || 0} />
+          <ProgressRing
+            done={project.doneCount || 0}
+            total={project.taskCount || 0}
+            running={isRunning}
+          />
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 mb-3 text-sm">
+      <div className="grid grid-cols-3 gap-3 mb-3 text-sm">
         <div className="p-2 rounded" style={{ backgroundColor: 'var(--wf-bg)' }}>
-          <div className="text-xs" style={{ color: 'var(--wf-fg-secondary)' }}>Running</div>
-          <div className="text-lg font-bold" style={{ color: 'var(--wf-accent-blue)' }}>
+          <div className="text-xs uppercase tracking-wide" style={{ color: 'var(--wf-fg-secondary)' }}>Running</div>
+          <div className="text-2xl font-semibold" style={{ color: 'var(--wf-accent-green)' }}>
             {project.runningCount || 0}
           </div>
         </div>
         <div className="p-2 rounded" style={{ backgroundColor: 'var(--wf-bg)' }}>
-          <div className="text-xs" style={{ color: 'var(--wf-fg-secondary)' }}>Parked</div>
-          <div className="text-lg font-bold" style={{ color: 'var(--wf-accent-orange)' }}>
+          <div className="text-xs uppercase tracking-wide" style={{ color: 'var(--wf-fg-secondary)' }}>Parked</div>
+          <div className="text-2xl font-semibold" style={{ color: 'var(--wf-accent-orange)' }}>
             {project.parkedCount || 0}
           </div>
         </div>
         <div className="p-2 rounded" style={{ backgroundColor: 'var(--wf-bg)' }}>
-          <div className="text-xs" style={{ color: 'var(--wf-fg-secondary)' }}>Total</div>
-          <div className="text-lg font-bold" style={{ color: 'var(--wf-fg-secondary)' }}>
+          <div className="text-xs uppercase tracking-wide" style={{ color: 'var(--wf-fg-secondary)' }}>Total</div>
+          <div className="text-2xl font-semibold" style={{ color: 'var(--wf-fg-secondary)' }}>
             {project.taskCount || 0}
           </div>
         </div>
       </div>
 
-      {project.lastNotice && (
-        <div
-          className="p-2 rounded text-xs truncate"
-          style={{ backgroundColor: 'var(--wf-bg)', color: 'var(--wf-fg-secondary)' }}
-        >
-          {project.lastNotice}
-        </div>
-      )}
+      {/* Always reserve the note row (a muted placeholder when there's nothing to
+          show) rather than letting cards without a `lastNotice` go quietly taller
+          via grid row-stretch — see the `items-start` on the grid below, which
+          stops row-stretch from padding shorter cards out in the first place; this
+          placeholder additionally keeps every card's own internal layout identical
+          regardless of content. */}
+      <div
+        className="p-2 rounded text-xs truncate"
+        style={{ backgroundColor: 'var(--wf-bg)', color: 'var(--wf-fg-secondary)' }}
+      >
+        {project.lastNotice || 'No recent activity'}
+      </div>
     </motion.div>
   );
 };
@@ -189,7 +216,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
   const globalHalted = haltedProjects > 0;
 
   return (
-    <div className="min-h-screen p-6" style={{ backgroundColor: 'var(--wf-bg)' }}>
+    // Was `min-h-screen`: pinning this content wrapper to the full viewport height
+    // when it only ever holds a few short cards rendered a large dead void below
+    // them (design-critique round 1). The outer App shell already paints
+    // `--wf-bg` across the full viewport (see App.tsx), so this container only
+    // needs to size to its own content.
+    <div className="p-6" style={{ backgroundColor: 'var(--wf-bg)' }}>
       <div className="max-w-7xl mx-auto">
         <div className="flex items-center justify-between mb-6">
           <div>
@@ -205,12 +237,29 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
           {onSettings && (
             <button
               onClick={onSettings}
-              className="px-4 py-2 rounded transition-colors"
+              className="flex items-center gap-2 px-4 py-2 rounded border transition-colors hover:bg-[var(--wf-hover)]"
               style={{
-                backgroundColor: 'var(--wf-bg-secondary)',
+                backgroundColor: 'transparent',
+                borderColor: 'var(--wf-border)',
                 color: 'var(--wf-fg)',
               }}
             >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                  d="M12 15a3 3 0 100-6 3 3 0 000 6z"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1.08-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
               Settings
             </button>
           )}
@@ -225,7 +274,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
             </p>
           </div>
         ) : (
-          <motion.div layout className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <motion.div layout className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 items-start">
             <AnimatePresence mode="popLayout">
               {projects.map((project) => (
                 <ProjectCard

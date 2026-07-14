@@ -129,6 +129,27 @@ const App: React.FC = () => {
           initialTab={boardTab}
           initialTaskId={initialTaskId}
         />
+      ) : currentView === 'board' ? (
+        // `currentView` flips to 'board' the instant a `?view=board|drilldown|task|office`
+        // deep link is parsed, but `selectedProject` only resolves once the first
+        // snapshot arrives (see the deepLinkResolved effect above) — a real async gap,
+        // not just a screenshot-timing artifact. Without this branch the ternary fell
+        // through to the `else` and rendered Dashboard for that whole window, which is
+        // exactly the "every board/drilldown/task/office route shows the dashboard"
+        // routing bug design-critique round 1 caught. Render a neutral loading state
+        // instead of ever silently substituting a different view.
+        <div
+          style={{
+            minHeight: '100vh',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: 'var(--wf-fg-secondary)',
+            fontSize: '0.875rem',
+          }}
+        >
+          Loading project…
+        </div>
       ) : currentView === 'settings' ? (
         <Settings
           projectId={selectedProject || undefined}

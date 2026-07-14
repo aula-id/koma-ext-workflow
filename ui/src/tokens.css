@@ -34,7 +34,11 @@
   --wf-fg: #e6e6e6;
   --wf-fg-secondary: #adadad;
 
-  --wf-border: #171717;
+  /* Bumped from the koma-sourced #171717: that value sits at ~1.2:1 contrast
+   * against --wf-bg (#000000), i.e. invisible as a card/section border (WCAG
+   * non-text UI components want >=3:1). #606060 clears ~3.3:1 while staying
+   * subtle. See design-critique round 1: "Section card borders are invisible". */
+  --wf-border: #606060;
   --wf-hover: #121212;
 
   --wf-accent-blue: #50c8ff;
@@ -71,7 +75,8 @@
   --wf-fg: #141414;
   --wf-fg-secondary: #787878;
 
-  --wf-border: #e3e3df;
+  /* Same contrast fix as the dark theme above: #e3e3df on #fafaf6 was ~1.2:1. */
+  --wf-border: #909090;
   --wf-hover: #e8e8e4;
 
   --wf-accent-blue: #1e78c8;

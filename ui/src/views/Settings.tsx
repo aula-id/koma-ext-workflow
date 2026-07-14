@@ -179,8 +179,14 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
           Settings
         </h1>
 
+        {/* `initial={false}`: this wraps every readable label/input/value on the page,
+            so animating it in from opacity:0 means there's a real (if brief) frame
+            where the whole settings form is illegible — exactly what design-critique
+            round 1 flagged as "unreadable" text/labels/borders. Skip the mount fade
+            entirely and paint straight at the `animate` state; nothing here needs an
+            entrance flourish. */}
         <motion.div
-          initial={{ opacity: 0, y: 10 }}
+          initial={false}
           animate={{ opacity: 1, y: 0 }}
           className="space-y-6"
         >
