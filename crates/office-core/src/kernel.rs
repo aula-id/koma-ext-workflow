@@ -371,8 +371,37 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             };
             p.office_transcript.push(ChatMsg {
                 who: ChatAuthor::Office,
-                text: reply,
+                text: reply.clone(),
             });
+            // The trio is MAIN-CHAT-FIRST: every office drafting reply also goes out
+            // through the chat.prompt outbox so the whole PRD conversation happens in
+            // the koma chat (the panel transcript is the secondary surface). Long
+            // replies are clipped for the notice — the full text is always in the
+            // panel transcript.
+            //
+            // PRD capture (6.2): a ```prd fenced block in the reply IS the PRD. Land
+            // it and immediately drive the pipeline forward with the breakdown invoke
+            // (Drafting -> Ready once it validates) — without this the persona chats
+            // forever while the board stays empty (live-test 2026-07-15).
+            if matches!(p.phase, ProjectPhase::Drafting) {
+                if let Some(prd) = office::extract_prd(&reply) {
+                    p.prd_markdown = prd;
+                    queue_notice(
+                        p,
+                        now_ms,
+                        format!(
+                            "office[{}]: PRD drafted (full text in the Workflow panel). Breaking it down into epics/stories/tasks now — authorize with a delivery path to start the line.",
+                            p.id.0
+                        ),
+                        ctx,
+                    );
+                    request_breakdown(p, ctx);
+                    ctx.dirty = true;
+                    return;
+                }
+            }
+            let clipped = clip_notice(&reply);
+            queue_notice(p, now_ms, format!("office[{}]: {}", p.id.0, clipped), ctx);
             ctx.dirty = true;
         }
         InvokePurpose::Fold => {
@@ -920,6 +949,20 @@ fn maybe_complete_project(p: &mut Project, now_ms: u64) {
             p.phase = ph;
         }
     }
+}
+
+/// Clip a persona reply to fit an outbox notice (driver sends <=4KB per tick; the
+/// host chat.prompt cap is 16KB). Cuts on a char boundary and marks the clip.
+fn clip_notice(reply: &str) -> String {
+    const MAX: usize = 3200;
+    if reply.len() <= MAX {
+        return reply.to_string();
+    }
+    let mut cut = MAX;
+    while !reply.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n[clipped — full reply in the Workflow panel]", &reply[..cut])
 }
 
 /// Mint an outbox notice and emit the chat.prompt effect for it.

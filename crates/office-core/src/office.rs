@@ -105,7 +105,49 @@ fn render_turns(turns: &[&ChatMsg]) -> String {
 }
 
 const PERSONA_CONTRACT: &str = "\nRespond as the Workflow front office: negotiate scope, \
-answer clearly, and drive toward a PRD. Be concise and decisive.\n";
+answer clearly, and drive toward a PRD. Be concise and decisive.\n\
+When (and only when) the scope is agreed, emit the COMPLETE PRD as markdown inside a \
+fenced block that starts with ```prd and ends with ``` — that exact fence is how the \
+system captures the PRD and starts the production line; a PRD outside that fence does \
+not count and nothing will happen.\n";
+
+/// Capture a PRD from a persona reply: the LAST ```prd fenced block, if any (6.2).
+/// The fence is the explicit capture contract given to the persona in
+/// [`PERSONA_CONTRACT`]; free-text 'here is the PRD' prose is deliberately ignored.
+pub fn extract_prd(reply: &str) -> Option<String> {
+    let mut result = None;
+    let mut rest = reply;
+    while let Some(start) = rest.find("```prd") {
+        let after = &rest[start + 6..];
+        // fence marker must end its line
+        let body_start = match after.find('\n') {
+            Some(i) if after[..i].trim().is_empty() => i + 1,
+            _ => {
+                rest = &rest[start + 6..];
+                continue;
+            }
+        };
+        let body = &after[body_start..];
+        match body.find("\n```") {
+            Some(end) => {
+                let prd = body[..end].trim();
+                if !prd.is_empty() {
+                    result = Some(prd.to_string());
+                }
+                rest = &body[end + 4..];
+            }
+            None => {
+                // unterminated fence: tolerate, take the remainder
+                let prd = body.trim();
+                if !prd.is_empty() {
+                    result = Some(prd.to_string());
+                }
+                break;
+            }
+        }
+    }
+    result
+}
 
 fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
     let mut prompt = String::new();

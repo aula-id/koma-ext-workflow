@@ -263,3 +263,28 @@ fn authorize_from_wrong_phase_is_rejected() {
     let err = office::authorize(&mut p, PathBuf::from("/ws/deliver"), false).unwrap_err();
     assert_eq!(err, office::AuthError::WrongPhase);
 }
+
+// ---- extract_prd: the ```prd fence capture contract (6.2) ----
+
+#[test]
+fn extract_prd_captures_a_fenced_block() {
+    let reply = "Sounds good.\n```prd\n# Title\nBody line.\n```\nAnything else?";
+    assert_eq!(office::extract_prd(reply).as_deref(), Some("# Title\nBody line."));
+}
+
+#[test]
+fn extract_prd_takes_the_last_fence_and_ignores_prose() {
+    let reply = "draft one\n```prd\nold\n```\nrevised:\n```prd\nnew version\n```";
+    assert_eq!(office::extract_prd(reply).as_deref(), Some("new version"));
+    assert_eq!(office::extract_prd("here is the PRD: build a todo app"), None);
+}
+
+#[test]
+fn extract_prd_tolerates_an_unterminated_fence_and_rejects_empty() {
+    assert_eq!(
+        office::extract_prd("```prd\ncontent till end").as_deref(),
+        Some("content till end")
+    );
+    assert_eq!(office::extract_prd("```prd\n\n```"), None);
+    assert_eq!(office::extract_prd(""), None);
+}

@@ -518,6 +518,54 @@ fn brief_runs_invoke_off_loop_and_result_lands_in_transcript_without_starving_di
     assert_eq!(a.office_transcript.len(), 2, "user turn + office reply");
     assert_eq!(a.office_transcript[1].who, ChatAuthor::Office);
     assert_eq!(a.office_transcript[1].text, "Sure, here is my plan.");
+
+    // Main-chat-first trio: the office reply is ALSO queued to the chat.prompt
+    // outbox (live-test 2026-07-15: replies used to land only in the panel
+    // transcript, leaving the koma chat silent after "answer will arrive via chat").
+    assert!(
+        a.outbox.iter().any(|n| n.text.contains("Sure, here is my plan.") && n.text.starts_with("office[a]:")),
+        "office reply flows to the koma chat via the outbox"
+    );
+}
+
+#[test]
+fn persona_reply_with_prd_fence_lands_prd_and_kicks_breakdown() {
+    // Live-test 2026-07-15: the persona narrated "handoff complete" forever while
+    // prd_markdown stayed empty and the board never filled. A ```prd fence in the
+    // reply must land as the PRD and immediately trigger the breakdown invoke.
+    let (store, _dir) = temp_store();
+    let mut d = driver(store, FakeHost::new());
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    d.insert_for_test(drafting("a"), 1_000);
+    d.handle(
+        handlers::Input::Command(handlers::Command::Brief {
+            project: Some("a".to_string()),
+            message: "simple todo app".to_string(),
+        }),
+        1_000,
+    );
+    let req_id = fake.jobs.lock().unwrap()[0].req_id;
+    d.handle(
+        invoke_done(
+            req_id,
+            Ok("Agreed. Here it is:\n```prd\n# Todo App\nSimple Vite+React todo.\n```\nShall we?".to_string()),
+        ),
+        2_000,
+    );
+
+    let a = d.project("a").unwrap();
+    assert_eq!(a.prd_markdown, "# Todo App\nSimple Vite+React todo.");
+    assert!(
+        a.outbox.iter().any(|n| n.text.contains("PRD drafted")),
+        "chat notice announces the captured PRD"
+    );
+    let jobs = fake.jobs.lock().unwrap();
+    assert!(
+        jobs.iter().any(|j| j.purpose == InvokePurpose::Breakdown && j.proj_slug == "a"),
+        "breakdown invoke kicked off automatically after PRD capture"
+    );
 }
 
 #[test]

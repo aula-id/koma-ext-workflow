@@ -1,6 +1,5 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { bridge } from '../bridge';
 import type { OutboundNoticeView, Project } from './Board';
 
 /**
@@ -35,33 +34,17 @@ export interface OfficeChatProps {
   project: Project;
 }
 
+/**
+ * READ-ONLY mirror of the PRD drafting conversation. The trio happens in the koma
+ * MAIN CHAT (brief/reply flow via the workflow tools + chat notices) — this pane
+ * only lets you watch it and see pending notices; there is deliberately no input
+ * here (product decision 2026-07-15: "this chat should not exist — use the koma
+ * main chat").
+ */
 export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
-  const [draft, setDraft] = useState('');
-  const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
   const transcript = project.officeTranscript ?? [];
   const outbox = project.outbox ?? [];
   const folded = isFolded(project);
-
-  const submit = async () => {
-    const message = draft.trim();
-    if (!message) return;
-    setSending(true);
-    setError(null);
-    try {
-      const res = await bridge.send({ op: 'office_chat', project: project.id, message });
-      if (res?.error) {
-        setError(res.error);
-      } else {
-        setDraft('');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'failed to reach the office');
-    } finally {
-      setSending(false);
-    }
-  };
 
   return (
     <div
@@ -137,30 +120,15 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
           })}
         </AnimatePresence>
         {transcript.length === 0 && (
-          <p style={{ fontSize: '0.75rem', color: 'var(--wf-fg-secondary)' }}>
-            No conversation yet — say hello to start the PRD.
+          <p style={{ fontSize: '0.75rem', color: 'var(--wf-dim)' }}>
+            No conversation yet — brief the office from the koma chat (workflow_brief).
           </p>
         )}
       </div>
 
-      <div style={{ display: 'flex', gap: '0.4rem' }}>
-        <input
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              void submit();
-            }
-          }}
-          placeholder="Message the office..."
-          style={{ flex: 1, fontSize: '0.8rem' }}
-        />
-        <button onClick={() => void submit()} disabled={sending || !draft.trim()} className="wf-btn wf-btn-accent">
-          send
-        </button>
-      </div>
-      {error && <span style={{ fontSize: '0.7rem', color: 'var(--wf-error)' }}>{error}</span>}
+      <p style={{ fontSize: '0.68rem', color: 'var(--wf-dim)', margin: 0 }}>
+        Read-only mirror — talk to the office in the koma chat; replies arrive there too.
+      </p>
 
       <div>
         <h4 style={{ margin: '0 0 0.3rem', fontSize: '0.65rem', color: 'var(--wf-fg-secondary)', textTransform: 'uppercase' }}>
