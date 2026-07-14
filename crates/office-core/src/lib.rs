@@ -15,6 +15,9 @@ pub use report::{ReportStatus, ReportTrailer, ReviewTrailer, Verdict};
 pub mod digest;
 pub use digest::SnapshotMode;
 
+pub mod kernel;
+pub use kernel::{step, Command, Effect, HostEvent, Input};
+
 #[cfg(test)]
 mod domain_test;
 
@@ -32,3 +35,6 @@ mod report_test;
 
 #[cfg(test)]
 mod digest_test;
+
+#[cfg(test)]
+mod kernel_test;
