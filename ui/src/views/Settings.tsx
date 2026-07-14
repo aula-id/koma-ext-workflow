@@ -195,7 +195,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
             className="p-4 rounded-lg border"
             style={{
               backgroundColor: 'var(--wf-bg-secondary)',
-              borderColor: 'var(--wf-accent-blue)',
+              borderColor: 'var(--wf-border)',
             }}
           >
             <h2 className="text-lg font-semibold mb-4" style={{ color: 'var(--wf-fg)' }}>
@@ -227,38 +227,44 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
               className="p-4 rounded-lg border"
               style={{
                 backgroundColor: 'var(--wf-bg-secondary)',
-                borderColor: 'var(--wf-accent-blue)',
+                borderColor: 'var(--wf-border)',
               }}
             >
               <h2 className="text-lg font-semibold mb-4" style={{ color: 'var(--wf-fg)' }}>
                 Select Project
               </h2>
               <div className="grid grid-cols-2 gap-2">
-                {projects.map((project) => (
-                  <button
-                    key={project.id}
-                    onClick={() => handleProjectSelect(project)}
-                    className={`p-3 rounded text-left transition-all ${
-                      selectedProject?.id === project.id
-                        ? 'ring-2'
-                        : 'opacity-70 hover:opacity-100'
-                    }`}
-                    style={{
-                      backgroundColor:
-                        selectedProject?.id === project.id
-                          ? 'var(--wf-accent-purple)'
+                {projects.map((project) => {
+                  const selected = selectedProject?.id === project.id;
+                  return (
+                    <button
+                      key={project.id}
+                      onClick={() => handleProjectSelect(project)}
+                      className={`p-3 rounded text-left transition-all ${selected ? '' : 'opacity-70 hover:opacity-100'}`}
+                      style={{
+                        // Design-critique round 2: a 100%-saturated solid accent fill
+                        // with gray-on-green subtitle text was the loudest thing on
+                        // the page. Selection is now a subtle tint + accent border +
+                        // left accent bar instead, keeping the neutral card surface.
+                        backgroundColor: selected
+                          ? 'color-mix(in srgb, var(--wf-accent-green) 12%, var(--wf-bg-secondary))'
                           : 'var(--wf-bg)',
-                      color: 'var(--wf-fg)',
-                      boxShadow:
-                        selectedProject?.id === project.id
-                          ? `0 0 0 2px var(--wf-accent-blue)`
-                          : 'none',
-                    }}
-                  >
-                    <div className="font-semibold text-sm">{project.name}</div>
-                    <div className="text-xs opacity-70 capitalize">{project.phase.kind}</div>
-                  </button>
-                ))}
+                        border: selected
+                          ? '1px solid var(--wf-accent-green)'
+                          : '1px solid transparent',
+                        borderLeft: selected
+                          ? '3px solid var(--wf-accent-green)'
+                          : '1px solid transparent',
+                        color: 'var(--wf-fg)',
+                      }}
+                    >
+                      <div className="font-semibold text-sm">{project.name}</div>
+                      <div className="text-xs capitalize" style={{ color: 'var(--wf-fg-secondary)' }}>
+                        {project.phase.kind}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </section>
           )}
@@ -270,7 +276,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                 className="p-4 rounded-lg border"
                 style={{
                   backgroundColor: 'var(--wf-bg-secondary)',
-                  borderColor: 'var(--wf-accent-green)',
+                  borderColor: 'var(--wf-border)',
                 }}
               >
                 <h2 className="text-lg font-semibold mb-2" style={{ color: 'var(--wf-fg)' }}>
@@ -324,7 +330,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                   className="p-4 rounded-lg border space-y-4"
                   style={{
                     backgroundColor: 'var(--wf-bg-secondary)',
-                    borderColor: 'var(--wf-accent-orange)',
+                    borderColor: 'var(--wf-border)',
                   }}
                 >
                   <h2 className="text-lg font-semibold" style={{ color: 'var(--wf-fg)' }}>

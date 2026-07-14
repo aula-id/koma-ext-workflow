@@ -79,21 +79,48 @@ const RollupBadge: React.FC<{ done: number; total: number }> = ({ done, total })
   </span>
 );
 
+// Design-critique round 2: rows used to be `justify-content: space-between` with
+// only a title on the left and a status word on the right — a big empty gap in
+// between and no other data, low information density for an at-a-glance tool.
+// The midsection now carries priority/agent/bounce metadata via an explicit grid
+// (title / meta cluster / fixed-width status) instead of two flex ends with a void
+// between them.
 const TaskRow: React.FC<{ task: Task }> = ({ task }) => (
   <div
     style={{
-      display: 'flex',
+      display: 'grid',
+      gridTemplateColumns: 'auto 1fr 90px',
       alignItems: 'center',
-      justifyContent: 'space-between',
-      padding: '0.35rem 0.5rem',
+      gap: '0.5rem',
+      padding: '0.4rem 0.5rem',
       borderRadius: 'var(--wf-radius)',
       background: 'var(--wf-bg)',
     }}
   >
     <span style={{ fontSize: '0.8rem', color: 'var(--wf-fg)' }}>{task.title}</span>
+    <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+      <span
+        style={{
+          fontSize: '0.65rem',
+          color: 'var(--wf-fg-secondary)',
+          border: '1px solid var(--wf-border)',
+          borderRadius: 'var(--wf-radius)',
+          padding: '0.02rem 0.35rem',
+        }}
+      >
+        p{task.priority}
+      </span>
+      {task.agentId !== undefined && (
+        <span style={{ fontSize: '0.65rem', color: 'var(--wf-fg-secondary)' }}>agent {task.agentId}</span>
+      )}
+      {task.bounces > 0 && (
+        <span style={{ fontSize: '0.65rem', color: 'var(--wf-accent-pink)' }}>bounce x{task.bounces}</span>
+      )}
+    </div>
     <span
       style={{
         fontSize: '0.65rem',
+        textAlign: 'right',
         color:
           task.state === 'parked'
             ? 'var(--wf-status-parked)'
@@ -186,7 +213,7 @@ export const Drilldown: React.FC<DrilldownProps> = ({ project }) => {
   const tree = useMemo(() => buildDrilldownTree(project), [project]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', maxWidth: 1100 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
         <span style={{ fontSize: '0.85rem', color: 'var(--wf-fg-secondary)' }}>Project rollup</span>
         <RollupBadge done={tree.done} total={tree.total} />

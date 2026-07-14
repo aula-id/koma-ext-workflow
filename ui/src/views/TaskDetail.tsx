@@ -88,15 +88,23 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({ task, onClose }) => {
       exit={{ x: 24, opacity: 0 }}
       transition={{ duration: 0.2 }}
       style={{
+        position: 'fixed',
+        top: 0,
+        right: 0,
+        height: '100vh',
+        width: 'min(420px, 100vw)',
+        boxSizing: 'border-box',
+        zIndex: 40,
         background: 'var(--wf-bg-secondary)',
-        borderRadius: 'var(--wf-radius)',
         boxShadow: 'var(--wf-shadow)',
         padding: '1rem 1.25rem',
         display: 'flex',
         flexDirection: 'column',
         gap: '0.9rem',
-        maxHeight: '100%',
         overflowY: 'auto',
+        overflowX: 'hidden',
+        wordBreak: 'break-word',
+        overflowWrap: 'anywhere',
       }}
       data-testid="task-detail"
     >

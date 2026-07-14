@@ -161,7 +161,7 @@ function nodeFill(state: TaskStateKey): string {
     case 'onprogress':
       return 'var(--wf-status-running)';
     case 'review':
-      return 'var(--wf-accent-purple)';
+      return 'var(--wf-status-review)';
     case 'done':
       return 'var(--wf-status-done)';
     default:

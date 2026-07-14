@@ -17,6 +17,14 @@ html {
   scroll-behavior: smooth;
 }
 
+/* Design-critique round 2: the task-detail drawer (a fixed-width overlay, see
+ * TaskDetail.tsx) plus any other fixed-position panel must never be able to widen
+ * the page past the viewport and leave a page-level horizontal scrollbar. */
+html,
+body {
+  overflow-x: hidden;
+}
+
 /* Input styling */
 input {
   border: 1px solid var(--wf-accent-blue);
@@ -81,5 +89,77 @@ button:disabled {
 .toast-info {
   background-color: var(--wf-tint-info);
   border-color: var(--wf-accent-blue);
+  color: var(--wf-accent-blue);
+}
+
+/* PRD document typography (Prd.tsx `renderMarkdownSafe` output, wrapped in
+ * `.wf-prd-body`). Tailwind's preflight resets every heading to unstyled 1em/400,
+ * so without this the doc title and every section heading (Goals/Non-goals/Open
+ * questions) rendered identically to body copy — no scannable structure
+ * (design-critique round 2). */
+.wf-prd-body {
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--wf-fg);
+}
+
+.wf-prd-body > *:first-child {
+  margin-top: 0;
+}
+
+.wf-prd-body h1 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0 0 12px;
+  color: var(--wf-fg);
+}
+
+.wf-prd-body h2 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 20px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--wf-border);
+  color: var(--wf-fg);
+}
+
+.wf-prd-body h3,
+.wf-prd-body h4,
+.wf-prd-body h5,
+.wf-prd-body h6 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 16px 0 6px;
+  color: var(--wf-fg);
+}
+
+.wf-prd-body p {
+  margin: 0 0 14px;
+}
+
+.wf-prd-body ul {
+  margin: 0 0 14px;
+  padding-left: 1.2rem;
+}
+
+.wf-prd-body li {
+  margin-bottom: 4px;
+}
+
+.wf-prd-body pre {
+  background: var(--wf-bg);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+  margin: 0 0 14px;
+}
+
+.wf-prd-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.wf-prd-body a {
   color: var(--wf-accent-blue);
 }

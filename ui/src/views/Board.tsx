@@ -292,8 +292,20 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
         </div>
 
         {tab === 'board' && (
-          <div style={{ display: 'flex', gap: '1rem', alignItems: 'flex-start' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(220px, 1fr))', gap: '0.75rem', flex: 1 }}>
+          <React.Fragment>
+          {/* `alignItems: 'start'` overrides CSS grid's default row-stretch, which was
+              forcing every column in the row to match the height of the tallest one —
+              short columns (In Progress, Done) showed a large blank panel below their
+              last card (design-critique round 2). `minHeight` stays as a slim drop-zone
+              affordance rather than growing to fill the row. */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(5, minmax(220px, 1fr))',
+              gap: '0.75rem',
+              alignItems: 'start',
+            }}
+          >
             {COLUMNS.map((col) => (
               <div
                 key={col.key}
@@ -352,12 +364,30 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
 
           <AnimatePresence>
             {selectedTaskId && selectedTask && (
-              <div style={{ width: 380, flexShrink: 0 }}>
+              <React.Fragment>
+                {/* Overlay + dim, not a widened layout row: this drawer used to sit
+                    in a flex row next to the column grid, whose combined width could
+                    exceed the viewport and clip the drawer's own content while adding
+                    a page-level horizontal scrollbar (design-critique round 2). It is
+                    now a fixed panel (see TaskDetail.tsx) with a dimming backdrop. */}
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.15 }}
+                  onClick={() => setSelectedTaskId(null)}
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    background: 'rgba(0, 0, 0, 0.5)',
+                    zIndex: 30,
+                  }}
+                />
                 <TaskDetail task={selectedTask} onClose={() => setSelectedTaskId(null)} />
-              </div>
+              </React.Fragment>
             )}
           </AnimatePresence>
-          </div>
+          </React.Fragment>
         )}
 
         {tab === 'drilldown' && <Drilldown project={project} />}

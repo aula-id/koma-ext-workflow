@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useStore, Project } from '../store';
 import { bridge } from '../bridge';
@@ -9,69 +9,55 @@ interface DashboardProps {
 }
 
 /**
- * Task-completion ring. `running` gates both the color and the semantics: a
- * colored, "live" ring only appears while the project is actually running —
- * showing the same active-green arc on a Halted or still-empty Drafting project
- * (as the old always-green version did) reads as a stuck/broken loading spinner.
- * Non-running projects get a static neutral ring instead.
- *
- * The done/total fraction used to be baked into the SVG as visible `<text>`,
- * which (a) duplicated the "Total" stat tile below and (b) routinely overflowed
- * the ring's own bounds at this size, making it look like loose text floating
- * next to a broken arc. It's exposed as an accessible label instead — the
- * numbers still live in the stat tiles, once, not twice.
+ * Deliberate, always-present status affordance. This replaces a per-card SVG
+ * progress ring whose colored arc was a thin sliver at most done/total
+ * fractions — and fully invisible at 0/0 — reading as a broken/clipped
+ * spinner rather than an intentional indicator, and inconsistent across cards
+ * (design-critique round 2). Every card now renders the exact same slot: a
+ * pulsing dot for a running project, a static dot (matching the phase badge
+ * color) for every other phase — present and visually identical in shape
+ * regardless of state, never half-drawn.
  */
-const ProgressRing: React.FC<{
-  done: number;
-  total: number;
-  running: boolean;
-  size?: number;
-}> = ({ done, total, running, size = 40 }) => {
-  const radius = size / 2 - 2;
-  const circumference = 2 * Math.PI * radius;
-  const offset = circumference - (done / Math.max(total, 1)) * circumference;
-  const ringColor = running ? 'var(--wf-accent-green)' : 'var(--wf-fg-secondary)';
-  const label = `${done} of ${total} task${total === 1 ? '' : 's'} complete`;
-
-  return (
-    <svg width={size} height={size} className="inline-block" role="img" aria-label={label}>
-      <title>{label}</title>
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={radius}
-        fill="none"
-        stroke="var(--wf-bg-secondary)"
-        strokeWidth="2"
-      />
-      <motion.circle
-        cx={size / 2}
-        cy={size / 2}
-        r={radius}
-        fill="none"
-        stroke={ringColor}
-        strokeWidth="2"
-        strokeDasharray={circumference}
-        strokeDashoffset={offset}
-        strokeLinecap="round"
-        animate={{ strokeDashoffset: offset }}
-        transition={{ duration: 0.5 }}
-      />
-    </svg>
-  );
-};
+const StatusDot: React.FC<{ colorVar: string; running: boolean; label: string }> = ({
+  colorVar,
+  running,
+  label,
+}) => (
+  <span
+    role="img"
+    aria-label={label}
+    title={label}
+    style={{ display: 'inline-flex', width: 12, height: 12, alignItems: 'center', justifyContent: 'center' }}
+  >
+    <motion.span
+      animate={running ? { opacity: [0.4, 1, 0.4] } : { opacity: 1 }}
+      transition={running ? { duration: 1.4, repeat: Infinity, ease: 'easeInOut' } : undefined}
+      style={{
+        width: 10,
+        height: 10,
+        borderRadius: '9999px',
+        background: colorVar,
+        display: 'inline-block',
+        boxShadow: running ? `0 0 0 3px color-mix(in srgb, ${colorVar} 25%, transparent)` : 'none',
+      }}
+    />
+  </span>
+);
 
 // Project phase badge colors. `running` intentionally uses the same green as
 // `done`/success rather than the koma "info" blue role: this is the single
 // semantic-color source for a running project across the whole card — the
-// phase badge, the progress ring (see ProgressRing's `running` prop) and the
+// phase badge, the status dot (see StatusDot's `running` prop) and the
 // "Running" stat tile below all read from here (or its literal value) so the
 // same state never shows up in two colors on one card. interrupted/parked read
 // as the "amber" bucket, halted/blocked as the "red" bucket (accent-pink is
-// koma's error role, i.e. red), drafting has no strong status yet so it stays
-// neutral, ready keeps the purple accent as the actionable/next-step color.
+// koma's error role, i.e. red), ready keeps the purple accent as the
+// actionable/next-step color. drafting gets its own dedicated indigo status
+// color (rendered as a tinted, not solid, chip — see `isDrafting` below):
+// it used to share --wf-fg-secondary with the *text* drawn on top of it,
+// which read as gray-on-gray (design-critique round 2).
 const PHASE_COLOR_VAR: Record<string, string> = {
-  drafting: 'var(--wf-fg-secondary)',
+  drafting: 'var(--wf-status-drafting)',
   ready: 'var(--wf-accent-purple)',
   running: 'var(--wf-accent-green)',
   interrupted: 'var(--wf-accent-orange)',
@@ -85,7 +71,7 @@ const ProjectCard: React.FC<{
 }> = ({ project, onClick }) => {
   const phaseKind = project.phase.kind;
   const phaseColorVar = PHASE_COLOR_VAR[phaseKind] || 'var(--wf-fg-secondary)';
-  const isNeutralPhase = phaseColorVar === 'var(--wf-fg-secondary)';
+  const isDrafting = phaseKind === 'drafting';
 
   const isRunning = phaseKind === 'running';
 
@@ -113,18 +99,20 @@ const ProjectCard: React.FC<{
           <span
             className="inline-block mt-1 px-2 py-1 text-xs font-semibold rounded capitalize"
             style={{
-              backgroundColor: phaseColorVar,
-              color: isNeutralPhase ? 'var(--wf-fg)' : 'var(--wf-bg)',
+              backgroundColor: isDrafting ? 'var(--wf-tint-drafting)' : phaseColorVar,
+              color: isDrafting ? 'var(--wf-status-drafting)' : 'var(--wf-bg)',
             }}
           >
             {phaseKind}
           </span>
         </div>
         <div className="ml-2">
-          <ProgressRing
-            done={project.doneCount || 0}
-            total={project.taskCount || 0}
+          <StatusDot
+            colorVar={phaseColorVar}
             running={isRunning}
+            label={`${project.doneCount || 0} of ${project.taskCount || 0} task${
+              (project.taskCount || 0) === 1 ? '' : 's'
+            } complete, ${phaseKind}`}
           />
         </div>
       </div>
@@ -215,6 +203,20 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
 
   const globalHalted = haltedProjects > 0;
 
+  // Second information tier (design-critique round 2): with only a handful of
+  // project cards the rest of the viewport read as a dead void, "a toy dashboard"
+  // for what should be a dense control surface. Both lists are derived from data
+  // the dashboard already has per project (no new protocol fields) so they degrade
+  // gracefully to an empty-state line rather than ever being wrong/stale.
+  const attentionProjects = useMemo(
+    () => projects.filter((p) => p.phase.kind === 'halted' || (p.parkedCount || 0) > 0),
+    [projects],
+  );
+  const recentActivity = useMemo(
+    () => projects.filter((p) => p.lastNotice && p.lastNotice.trim().length > 0),
+    [projects],
+  );
+
   return (
     // Was `min-h-screen`: pinning this content wrapper to the full viewport height
     // when it only ever holds a few short cards rendered a large dead void below
@@ -222,7 +224,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
     // `--wf-bg` across the full viewport (see App.tsx), so this container only
     // needs to size to its own content.
     <div className="p-6" style={{ backgroundColor: 'var(--wf-bg)' }}>
-      <div className="max-w-7xl mx-auto">
+      {/* Constrained + left-anchored (not centered with `mx-auto`): a centered
+          ~1200px column on a wide viewport with only a few cards symmetrically
+          doubles the dead space on both sides (design-critique round 2). */}
+      <div style={{ maxWidth: 1200 }}>
         <div className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-3xl font-bold mb-2" style={{ color: 'var(--wf-fg)' }}>
@@ -285,6 +290,78 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
               ))}
             </AnimatePresence>
           </motion.div>
+        )}
+
+        {projects.length > 0 && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
+            <div
+              className="p-4 rounded-lg border"
+              style={{ borderColor: 'var(--wf-border)', backgroundColor: 'var(--wf-bg-secondary)' }}
+            >
+              <h2
+                className="text-xs font-semibold mb-3 uppercase tracking-wide"
+                style={{ color: 'var(--wf-fg-secondary)' }}
+              >
+                Attention needed
+              </h2>
+              {attentionProjects.length === 0 ? (
+                <p className="text-sm" style={{ color: 'var(--wf-fg-secondary)' }}>
+                  Nothing needs attention right now.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {attentionProjects.map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-center justify-between text-sm cursor-pointer"
+                      onClick={() => onProjectClick?.(p.id)}
+                    >
+                      <span style={{ color: 'var(--wf-fg)' }}>{p.name}</span>
+                      <span
+                        style={{
+                          color: p.phase.kind === 'halted' ? 'var(--wf-accent-pink)' : 'var(--wf-accent-orange)',
+                        }}
+                      >
+                        {p.phase.kind === 'halted' ? 'halted' : `${p.parkedCount} parked`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div
+              className="p-4 rounded-lg border"
+              style={{ borderColor: 'var(--wf-border)', backgroundColor: 'var(--wf-bg-secondary)' }}
+            >
+              <h2
+                className="text-xs font-semibold mb-3 uppercase tracking-wide"
+                style={{ color: 'var(--wf-fg-secondary)' }}
+              >
+                Recent activity across projects
+              </h2>
+              {recentActivity.length === 0 ? (
+                <p className="text-sm" style={{ color: 'var(--wf-fg-secondary)' }}>
+                  No recent activity yet.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {recentActivity.map((p) => (
+                    <div
+                      key={p.id}
+                      className="text-sm cursor-pointer"
+                      onClick={() => onProjectClick?.(p.id)}
+                    >
+                      <span className="font-semibold" style={{ color: 'var(--wf-fg)' }}>
+                        {p.name}:{' '}
+                      </span>
+                      <span style={{ color: 'var(--wf-fg-secondary)' }}>{p.lastNotice}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
         )}
 
         {snapshot && snapshot.truncated && (

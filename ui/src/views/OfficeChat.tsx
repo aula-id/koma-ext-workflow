@@ -105,27 +105,44 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
         }}
       >
         <AnimatePresence initial={false}>
-          {transcript.map((m, i) => (
-            <motion.div
-              key={i}
-              initial={{ opacity: 0, y: 4 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0 }}
-              style={{
-                alignSelf: m.who === 'user' ? 'flex-end' : 'flex-start',
-                maxWidth: '85%',
-                background: m.who === 'user' ? 'var(--wf-bg)' : 'var(--wf-bg)',
-                border: `1px solid ${m.who === 'user' ? 'var(--wf-accent-blue)' : 'var(--wf-accent-purple)'}`,
-                borderRadius: 'var(--wf-radius)',
-                padding: '0.4rem 0.6rem',
-              }}
-            >
-              <div style={{ fontSize: '0.6rem', color: 'var(--wf-fg-secondary)', marginBottom: '0.15rem' }}>
-                {m.who === 'user' ? 'You' : 'Office'}
-              </div>
-              <div style={{ fontSize: '0.8rem', color: 'var(--wf-fg)', whiteSpace: 'pre-wrap' }}>{m.text}</div>
-            </motion.div>
-          ))}
+          {transcript.map((m, i) => {
+            const isUser = m.who === 'user';
+            // Design-critique round 2: a full saturated 1px border wrapping every
+            // bubble made the panel read as a stack of loud outlined boxes. Color
+            // weight is now carried by a single 3px left accent bar on an otherwise
+            // neutral (or lightly tinted, for "You") bubble background.
+            const accentVar = isUser ? 'var(--wf-accent-blue)' : 'var(--wf-accent-purple)';
+            return (
+              <motion.div
+                key={i}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0 }}
+                style={{
+                  alignSelf: isUser ? 'flex-end' : 'flex-start',
+                  maxWidth: '85%',
+                  background: isUser ? 'var(--wf-tint-info)' : 'var(--wf-bg)',
+                  borderLeft: `3px solid ${accentVar}`,
+                  borderRadius: 'var(--wf-radius)',
+                  padding: '0.4rem 0.6rem',
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: '0.6rem',
+                    fontWeight: 600,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.04em',
+                    color: 'var(--wf-fg-secondary)',
+                    marginBottom: '0.15rem',
+                  }}
+                >
+                  {isUser ? 'You' : 'Office'}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: 'var(--wf-fg)', whiteSpace: 'pre-wrap' }}>{m.text}</div>
+              </motion.div>
+            );
+          })}
         </AnimatePresence>
         {transcript.length === 0 && (
           <p style={{ fontSize: '0.75rem', color: 'var(--wf-fg-secondary)' }}>

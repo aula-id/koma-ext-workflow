@@ -62,7 +62,7 @@ function stateBadgeStyle(state: TaskStateKey): React.CSSProperties {
     case 'onprogress':
       return { background: 'var(--wf-status-running)', color: 'var(--wf-bg)' };
     case 'review':
-      return { background: 'var(--wf-accent-purple)', color: 'var(--wf-bg)' };
+      return { background: 'var(--wf-status-review)', color: 'var(--wf-bg)' };
     case 'done':
       return { background: 'var(--wf-status-done)', color: 'var(--wf-bg)' };
     default:
@@ -135,7 +135,17 @@ export const Card: React.FC<CardProps> = ({ task, draggable = false, culprit = f
             </span>
           </span>
         )}
-        <span style={{ fontSize: '0.65rem', color: 'var(--wf-fg-secondary)' }}>p{task.priority}</span>
+        <span
+          style={{
+            fontSize: '0.65rem',
+            color: 'var(--wf-fg-secondary)',
+            border: '1px solid var(--wf-border)',
+            borderRadius: 'var(--wf-radius)',
+            padding: '0.02rem 0.35rem',
+          }}
+        >
+          p{task.priority}
+        </span>
         {task.bounces > 0 && (
           <span
             style={{

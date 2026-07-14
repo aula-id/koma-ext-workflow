@@ -53,6 +53,19 @@
   --wf-status-parked: var(--wf-accent-orange);
   --wf-status-blocked: var(--wf-accent-pink);
 
+  /* `--wf-accent-purple` is koma's "accent" role, but its actual sourced value is
+   * green in both themes (see below) — reusing it for the Review status pill made
+   * Review and Done render as the same hue (design-critique round 2). Review gets
+   * its own dedicated violet hue instead, distinct from every other status color. */
+  --wf-status-review: #a78bfa;
+
+  /* Design-critique round 2: "Drafting" read as gray-on-gray (near-invisible) when
+   * it shared --wf-fg-secondary for both the chip fill and, via the neutral-badge
+   * branch, ended up too close in lightness to the text on top of it. Drafting gets
+   * its own low-saturation indigo status color plus a tinted (not solid) chip fill. */
+  --wf-status-drafting: #a5b4fc;
+  --wf-tint-drafting: color-mix(in srgb, #6366f1 15%, var(--wf-bg-secondary));
+
   --wf-radius: 0.375rem;
   --wf-shadow: 0 4px 6px rgba(0, 0, 0, 0.4);
   --wf-animation-duration: 0.2s;
@@ -73,7 +86,12 @@
   --wf-bg: #fafaf6;
   --wf-bg-secondary: #e4e6eb;
   --wf-fg: #141414;
-  --wf-fg-secondary: #787878;
+
+  /* Bumped from #787878 (~3.5:1 on --wf-bg-secondary, under the 4.5:1 text
+   * minimum): priority tokens and status subtitles rendered in this color were
+   * effectively unreadable in light mode (design-critique round 2). #52525b clears
+   * ~6.2:1 on --wf-bg-secondary. */
+  --wf-fg-secondary: #52525b;
 
   /* Same contrast fix as the dark theme above: #e3e3df on #fafaf6 was ~1.2:1. */
   --wf-border: #909090;
@@ -85,6 +103,9 @@
   --wf-accent-pink: #c82828;
   --wf-accent-purple: #008000;
   --wf-accent-yellow: #c87800;
+
+  --wf-status-review: #7c3aed;
+  --wf-status-drafting: #4f46e5;
 
   --wf-shadow: 0 4px 6px rgba(0, 0, 0, 0.12);
 }
