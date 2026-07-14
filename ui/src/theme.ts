@@ -88,7 +88,12 @@ export class ThemeManager {
   }
 
   private setupReducedMotion(): void {
-    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // Guarded like `loadTheme`'s matchMedia read above: some embedding webviews (and
+    // jsdom test environments) don't implement `matchMedia` at all — treat that as
+    // "no preference" rather than crashing the whole module on import.
+    const prefersReducedMotion = Boolean(
+      window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+    );
     if (prefersReducedMotion) {
       document.documentElement.style.setProperty('--wf-animation-duration', '0s');
     } else {

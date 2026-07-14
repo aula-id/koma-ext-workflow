@@ -307,6 +307,7 @@ mod tests {
                 reviewer_model: Some("claude-opus".to_string()),
                 office_role: "main".to_string(),
                 worker_max_runtime_ms: 20 * 60 * 1000,
+                keep_desks: true,
             },
             outbox: vec![
                 OutboundNotice {

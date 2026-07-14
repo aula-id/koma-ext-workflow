@@ -367,6 +367,84 @@ fn normal_snapshot_is_full_mode_not_truncated() {
 }
 
 // ---------------------------------------------------------------------------
+// 7.5 config_set (10.2): direct project-config edit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_set_applies_partial_update_including_keep_desks() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    d.insert_for_test(project("auth", ProjectPhase::Running, vec![task("auth/t1", TaskState::Todo)]), 1_000);
+    assert!(!d.project("auth").unwrap().config.keep_desks, "default is false");
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::ConfigSet {
+            project: "auth".to_string(),
+            max_workers: Some(3),
+            bounce_budget: None,
+            worker_model: None,
+            reviewer_model: None,
+            keep_desks: Some(true),
+        }),
+        2_000,
+    );
+
+    let cfg = &d.project("auth").unwrap().config;
+    assert_eq!(cfg.max_workers, 3, "provided field is applied");
+    assert_eq!(cfg.bounce_budget, 3, "absent field keeps the default untouched");
+    assert!(cfg.keep_desks, "keepDesks now parses end-to-end into ProjectConfig");
+
+    // Persisted too, not just in-memory (10.2 write-through).
+    let reloaded = d.store.load_project("auth").unwrap();
+    assert!(reloaded.config.keep_desks);
+}
+
+#[test]
+fn config_set_max_workers_is_clamped_to_the_project_ceiling() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    d.insert_for_test(project("auth", ProjectPhase::Running, vec![task("auth/t1", TaskState::Todo)]), 1_000);
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::ConfigSet {
+            project: "auth".to_string(),
+            max_workers: Some(99),
+            bounce_budget: None,
+            worker_model: None,
+            reviewer_model: None,
+            keep_desks: None,
+        }),
+        2_000,
+    );
+
+    assert_eq!(d.project("auth").unwrap().config.max_workers, 4, "clamped to MAX_PROJECT_WORKERS");
+}
+
+#[test]
+fn config_set_on_a_non_owned_project_is_dropped_not_applied() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    d.insert_for_test(project("auth", ProjectPhase::Running, vec![task("auth/t1", TaskState::Todo)]), 1_000);
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::ConfigSet {
+            project: "does-not-exist".to_string(),
+            max_workers: Some(3),
+            bounce_budget: None,
+            worker_model: None,
+            reviewer_model: None,
+            keep_desks: Some(true),
+        }),
+        2_000,
+    );
+
+    assert_eq!(d.project("auth").unwrap().config.max_workers, 2, "untouched: the target project isn't owned/found");
+}
+
+// ---------------------------------------------------------------------------
 // 8. off-loop invoke pool (W9, ARCHITECTURE.md 5.1 / 6.2)
 // ---------------------------------------------------------------------------
 

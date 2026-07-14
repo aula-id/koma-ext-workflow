@@ -74,13 +74,14 @@ pub enum Command {
     /// `{ op: "edit_deps", task, ... }`.
     EditDeps { task: String, patch: Value },
     /// `{ op: "config_set", project, maxWorkers?, bounceBudget?, workerModel?,
-    /// reviewerModel? }`.
+    /// reviewerModel?, keepDesks? }`.
     ConfigSet {
         project: String,
         max_workers: Option<u32>,
         bounce_budget: Option<u32>,
         worker_model: Option<String>,
         reviewer_model: Option<String>,
+        keep_desks: Option<bool>,
     },
     /// `{ op: "project_create", name }`.
     ProjectCreate { name: String },
@@ -397,6 +398,7 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
                     .map(|n| n as u32),
                 worker_model: opt_str_field(&payload, "workerModel"),
                 reviewer_model: opt_str_field(&payload, "reviewerModel"),
+                keep_desks: payload.get("keepDesks").and_then(Value::as_bool),
             }
         }
         "project_create" => {
@@ -430,18 +432,16 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
         other => return error(&format!("unknown panel op: {other}")),
     };
 
-    // `driver::handle_command` currently no-ops these five ops (board edits + config +
-    // archive are not wired into the kernel yet). Telling the panel `{ok:true}` for a
-    // write that silently vanishes is worse than an honest error: the panel would show
-    // no toast and the very next snapshot push would revert the optimistic UI change
-    // with no explanation. Surface a real error until a later wave wires these through.
+    // `driver::handle_command` currently no-ops these four ops (board edits + project
+    // archive are not wired into the kernel yet; `config_set` IS wired, see
+    // `driver::handle_command`'s `DCmd::ConfigSet` arm). Telling the panel `{ok:true}`
+    // for a write that silently vanishes is worse than an honest error: the panel would
+    // show no toast and the very next snapshot push would revert the optimistic UI
+    // change with no explanation. Surface a real error until a later wave wires these
+    // through.
     let unimplemented = matches!(
         command,
-        Command::CardMove { .. }
-            | Command::EditTask { .. }
-            | Command::EditDeps { .. }
-            | Command::ConfigSet { .. }
-            | Command::ProjectArchive { .. }
+        Command::CardMove { .. } | Command::EditTask { .. } | Command::EditDeps { .. } | Command::ProjectArchive { .. }
     );
     send(tx, command);
     if unimplemented {

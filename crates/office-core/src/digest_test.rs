@@ -137,6 +137,23 @@ mod tests {
     }
 
     #[test]
+    fn panel_snapshot_full_mode_round_trips_config_including_keep_desks() {
+        let mut p = project("p1", 1, ProjectPhase::Running, vec![]);
+        p.config.max_workers = 3;
+        p.config.bounce_budget = 5;
+        p.config.worker_model = Some("gpt-5".to_string());
+        p.config.reviewer_model = None;
+        p.config.keep_desks = true;
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let cfg = &snap.as_array().expect("array")[0]["config"];
+        assert_eq!(cfg["maxWorkers"], 3);
+        assert_eq!(cfg["bounceBudget"], 5);
+        assert_eq!(cfg["workerModel"], "gpt-5");
+        assert!(cfg["reviewerModel"].is_null());
+        assert_eq!(cfg["keepDesks"], true);
+    }
+
+    #[test]
     fn panel_snapshot_summary_mode_drops_report_and_history_bodies() {
         let projects = vec![project("p1", 1, ProjectPhase::Running, vec![task("t1", TaskState::Todo)])];
         let snap = panel_snapshot(&projects, SnapshotMode::Summary);
@@ -149,6 +166,7 @@ mod tests {
         assert!(t.get("comments").is_none());
         assert!(t.get("description").is_none());
         assert!(arr[0].get("prdMarkdown").is_none());
+        assert!(arr[0].get("config").is_none(), "summary mode omits config too (size guard)");
 
         // Counts and state survive.
         assert_eq!(t["id"], "t1");

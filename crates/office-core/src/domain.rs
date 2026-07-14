@@ -180,6 +180,12 @@ pub struct ProjectConfig {
     pub reviewer_model: Option<String>,
     pub office_role: String,
     pub worker_max_runtime_ms: u64,
+    /// Retain a task's desk directory (`desks/<project>/<task>--koma-workflow-desk/`,
+    /// kernel.rs `desk_dir`) after the task completes, instead of it being reclaimed.
+    /// `#[serde(default)]` so state files persisted before this field existed still
+    /// deserialize cleanly (defaults to `false`, matching the panel's initial toggle).
+    #[serde(default)]
+    pub keep_desks: bool,
 }
 
 impl ProjectConfig {
@@ -191,6 +197,7 @@ impl ProjectConfig {
             reviewer_model: None,
             office_role: "main".to_string(),
             worker_max_runtime_ms: 20 * 60 * 1000, // 20 minutes
+            keep_desks: false,
         }
     }
 }

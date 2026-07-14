@@ -839,6 +839,88 @@ fn unpark_returns_task_to_todo_preserving_attempt() {
 }
 
 // ---------------------------------------------------------------------------
+// config_set (10.2 panel op; ProjectConfig direct edit)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_set_applies_only_the_provided_fields() {
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    assert!(!p.config.keep_desks, "starts false, matching ProjectConfig::default_config");
+
+    let fx = step(
+        &mut p,
+        Input::Command(Command::ConfigSet {
+            max_workers: Some(3),
+            bounce_budget: None,
+            worker_model: None,
+            reviewer_model: Some("claude-opus".to_string()),
+            keep_desks: Some(true),
+        }),
+        1000,
+        4,
+    );
+
+    assert_eq!(p.config.max_workers, 3, "provided field is applied");
+    assert_eq!(p.config.bounce_budget, 3, "absent field keeps ProjectConfig::default_config's value");
+    assert_eq!(p.config.worker_model, None, "absent field is left untouched, not cleared");
+    assert_eq!(p.config.reviewer_model, Some("claude-opus".to_string()));
+    assert!(p.config.keep_desks, "keepDesks parses through into ProjectConfig.keep_desks");
+    assert!(fx.iter().any(|e| matches!(e, Effect::Persist)), "a mutation always persists");
+}
+
+#[test]
+fn config_set_max_workers_is_clamped_within_1_to_4() {
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    step(
+        &mut p,
+        Input::Command(Command::ConfigSet {
+            max_workers: Some(99),
+            bounce_budget: None,
+            worker_model: None,
+            reviewer_model: None,
+            keep_desks: None,
+        }),
+        1000,
+        4,
+    );
+    assert_eq!(p.config.max_workers, 4);
+
+    step(
+        &mut p,
+        Input::Command(Command::ConfigSet {
+            max_workers: Some(0),
+            bounce_budget: None,
+            worker_model: None,
+            reviewer_model: None,
+            keep_desks: None,
+        }),
+        1000,
+        4,
+    );
+    assert_eq!(p.config.max_workers, 1);
+}
+
+#[test]
+fn config_set_with_no_fields_is_a_no_op_and_does_not_mark_dirty() {
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    let before = p.config.clone();
+    let fx = step(
+        &mut p,
+        Input::Command(Command::ConfigSet {
+            max_workers: None,
+            bounce_budget: None,
+            worker_model: None,
+            reviewer_model: None,
+            keep_desks: None,
+        }),
+        1000,
+        4,
+    );
+    assert_eq!(p.config, before);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Persist)), "no fields provided -> no dirty -> no persist");
+}
+
+// ---------------------------------------------------------------------------
 // Determinism
 // ---------------------------------------------------------------------------
 

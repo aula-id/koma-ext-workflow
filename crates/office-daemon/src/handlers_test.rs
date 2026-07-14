@@ -344,7 +344,8 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
                 "maxWorkers": 3,
                 "bounceBudget": 2,
                 "workerModel": "gpt-5",
-                "reviewerModel": "opus"
+                "reviewerModel": "opus",
+                "keepDesks": true
             }
         }),
         &tx,
@@ -357,6 +358,7 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
             bounce_budget: Some(2),
             worker_model: Some("gpt-5".to_string()),
             reviewer_model: Some("opus".to_string()),
+            keep_desks: Some(true),
         }
     );
 
@@ -391,19 +393,20 @@ fn panel_msg_edit_task_and_edit_deps_carry_opaque_patch() {
     );
 }
 
-/// Regression: `card_move`/`edit_task`/`edit_deps`/`config_set`/`project_archive` are not
-/// yet wired into the kernel (driver.rs no-ops them), so the ack must be an honest error,
-/// not `{ok:true, accepted:true}` — otherwise the panel shows no toast and the drag/edit
+/// Regression: `card_move`/`edit_task`/`edit_deps`/`project_archive` are not yet wired
+/// into the kernel (driver.rs no-ops them), so the ack must be an honest error, not
+/// `{ok:true, accepted:true}` — otherwise the panel shows no toast and the drag/edit
 /// silently reverts on the next snapshot push with no explanation to the user. The command
 /// must still be enqueued (a later wave can wire it up without a handler change) but the
-/// wire reply may never claim success for a write that never happens.
+/// wire reply may never claim success for a write that never happens. `config_set` is NOT
+/// in this list: it IS wired (`driver::handle_command`'s `DCmd::ConfigSet` arm), see
+/// `panel_msg_wired_write_ops_still_ack_success` below.
 #[test]
 fn panel_msg_unwired_write_ops_ack_with_error_not_false_success() {
     let cases = [
         json!({ "op": "card_move", "task": "t1", "to": "todo" }),
         json!({ "op": "edit_task", "task": "t1", "priority": 5 }),
         json!({ "op": "edit_deps", "task": "t1", "deps": [] }),
-        json!({ "op": "config_set", "project": "auth", "maxWorkers": 3 }),
         json!({ "op": "project_archive", "project": "auth" }),
     ];
     for payload in cases {
@@ -433,6 +436,7 @@ fn panel_msg_wired_write_ops_still_ack_success() {
         json!({ "op": "comment_add", "task": "t1", "text": "lgtm" }),
         json!({ "op": "unpark", "task": "t1" }),
         json!({ "op": "project_create", "name": "New" }),
+        json!({ "op": "config_set", "project": "auth", "maxWorkers": 3, "keepDesks": true }),
     ];
     for payload in cases {
         let (tx, _rx) = channel();

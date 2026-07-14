@@ -137,11 +137,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
   const [haltedProjects, setHaltedProjects] = useState(0);
 
   useEffect(() => {
+    // Regression (found while wiring the mock harness/deep links): calling
+    // `useStore.setState((state) => { state.updateSnapshot(x); return state; })` runs
+    // TWO nested zustand `setState`s — the inner one inside `updateSnapshot` applies the
+    // new snapshot correctly, but the outer call then "returns" the STALE `state`
+    // parameter it was invoked with (captured before the inner `set` ran) and zustand
+    // merges that stale snapshot back on top, silently reverting every push. Calling the
+    // store action directly does exactly one `set` and is also just less code.
     const unsubscribe = bridge.onSnapshot((newSnapshot) => {
-      useStore.setState((state) => {
-        state.updateSnapshot(newSnapshot);
-        return state;
-      });
+      useStore.getState().updateSnapshot(newSnapshot);
     });
 
     bridge.hello('0.1.0').catch((err) => {

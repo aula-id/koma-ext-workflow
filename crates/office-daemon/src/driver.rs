@@ -429,6 +429,31 @@ impl<H: Host> Driver<H> {
             // construct an empty Drafting project so the PRD -> breakdown -> authorize ->
             // Running pipeline has something to act on.
             DCmd::ProjectCreate { name } => self.create_project(name, now_ms),
+            // A direct project-config edit (10.2 `config_set`). Only the lease holder
+            // may apply it, matching Interrupt/Resume/Unpark above; a non-holder's
+            // config_set is silently dropped the same way theirs would be.
+            DCmd::ConfigSet {
+                project,
+                max_workers,
+                bounce_budget,
+                worker_model,
+                reviewer_model,
+                keep_desks,
+            } => {
+                if let Some(i) = self.owned_project_by_id(&project) {
+                    self.step(
+                        i,
+                        kernel::Input::Command(kernel::Command::ConfigSet {
+                            max_workers,
+                            bounce_budget,
+                            worker_model,
+                            reviewer_model,
+                            keep_desks,
+                        }),
+                        now_ms,
+                    );
+                }
+            }
             // Remaining panel/tool surface not owned by W9; no-ops until their waves wire
             // them (status digests, board edits, project lifecycle).
             DCmd::Status { .. }
@@ -436,7 +461,6 @@ impl<H: Host> Driver<H> {
             | DCmd::CardMove { .. }
             | DCmd::EditTask { .. }
             | DCmd::EditDeps { .. }
-            | DCmd::ConfigSet { .. }
             | DCmd::ProjectArchive { .. }
             | DCmd::TaskDetail { .. } => {}
             // hello/state/prd_get are answered INLINE by the handler off the snapshot

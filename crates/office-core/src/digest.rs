@@ -248,6 +248,16 @@ fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
             .map(|m| json!({ "who": chat_author_str(&m.who), "text": m.text }))
             .collect::<Vec<_>>());
         obj["officeSummary"] = json!(p.office_summary);
+        // The panel's `config_set` form (Settings.tsx) needs to read back what it last
+        // saved (10.2 round-trip); only the fields that form edits (not `officeRole`/
+        // `workerMaxRuntimeMs`, which have no panel affordance yet).
+        obj["config"] = json!({
+            "maxWorkers": p.config.max_workers,
+            "bounceBudget": p.config.bounce_budget,
+            "workerModel": p.config.worker_model,
+            "reviewerModel": p.config.reviewer_model,
+            "keepDesks": p.config.keep_desks,
+        });
     }
 
     obj

@@ -104,6 +104,17 @@ pub enum Command {
         purpose: InvokePurpose,
         outcome: Result<String, String>,
     },
+    /// Panel `config_set` (ARCHITECTURE.md 10.2 / PANEL_PROTOCOL.md 1.2): a direct,
+    /// synchronous edit of `ProjectConfig`. Absent fields leave the current value
+    /// untouched (partial update); there is no state-machine transition or dispatch
+    /// consequence beyond the fields themselves.
+    ConfigSet {
+        max_workers: Option<u32>,
+        bounce_budget: Option<u32>,
+        worker_model: Option<String>,
+        reviewer_model: Option<String>,
+        keep_desks: Option<bool>,
+    },
 }
 
 /// Facts fed back by the driver. `Tick`/`Reconcile` carry no clock — the authoritative
@@ -274,6 +285,34 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
         } => authorize(p, delivery_path, allow_outside_workspace, now_ms, ctx),
         Command::InvokeResult { purpose, outcome } => {
             invoke_result(p, purpose, outcome, now_ms, ctx)
+        }
+        Command::ConfigSet {
+            max_workers,
+            bounce_budget,
+            worker_model,
+            reviewer_model,
+            keep_desks,
+        } => {
+            if let Some(w) = max_workers {
+                p.config.max_workers = w.clamp(1, MAX_PROJECT_WORKERS);
+                ctx.dirty = true;
+            }
+            if let Some(b) = bounce_budget {
+                p.config.bounce_budget = b;
+                ctx.dirty = true;
+            }
+            if let Some(m) = worker_model {
+                p.config.worker_model = Some(m);
+                ctx.dirty = true;
+            }
+            if let Some(m) = reviewer_model {
+                p.config.reviewer_model = Some(m);
+                ctx.dirty = true;
+            }
+            if let Some(k) = keep_desks {
+                p.config.keep_desks = k;
+                ctx.dirty = true;
+            }
         }
     }
 }

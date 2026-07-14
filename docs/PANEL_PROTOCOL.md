@@ -49,7 +49,7 @@ on the kernel tick loop and surfaced by a subsequent full-snapshot push.
 { op: "unpark", task }
 { op: "edit_task", task, ... }                        // opaque patch
 { op: "edit_deps", task, ... }                        // opaque patch
-{ op: "config_set", project, maxWorkers?, bounceBudget?, workerModel?, reviewerModel? }
+{ op: "config_set", project, maxWorkers?, bounceBudget?, workerModel?, reviewerModel?, keepDesks? }
 { op: "project_create", name }
 { op: "project_archive", project }
 { op: "task_detail", task }                           // on-demand detail (full snapshot already carries it)
@@ -91,7 +91,9 @@ Envelope = {
   deliveryPath: <string|null>,
   seq: <u64>,
   tasks: [ Task ],
-  prdMarkdown, officeTranscript: [ { who: "user"|"office", text } ], officeSummary
+  prdMarkdown, officeTranscript: [ { who: "user"|"office", text } ], officeSummary,
+  config: { maxWorkers, bounceBudget, workerModel: <string|null>,
+            reviewerModel: <string|null>, keepDesks: <bool> }   // config_set round-trip
 }
 ```
 

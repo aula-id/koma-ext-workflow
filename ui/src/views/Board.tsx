@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useStore } from '../store';
 import { bridge } from '../bridge';
@@ -108,26 +108,32 @@ export interface BoardProps {
   projectId: string;
   onBack?: () => void;
   onSettings?: () => void;
+  /** Deep-link support (`?view=board|drilldown|task|office`, see App.tsx): which tab
+   * to land on. Defaults to `'board'`, matching prior behavior. */
+  initialTab?: Tab;
+  /** Deep-link support: pre-select a task's detail panel (`?view=task`) on mount. */
+  initialTaskId?: string;
 }
 
 type Tab = 'board' | 'drilldown' | 'depmap' | 'prd';
 
-export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _onSettings }) => {
+export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _onSettings, initialTab, initialTaskId }) => {
   const rawProject = useStore((s) => s.getProject(projectId));
   const project = rawProject as unknown as Project | undefined;
 
-  const [tab, setTab] = useState<Tab>('board');
+  const [tab, setTab] = useState<Tab>(initialTab ?? 'board');
   const [dragTaskId, setDragTaskId] = useState<string | null>(null);
   const [dragOverColumn, setDragOverColumn] = useState<ColumnKey | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(initialTaskId ?? null);
 
   useEffect(() => {
+    // See Dashboard.tsx's identical fix: call the store action directly (exactly one
+    // zustand `set`) rather than wrapping it in `useStore.setState((state) => {...;
+    // return state})`, which double-applies `setState` and silently reverts every push
+    // back to stale state.
     const unsubscribe = bridge.onSnapshot((snap) => {
-      useStore.setState((state) => {
-        state.updateSnapshot(snap);
-        return state;
-      });
+      useStore.getState().updateSnapshot(snap);
     });
     bridge.state().catch((err) => console.error('Failed to refresh state:', err));
     return unsubscribe;
@@ -139,7 +145,13 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
     return () => clearTimeout(t);
   }, [toast]);
 
+  // Reset the task-detail selection on a genuine project switch, but not on the
+  // initial mount — otherwise a deep-linked `initialTaskId` (?view=task) would be
+  // wiped out by this same effect firing once for free on mount.
+  const mountedProjectId = useRef(projectId);
   useEffect(() => {
+    if (mountedProjectId.current === projectId) return;
+    mountedProjectId.current = projectId;
     setSelectedTaskId(null);
   }, [projectId]);
 

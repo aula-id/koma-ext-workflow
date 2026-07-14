@@ -9,6 +9,14 @@ interface SettingsProps {
   onBack?: () => void;
 }
 
+/** Clamp `maxWorkers` to the kernel's project ceiling (office-core kernel.rs
+ * `MAX_PROJECT_WORKERS`, PANEL_PROTOCOL.md 1.2 `config_set`): 1..=4. Exported (not just
+ * an inline closure) so it is the actual function under test, not a copy-pasted
+ * reimplementation — see Settings.test.ts. */
+export function clampMaxWorkers(value: number): number {
+  return Math.max(1, Math.min(4, value));
+}
+
 const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
   const { projects } = useStore();
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -61,10 +69,6 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     initializeFormData(project);
     setError(null);
     setSuccess(null);
-  };
-
-  const clampMaxWorkers = (value: number): number => {
-    return Math.max(1, Math.min(4, value));
   };
 
   const handleMaxWorkersChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -333,6 +337,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                         max="4"
                         value={formData.maxWorkers}
                         onChange={handleMaxWorkersChange}
+                        data-testid="settings-max-workers"
                         className="w-20 px-3 py-2 rounded"
                         style={{
                           backgroundColor: 'var(--wf-bg)',
@@ -357,6 +362,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                         min="0"
                         value={formData.bounceBudget}
                         onChange={handleBounceBudgetChange}
+                        data-testid="settings-bounce-budget"
                         className="w-20 px-3 py-2 rounded"
                         style={{
                           backgroundColor: 'var(--wf-bg)',
@@ -418,6 +424,9 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                   <div className="flex items-center gap-3">
                     <button
                       type="button"
+                      role="switch"
+                      aria-checked={formData.keepDesks}
+                      data-testid="settings-keep-desks-toggle"
                       onClick={handleKeepDesksToggle}
                       className="relative w-12 h-6 rounded-full transition-colors"
                       style={{
@@ -449,6 +458,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                     <button
                       type="submit"
                       disabled={loading}
+                      data-testid="settings-submit"
                       className="px-6 py-2 rounded font-semibold transition-opacity"
                       style={{
                         backgroundColor: 'var(--wf-accent-green)',
