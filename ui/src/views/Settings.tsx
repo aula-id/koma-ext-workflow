@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
 import { useStore, Project } from '../store';
 import { bridge } from '../bridge';
 import { themeManager, Theme } from '../theme';
@@ -17,6 +16,22 @@ export function clampMaxWorkers(value: number): number {
   return Math.max(1, Math.min(4, value));
 }
 
+const PHASE_COLOR: Record<string, string> = {
+  drafting: 'var(--wf-status-drafting)',
+  ready: 'var(--wf-accent)',
+  running: 'var(--wf-status-running)',
+  interrupted: 'var(--wf-status-parked)',
+  halted: 'var(--wf-status-blocked)',
+  done: 'var(--wf-status-done)',
+};
+
+/*
+ * koma-flat settings: one centered column, sections separated by hairline
+ * rules and small-caps titles — no boxed cards, no filled chips, no neon
+ * buttons. Model bindings are deliberately ABSENT: worker/reviewer models are
+ * bound on the extension's contributed sub-agents in koma's sub-agent
+ * sidebar (single source of truth), not per-project free-text slugs.
+ */
 const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
   const { projects } = useStore();
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -25,12 +40,9 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
-  // Form state for selected project
   const [formData, setFormData] = useState({
     maxWorkers: 2,
     bounceBudget: 3,
-    workerModel: '',
-    reviewerModel: '',
     keepDesks: false,
   });
 
@@ -58,8 +70,6 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     setFormData({
       maxWorkers: project.config?.maxWorkers || 2,
       bounceBudget: project.config?.bounceBudget || 3,
-      workerModel: project.config?.workerModel || '',
-      reviewerModel: project.config?.reviewerModel || '',
       keepDesks: project.config?.keepDesks || false,
     });
   };
@@ -83,10 +93,6 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     if (!isNaN(value) && value >= 0) {
       setFormData({ ...formData, bounceBudget: value });
     }
-  };
-
-  const handleModelChange = (field: 'workerModel' | 'reviewerModel', value: string) => {
-    setFormData({ ...formData, [field]: value });
   };
 
   const handleKeepDesksToggle = () => {
@@ -113,8 +119,6 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
         project: selectedProject.id,
         maxWorkers: clampedMaxWorkers,
         bounceBudget: formData.bounceBudget,
-        workerModel: formData.workerModel || undefined,
-        reviewerModel: formData.reviewerModel || undefined,
         keepDesks: formData.keepDesks,
       };
 
@@ -129,7 +133,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
           setError(result.error);
         }
       } else {
-        setSuccess('Settings saved successfully');
+        setSuccess('Settings saved');
         setTimeout(() => setSuccess(null), 3000);
       }
     } catch (err: any) {
@@ -139,361 +143,225 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     }
   };
 
+  const header = (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'baseline',
+        gap: '0.75rem',
+        paddingBottom: '0.6rem',
+        borderBottom: '1px solid var(--wf-head)',
+      }}
+    >
+      {onBack && (
+        <button onClick={onBack} className="wf-btn wf-btn-ghost" style={{ paddingLeft: 0 }}>
+          &larr;
+        </button>
+      )}
+      <h1 style={{ color: 'var(--wf-fg)', fontSize: '1rem', fontWeight: 700, margin: 0 }}>Settings</h1>
+    </div>
+  );
+
   if (projects.length === 0) {
     return (
-      <div className="min-h-screen p-6" style={{ backgroundColor: 'var(--wf-bg)' }}>
-        <div className="max-w-2xl mx-auto">
-          <button
-            onClick={onBack}
-            className="mb-4 px-4 py-2 rounded"
-            style={{ backgroundColor: 'var(--wf-bg-secondary)', color: 'var(--wf-fg)' }}
-          >
-            Back
-          </button>
-          <h1 className="text-2xl font-bold mb-4" style={{ color: 'var(--wf-fg)' }}>
-            Settings
-          </h1>
-          <p style={{ color: 'var(--wf-fg-secondary)' }}>No projects to configure yet.</p>
+      <div style={{ minHeight: '100vh', padding: '1.25rem 1.5rem' }}>
+        <div style={{ maxWidth: 640, margin: '0 auto' }}>
+          {header}
+          <p style={{ color: 'var(--wf-dim)', marginTop: '1rem' }}>No projects to configure yet.</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen p-6" style={{ backgroundColor: 'var(--wf-bg)' }}>
-      <div className="max-w-2xl mx-auto">
-        {onBack && (
-          <button
-            onClick={onBack}
-            className="mb-4 px-4 py-2 rounded transition-colors"
-            style={{
-              backgroundColor: 'var(--wf-bg-secondary)',
-              color: 'var(--wf-fg)',
-            }}
-          >
-            Back
-          </button>
+    <div style={{ minHeight: '100vh', padding: '1.25rem 1.5rem' }}>
+      <div style={{ maxWidth: 640, margin: '0 auto' }}>
+        {header}
+
+        {/* Appearance */}
+        <div className="wf-section" style={{ borderTop: 'none', marginTop: '1rem', paddingTop: 0 }}>
+          <h2 className="wf-section-title">Appearance</h2>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            {(['dark', 'light'] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => handleThemeChange(t)}
+                className="wf-btn"
+                style={
+                  theme === t
+                    ? { borderColor: 'var(--wf-grip)', color: 'var(--wf-fg)', background: 'var(--wf-hover)' }
+                    : { color: 'var(--wf-dim)' }
+                }
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Project selector: flat rows, accent left bar for the active one */}
+        {projects.length > 1 && (
+          <div className="wf-section">
+            <h2 className="wf-section-title">Project</h2>
+            <div>
+              {projects.map((project) => {
+                const selected = selectedProject?.id === project.id;
+                const phaseColor = PHASE_COLOR[project.phase.kind] || 'var(--wf-dim)';
+                return (
+                  <button
+                    key={project.id}
+                    onClick={() => handleProjectSelect(project)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.6rem',
+                      width: '100%',
+                      textAlign: 'left',
+                      padding: '0.45rem 0.6rem',
+                      borderLeft: selected ? '2px solid var(--wf-accent)' : '2px solid transparent',
+                      background: selected ? 'var(--wf-hover)' : 'transparent',
+                      color: selected ? 'var(--wf-fg)' : 'var(--wf-dim)',
+                      borderRadius: 0,
+                      borderBottom: '1px solid var(--wf-border)',
+                    }}
+                  >
+                    <span className="wf-status-dot" style={{ background: phaseColor }} />
+                    <span style={{ flex: 1 }}>{project.name}</span>
+                    <span style={{ fontSize: '0.72rem', color: phaseColor }}>{project.phase.kind}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         )}
 
-        <h1 className="text-3xl font-bold mb-6" style={{ color: 'var(--wf-fg)' }}>
-          Settings
-        </h1>
-
-        {/* `initial={false}`: this wraps every readable label/input/value on the page,
-            so animating it in from opacity:0 means there's a real (if brief) frame
-            where the whole settings form is illegible — exactly what design-critique
-            round 1 flagged as "unreadable" text/labels/borders. Skip the mount fade
-            entirely and paint straight at the `animate` state; nothing here needs an
-            entrance flourish. */}
-        <motion.div
-          initial={false}
-          animate={{ opacity: 1, y: 0 }}
-          className="space-y-6"
-        >
-          {/* Theme Settings */}
-          <section
-            className="p-4 rounded-lg border"
-            style={{
-              backgroundColor: 'var(--wf-bg-secondary)',
-              borderColor: 'var(--wf-border)',
-            }}
-          >
-            <h2 className="text-lg font-semibold mb-4" style={{ color: 'var(--wf-fg)' }}>
-              Appearance
-            </h2>
-            <div className="flex gap-3">
-              {(['dark', 'light'] as const).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => handleThemeChange(t)}
-                  className={`px-4 py-2 rounded capitalize transition-all ${
-                    theme === t ? 'font-semibold' : 'opacity-70'
-                  }`}
-                  style={{
-                    backgroundColor:
-                      theme === t ? 'var(--wf-accent-blue)' : 'var(--wf-bg)',
-                    color: 'var(--wf-fg)',
-                  }}
-                >
-                  {t}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          {/* Project Selection */}
-          {projects.length > 1 && (
-            <section
-              className="p-4 rounded-lg border"
-              style={{
-                backgroundColor: 'var(--wf-bg-secondary)',
-                borderColor: 'var(--wf-border)',
-              }}
-            >
-              <h2 className="text-lg font-semibold mb-4" style={{ color: 'var(--wf-fg)' }}>
-                Select Project
-              </h2>
-              <div className="grid grid-cols-2 gap-2">
-                {projects.map((project) => {
-                  const selected = selectedProject?.id === project.id;
-                  return (
-                    <button
-                      key={project.id}
-                      onClick={() => handleProjectSelect(project)}
-                      className={`p-3 rounded text-left transition-all ${selected ? '' : 'opacity-70 hover:opacity-100'}`}
-                      style={{
-                        // Design-critique round 2: a 100%-saturated solid accent fill
-                        // with gray-on-green subtitle text was the loudest thing on
-                        // the page. Selection is now a subtle tint + accent border +
-                        // left accent bar instead, keeping the neutral card surface.
-                        backgroundColor: selected
-                          ? 'color-mix(in srgb, var(--wf-accent-green) 12%, var(--wf-bg-secondary))'
-                          : 'var(--wf-bg)',
-                        border: selected
-                          ? '1px solid var(--wf-accent-green)'
-                          : '1px solid transparent',
-                        borderLeft: selected
-                          ? '3px solid var(--wf-accent-green)'
-                          : '1px solid transparent',
-                        color: 'var(--wf-fg)',
-                      }}
-                    >
-                      <div className="font-semibold text-sm">{project.name}</div>
-                      <div className="text-xs capitalize" style={{ color: 'var(--wf-fg-secondary)' }}>
-                        {project.phase.kind}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-          )}
-
-          {selectedProject && (
-            <>
-              {/* State Root Display */}
-              <section
-                className="p-4 rounded-lg border"
+        {selectedProject && (
+          <>
+            {/* Storage */}
+            <div className="wf-section">
+              <h2 className="wf-section-title">Storage</h2>
+              {/* a path is a contained/code thing — the one allowed box */}
+              <div
                 style={{
-                  backgroundColor: 'var(--wf-bg-secondary)',
-                  borderColor: 'var(--wf-border)',
+                  padding: '0.4rem 0.6rem',
+                  background: 'var(--wf-panel2)',
+                  border: '1px solid var(--wf-border)',
+                  borderRadius: 'var(--wf-radius)',
+                  color: 'var(--wf-fg)',
+                  fontSize: '0.8rem',
                 }}
               >
-                <h2 className="text-lg font-semibold mb-2" style={{ color: 'var(--wf-fg)' }}>
-                  State Root
-                </h2>
-                <div
-                  className="p-2 rounded text-sm font-mono"
-                  style={{ backgroundColor: 'var(--wf-bg)', color: 'var(--wf-accent-green)' }}
-                >
-                  ~/.koma-workflow/
-                </div>
-                <p className="text-xs mt-2" style={{ color: 'var(--wf-fg-secondary)' }}>
-                  All project state is stored here. Do not edit manually.
-                </p>
-              </section>
+                ~/.koma-workflow/
+              </div>
+              <p style={{ fontSize: '0.72rem', color: 'var(--wf-dim)', margin: '0.4rem 0 0' }}>
+                All project state lives here. Do not edit manually.
+              </p>
+            </div>
 
-              {/* Errors and Success Messages */}
-              {error && (
-                <motion.div
-                  initial={{ opacity: 0, y: -10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="p-3 rounded border"
-                  style={{
-                    backgroundColor: 'var(--wf-tint-error)',
-                    borderColor: 'var(--wf-accent-pink)',
-                    color: 'var(--wf-accent-pink)',
-                  }}
-                >
-                  {error}
-                </motion.div>
-              )}
+            {error && (
+              <div
+                style={{
+                  marginTop: '1rem',
+                  padding: '0.45rem 0.6rem',
+                  borderLeft: '2px solid var(--wf-error)',
+                  background: 'var(--wf-tint-error)',
+                  color: 'var(--wf-error)',
+                  fontSize: '0.8rem',
+                }}
+              >
+                {error}
+              </div>
+            )}
 
-              {success && (
-                <motion.div
-                  initial={{ opacity: 0, y: -10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="p-3 rounded border"
-                  style={{
-                    backgroundColor: 'var(--wf-tint-success)',
-                    borderColor: 'var(--wf-accent-green)',
-                    color: 'var(--wf-accent-green)',
-                  }}
-                >
-                  {success}
-                </motion.div>
-              )}
+            {success && (
+              <div
+                style={{
+                  marginTop: '1rem',
+                  padding: '0.45rem 0.6rem',
+                  borderLeft: '2px solid var(--wf-success)',
+                  background: 'var(--wf-tint-success)',
+                  color: 'var(--wf-success)',
+                  fontSize: '0.8rem',
+                }}
+              >
+                {success}
+              </div>
+            )}
 
-              {/* Project Configuration Form */}
-              <form onSubmit={handleSubmit}>
-                <section
-                  className="p-4 rounded-lg border space-y-4"
-                  style={{
-                    backgroundColor: 'var(--wf-bg-secondary)',
-                    borderColor: 'var(--wf-border)',
-                  }}
-                >
-                  <h2 className="text-lg font-semibold" style={{ color: 'var(--wf-fg)' }}>
-                    Project Configuration
-                  </h2>
+            {/* Project configuration */}
+            <form onSubmit={handleSubmit}>
+              <div className="wf-section">
+                <h2 className="wf-section-title">Project configuration</h2>
 
-                  {/* Max Workers */}
-                  <div>
-                    <label className="block text-sm font-semibold mb-2" style={{ color: 'var(--wf-fg)' }}>
-                      Max Concurrent Workers
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min="1"
-                        max="4"
-                        value={formData.maxWorkers}
-                        onChange={handleMaxWorkersChange}
-                        data-testid="settings-max-workers"
-                        className="w-20 px-3 py-2 rounded"
-                        style={{
-                          backgroundColor: 'var(--wf-bg)',
-                          color: 'var(--wf-fg)',
-                          borderColor: 'var(--wf-accent-blue)',
-                        }}
-                      />
-                      <span className="text-sm" style={{ color: 'var(--wf-fg-secondary)' }}>
-                        1-4 workers per project
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Bounce Budget */}
-                  <div>
-                    <label className="block text-sm font-semibold mb-2" style={{ color: 'var(--wf-fg)' }}>
-                      Bounce Budget
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min="0"
-                        value={formData.bounceBudget}
-                        onChange={handleBounceBudgetChange}
-                        data-testid="settings-bounce-budget"
-                        className="w-20 px-3 py-2 rounded"
-                        style={{
-                          backgroundColor: 'var(--wf-bg)',
-                          color: 'var(--wf-fg)',
-                          borderColor: 'var(--wf-accent-blue)',
-                        }}
-                      />
-                      <span className="text-sm" style={{ color: 'var(--wf-fg-secondary)' }}>
-                        Failed review attempts before escalation
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Worker Model */}
-                  <div>
-                    <label className="block text-sm font-semibold mb-2" style={{ color: 'var(--wf-fg)' }}>
-                      Worker Model
-                    </label>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
                     <input
-                      type="text"
-                      placeholder="Leave blank to inherit Main"
-                      value={formData.workerModel}
-                      onChange={(e) => handleModelChange('workerModel', e.target.value)}
-                      className="w-full px-3 py-2 rounded"
-                      style={{
-                        backgroundColor: 'var(--wf-bg)',
-                        color: 'var(--wf-fg)',
-                        borderColor: 'var(--wf-accent-blue)',
-                      }}
+                      type="number"
+                      min="1"
+                      max="4"
+                      value={formData.maxWorkers}
+                      onChange={handleMaxWorkersChange}
+                      data-testid="settings-max-workers"
+                      style={{ width: 64 }}
                     />
-                    <p className="text-xs mt-1" style={{ color: 'var(--wf-fg-secondary)' }}>
-                      Model slug (e.g., claude-opus, gpt-4)
-                    </p>
-                  </div>
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Max concurrent workers</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        1-4 per project; the office always leaves one koma sub-agent slot for you
+                      </span>
+                    </span>
+                  </label>
 
-                  {/* Reviewer Model */}
-                  <div>
-                    <label className="block text-sm font-semibold mb-2" style={{ color: 'var(--wf-fg)' }}>
-                      Reviewer Model
-                    </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
                     <input
-                      type="text"
-                      placeholder="Leave blank to inherit Main"
-                      value={formData.reviewerModel}
-                      onChange={(e) => handleModelChange('reviewerModel', e.target.value)}
-                      className="w-full px-3 py-2 rounded"
-                      style={{
-                        backgroundColor: 'var(--wf-bg)',
-                        color: 'var(--wf-fg)',
-                        borderColor: 'var(--wf-accent-blue)',
-                      }}
+                      type="number"
+                      min="0"
+                      value={formData.bounceBudget}
+                      onChange={handleBounceBudgetChange}
+                      data-testid="settings-bounce-budget"
+                      style={{ width: 64 }}
                     />
-                    <p className="text-xs mt-1" style={{ color: 'var(--wf-fg-secondary)' }}>
-                      Model slug for review tasks
-                    </p>
-                  </div>
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Bounce budget</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        failed review attempts before a task is parked
+                      </span>
+                    </span>
+                  </label>
 
-                  {/* Keep Desks Toggle */}
-                  <div className="flex items-center gap-3">
-                    <button
-                      type="button"
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
                       role="switch"
                       aria-checked={formData.keepDesks}
+                      checked={formData.keepDesks}
                       data-testid="settings-keep-desks-toggle"
-                      onClick={handleKeepDesksToggle}
-                      className="relative w-12 h-6 rounded-full transition-colors"
-                      style={{
-                        backgroundColor: formData.keepDesks
-                          ? 'var(--wf-accent-green)'
-                          : 'var(--wf-bg)',
-                      }}
-                    >
-                      <motion.div
-                        layout
-                        className="absolute w-5 h-5 rounded-full top-0.5"
-                        style={{
-                          // Contrast partner for whichever surface the knob currently
-                          // sits on: `--wf-bg` against the accent-green "on" track
-                          // (same trick badges use to read against saturated accent
-                          // colors in both themes), `--wf-fg` against the neutral
-                          // `--wf-bg` "off" track.
-                          backgroundColor: formData.keepDesks ? 'var(--wf-bg)' : 'var(--wf-fg)',
-                        }}
-                        animate={{
-                          left: formData.keepDesks ? '1.5rem' : '0.25rem',
-                        }}
-                      />
-                    </button>
-                    <label className="flex-1 cursor-pointer">
-                      <div className="text-sm font-semibold" style={{ color: 'var(--wf-fg)' }}>
-                        Keep Desks After Completion
-                      </div>
-                      <p className="text-xs" style={{ color: 'var(--wf-fg-secondary)' }}>
-                        Retain task working directories for debugging
-                      </p>
-                    </label>
-                  </div>
+                      onChange={handleKeepDesksToggle}
+                      style={{ width: 16, height: 16, accentColor: 'var(--wf-accent)' }}
+                    />
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Keep desks after completion</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        retain task working directories for debugging
+                      </span>
+                    </span>
+                  </label>
 
-                  {/* Submit Button */}
-                  <div className="flex gap-2 pt-4">
-                    <button
-                      type="submit"
-                      disabled={loading}
-                      data-testid="settings-submit"
-                      className="px-6 py-2 rounded font-semibold transition-opacity"
-                      style={{
-                        backgroundColor: 'var(--wf-accent-green)',
-                        color: 'var(--wf-bg)',
-                        opacity: loading ? 0.5 : 1,
-                      }}
-                    >
-                      {loading ? 'Saving...' : 'Save Settings'}
+                  <p style={{ fontSize: '0.72rem', color: 'var(--wf-dim)', margin: 0 }}>
+                    Worker and reviewer models are bound in koma&apos;s sub-agent sidebar (default: inherit
+                    Main) — there is deliberately no per-project model override here.
+                  </p>
+
+                  <div>
+                    <button type="submit" disabled={loading} data-testid="settings-submit" className="wf-btn wf-btn-accent">
+                      {loading ? 'saving…' : 'save'}
                     </button>
                   </div>
-                </section>
-              </form>
-            </>
-          )}
-        </motion.div>
+                </div>
+              </div>
+            </form>
+          </>
+        )}
       </div>
     </div>
   );

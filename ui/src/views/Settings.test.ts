@@ -146,20 +146,22 @@ describe('Settings (real component, rendered)', () => {
     expect(bridge.send).toHaveBeenCalledWith(expect.objectContaining({ maxWorkers: 4 }));
   });
 
-  it('blank model fields are submitted as undefined ("inherit Main"), not empty strings', async () => {
+  it('never submits per-project model overrides — models are bound in the koma sub-agent sidebar', async () => {
+    // Product decision (2026-07-15): worker/reviewer model fields were removed
+    // from Settings entirely; the contributed sub-agents' models are bound in
+    // koma's sidebar. config_set must not carry model keys AT ALL (not even
+    // undefined), and no free-text model inputs may render.
     seedProject({ workerModel: 'claude-sonnet', reviewerModel: 'claude-opus' });
     renderSettings();
 
-    const workerInput = container.querySelectorAll('input[type="text"]')[0] as HTMLInputElement;
-    const reviewerInput = container.querySelectorAll('input[type="text"]')[1] as HTMLInputElement;
-    setInputValue(workerInput, '');
-    setInputValue(reviewerInput, '');
+    expect(container.querySelectorAll('input[type="text"]').length).toBe(0);
 
     await submitForm();
 
-    expect(bridge.send).toHaveBeenCalledWith(
-      expect.objectContaining({ workerModel: undefined, reviewerModel: undefined }),
-    );
+    const payload = vi.mocked(bridge.send).mock.calls.at(-1)![0] as Record<string, unknown>;
+    expect(payload.op).toBe('config_set');
+    expect('workerModel' in payload).toBe(false);
+    expect('reviewerModel' in payload).toBe(false);
   });
 
   it('shows a success message on a clean save and an access-denied message on a grant-denied error', async () => {
@@ -167,7 +169,7 @@ describe('Settings (real component, rendered)', () => {
     renderSettings();
 
     await submitForm();
-    expect(container.textContent).toContain('Settings saved successfully');
+    expect(container.textContent).toContain('Settings saved');
 
     vi.mocked(bridge.send).mockResolvedValueOnce({ error: 'grant denied: config_set' });
     await submitForm();

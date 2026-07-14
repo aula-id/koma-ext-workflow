@@ -46,30 +46,6 @@ export interface Task {
   history?: TaskHistoryEntry[];
 }
 
-const STATE_LABEL: Record<TaskStateKey, string> = {
-  backlog: 'Backlog',
-  todo: 'Todo',
-  onprogress: 'Running',
-  review: 'Review',
-  parked: 'Parked',
-  done: 'Done',
-};
-
-function stateBadgeStyle(state: TaskStateKey): React.CSSProperties {
-  switch (state) {
-    case 'parked':
-      return { background: 'var(--wf-status-parked)', color: 'var(--wf-bg)' };
-    case 'onprogress':
-      return { background: 'var(--wf-status-running)', color: 'var(--wf-bg)' };
-    case 'review':
-      return { background: 'var(--wf-status-review)', color: 'var(--wf-bg)' };
-    case 'done':
-      return { background: 'var(--wf-status-done)', color: 'var(--wf-bg)' };
-    default:
-      return { background: 'var(--wf-bg)', color: 'var(--wf-fg-secondary)', border: '1px solid var(--wf-fg-secondary)' };
-  }
-}
-
 export interface CardProps {
   task: Task;
   draggable?: boolean;
@@ -78,7 +54,21 @@ export interface CardProps {
   onClick?: (task: Task) => void;
 }
 
+/*
+ * koma-flat card: the kanban card is the ONE legitimate box in this app
+ * (a draggable, contained thing). It stays quiet: panel surface, hairline
+ * border, no shadow, no state chip — the column it sits in already names its
+ * state. The only per-card signals are the ones the column CANNOT tell you:
+ *   - running: pulsing info dot (+ agent id when known)
+ *   - parked: warn dot + word (a parked card sits in the Review column)
+ *   - bounces: warn count, quiet until it exists
+ *   - blocked-by: dim refs
+ *   - halt culprit: 2px error left rule, not a full red frame
+ */
 export const Card: React.FC<CardProps> = ({ task, draggable = false, culprit = false, onDragStart, onClick }) => {
+  const parked = task.state === 'parked';
+  const running = task.state === 'onprogress';
+
   return (
     <motion.div
       layout
@@ -90,93 +80,62 @@ export const Card: React.FC<CardProps> = ({ task, draggable = false, culprit = f
       onDragStart={(e) => onDragStart?.(task, e as unknown as React.DragEvent)}
       onClick={() => onClick?.(task)}
       style={{
-        background: 'var(--wf-bg-secondary)',
+        background: 'var(--wf-panel)',
         borderRadius: 'var(--wf-radius)',
-        boxShadow: 'var(--wf-shadow)',
-        border: culprit ? '1px solid var(--wf-accent-pink)' : '1px solid transparent',
-        padding: '0.6rem 0.7rem',
+        border: '1px solid var(--wf-border)',
+        borderLeft: culprit ? '2px solid var(--wf-error)' : '1px solid var(--wf-border)',
+        padding: '0.5rem 0.6rem',
         cursor: draggable ? 'grab' : onClick ? 'pointer' : 'default',
       }}
+      whileHover={{ borderColor: 'var(--wf-grip)' }}
       data-task-id={task.id}
       data-testid="task-card"
     >
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '0.5rem' }}>
-        <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--wf-fg)', flex: 1 }}>{task.title}</span>
-        <span
-          style={{
-            fontSize: '0.65rem',
-            fontWeight: 600,
-            padding: '0.05rem 0.4rem',
-            borderRadius: 'var(--wf-radius)',
-            whiteSpace: 'nowrap',
-            ...stateBadgeStyle(task.state),
-          }}
-        >
-          {STATE_LABEL[task.state]}
-        </span>
-      </div>
+      <div style={{ fontSize: '0.82rem', color: 'var(--wf-fg)', lineHeight: 1.35 }}>{task.title}</div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: '0.35rem' }}>
-        {task.state === 'onprogress' && (
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: '0.55rem',
+          marginTop: '0.35rem',
+          fontSize: '0.68rem',
+          color: 'var(--wf-dim)',
+        }}
+      >
+        <span>p{task.priority}</span>
+
+        {running && (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', color: 'var(--wf-info)' }}>
             <motion.span
               animate={{ opacity: [0.35, 1, 0.35] }}
               transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
-              style={{
-                width: 6,
-                height: 6,
-                borderRadius: '50%',
-                background: 'var(--wf-status-running)',
-                display: 'inline-block',
-              }}
+              style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--wf-info)', display: 'inline-block' }}
             />
-            <span style={{ fontSize: '0.65rem', color: 'var(--wf-fg-secondary)' }}>
-              {task.agentId !== undefined ? `agent ${task.agentId}` : 'in progress'}
-            </span>
+            {task.agentId !== undefined ? `agent ${task.agentId}` : 'working'}
           </span>
         )}
-        <span
-          style={{
-            fontSize: '0.65rem',
-            color: 'var(--wf-fg-secondary)',
-            border: '1px solid var(--wf-border)',
-            borderRadius: 'var(--wf-radius)',
-            padding: '0.02rem 0.35rem',
-          }}
-        >
-          p{task.priority}
-        </span>
+
+        {parked && (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', color: 'var(--wf-warn)' }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--wf-warn)', display: 'inline-block' }} />
+            parked
+          </span>
+        )}
+
         {task.bounces > 0 && (
-          <span
-            style={{
-              fontSize: '0.65rem',
-              color: 'var(--wf-accent-pink)',
-            }}
-          >
-            bounce x{task.bounces}
+          <span style={{ color: 'var(--wf-warn)' }}>
+            {task.bounces} bounce{task.bounces === 1 ? '' : 's'}
+          </span>
+        )}
+
+        {task.blockedBy.length > 0 && (
+          <span title={`blocked by ${task.blockedBy.join(', ')}`}>
+            blocked by {task.blockedBy.join(', ')}
           </span>
         )}
       </div>
-
-      {task.blockedBy.length > 0 && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem', marginTop: '0.4rem' }}>
-          {task.blockedBy.map((id) => (
-            <span
-              key={id}
-              style={{
-                fontSize: '0.6rem',
-                color: 'var(--wf-fg-secondary)',
-                border: '1px solid var(--wf-fg-secondary)',
-                borderRadius: 'var(--wf-radius)',
-                padding: '0.02rem 0.3rem',
-              }}
-              title={`blocked by ${id}`}
-            >
-              blocked-by {id}
-            </span>
-          ))}
-        </div>
-      )}
     </motion.div>
   );
 };

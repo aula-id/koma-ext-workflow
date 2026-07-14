@@ -66,6 +66,15 @@ const COLUMNS: { key: ColumnKey; label: string }[] = [
   { key: 'done', label: 'Done' },
 ];
 
+const PHASE_COLOR: Record<ProjectPhase['kind'], string> = {
+  drafting: 'var(--wf-status-drafting)',
+  ready: 'var(--wf-accent)',
+  running: 'var(--wf-status-running)',
+  interrupted: 'var(--wf-status-parked)',
+  halted: 'var(--wf-status-blocked)',
+  done: 'var(--wf-status-done)',
+};
+
 export interface MoveGuardResult {
   legal: boolean;
   requiresKillWorker?: boolean;
@@ -104,6 +113,43 @@ export function guardCardMove(state: TaskStateKey, to: ColumnKey, killWorker: bo
   return { legal: true };
 }
 
+/**
+ * Two-step destructive button. wry webviews have NO native window.confirm /
+ * alert / prompt (they silently return falsy), so every confirmation must be
+ * in-UI: first click arms the button ("confirm <label>?"), second click within
+ * 3.5s fires; it disarms automatically after the timeout.
+ */
+const ConfirmButton: React.FC<{
+  label: string;
+  className: string;
+  onConfirm: () => void;
+  testId?: string;
+}> = ({ label, className, onConfirm, testId }) => {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 3500);
+    return () => clearTimeout(t);
+  }, [armed]);
+  return (
+    <button
+      data-testid={testId}
+      className={className}
+      style={armed ? { fontWeight: 700 } : undefined}
+      onClick={() => {
+        if (armed) {
+          setArmed(false);
+          onConfirm();
+        } else {
+          setArmed(true);
+        }
+      }}
+    >
+      {armed ? `confirm ${label}?` : label}
+    </button>
+  );
+};
+
 export interface BoardProps {
   projectId: string;
   onBack?: () => void;
@@ -126,6 +172,9 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
   const [dragOverColumn, setDragOverColumn] = useState<ColumnKey | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(initialTaskId ?? null);
+  /** A drop that needs the kill-worker confirmation (running -> todo). Rendered as
+   * an inline flat confirm strip — window.confirm does not exist in wry. */
+  const [pendingKillMove, setPendingKillMove] = useState<{ taskId: string; to: ColumnKey } | null>(null);
 
   useEffect(() => {
     // See Dashboard.tsx's identical fix: call the store action directly (exactly one
@@ -153,6 +202,7 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
     if (mountedProjectId.current === projectId) return;
     mountedProjectId.current = projectId;
     setSelectedTaskId(null);
+    setPendingKillMove(null);
   }, [projectId]);
 
   const selectedTask = useMemo(
@@ -177,26 +227,7 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
     return grouped;
   }, [project]);
 
-  const handleDrop = async (to: ColumnKey) => {
-    setDragOverColumn(null);
-    const taskId = dragTaskId;
-    setDragTaskId(null);
-    if (!taskId || !project) return;
-    const task = project.tasks.find((t) => t.id === taskId);
-    if (!task) return;
-
-    let killWorker = false;
-    if (task.state === 'onprogress' && to === 'todo') {
-      killWorker = window.confirm('Kill the running worker and requeue this task?');
-      if (!killWorker) return;
-    }
-
-    const guard = guardCardMove(task.state, to, killWorker);
-    if (!guard.legal) {
-      setToast(guard.reason ?? 'that move is not allowed');
-      return;
-    }
-
+  const sendMove = async (taskId: string, to: ColumnKey, killWorker: boolean) => {
     try {
       const res = await bridge.send({ op: 'card_move', task: taskId, to, killWorker });
       if (res?.error) setToast(res.error);
@@ -205,10 +236,31 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
     }
   };
 
+  const handleDrop = async (to: ColumnKey) => {
+    setDragOverColumn(null);
+    const taskId = dragTaskId;
+    setDragTaskId(null);
+    if (!taskId || !project) return;
+    const task = project.tasks.find((t) => t.id === taskId);
+    if (!task) return;
+
+    if (task.state === 'onprogress' && to === 'todo') {
+      // needs the kill-worker confirmation — arm the inline strip instead of
+      // a native dialog that does not exist in wry
+      setPendingKillMove({ taskId, to });
+      return;
+    }
+
+    const guard = guardCardMove(task.state, to, false);
+    if (!guard.legal) {
+      setToast(guard.reason ?? 'that move is not allowed');
+      return;
+    }
+    await sendMove(taskId, to, false);
+  };
+
   const runInterrupt = async (mode: 'hard' | 'soft') => {
     if (!project) return;
-    const label = mode === 'hard' ? 'Interrupt (hard-kill all workers)' : 'Drain (soft, finish in-flight)';
-    if (!window.confirm(`${label} for "${project.name}"?`)) return;
     try {
       const res = await bridge.send({ op: 'interrupt', project: project.id, mode });
       if (res?.error) setToast(res.error);
@@ -219,7 +271,6 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
 
   const runResume = async () => {
     if (!project) return;
-    if (!window.confirm(`Resume "${project.name}"?`)) return;
     try {
       const res = await bridge.send({ op: 'resume', project: project.id });
       if (res?.error) setToast(res.error);
@@ -230,80 +281,143 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
 
   if (!project) {
     return (
-      <div style={{ padding: '2rem', color: 'var(--wf-fg-secondary)' }}>
-        <button onClick={onBack} style={backButtonStyle}>
-          &larr; Dashboard
+      <div style={{ padding: '2rem', color: 'var(--wf-dim)' }}>
+        <button onClick={onBack} className="wf-btn wf-btn-ghost" style={{ paddingLeft: 0 }}>
+          &larr; dashboard
         </button>
         <p>Loading project…</p>
       </div>
     );
   }
 
-  const halted = project.phase.kind === 'halted';
+  const phaseKind = project.phase.kind;
+  const halted = phaseKind === 'halted';
+  const pendingKillTask = pendingKillMove ? project.tasks.find((t) => t.id === pendingKillMove.taskId) : undefined;
 
   return (
-    <div style={{ minHeight: '100vh', padding: '1.5rem', background: 'var(--wf-bg)' }}>
-      <div style={{ maxWidth: 1400, margin: '0 auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
-          <div>
-            <button onClick={onBack} style={backButtonStyle}>
-              &larr; Dashboard
+    <div style={{ minHeight: '100vh', padding: '1.25rem 1.5rem', background: 'var(--wf-bg)' }}>
+      <div style={{ maxWidth: 1500, margin: '0 auto' }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            paddingBottom: '0.6rem',
+            borderBottom: '1px solid var(--wf-head)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.75rem', minWidth: 0 }}>
+            <button onClick={onBack} className="wf-btn wf-btn-ghost" style={{ paddingLeft: 0 }}>
+              &larr;
             </button>
-            <h1 style={{ color: 'var(--wf-fg)', fontSize: '1.5rem', fontWeight: 700, margin: '0.25rem 0 0' }}>
+            <h1 style={{ color: 'var(--wf-fg)', fontSize: '1rem', fontWeight: 700, margin: 0 }} className="truncate">
               {project.name}
             </h1>
-            <span style={{ fontSize: '0.75rem', color: 'var(--wf-fg-secondary)' }}>{project.phase.kind}</span>
+            <span className="wf-status" style={{ color: PHASE_COLOR[phaseKind] }}>
+              <span className="wf-status-dot" style={{ background: PHASE_COLOR[phaseKind] }} />
+              {phaseKind}
+            </span>
           </div>
+          {/* Phase-dependent actions: one set at a time, never three alarm
+              buttons side by side for every state. */}
           <div style={{ display: 'flex', gap: '0.5rem' }}>
-            <button onClick={() => runInterrupt('hard')} style={dangerButtonStyle}>
-              Interrupt
-            </button>
-            <button onClick={() => runInterrupt('soft')} style={warnButtonStyle}>
-              Drain
-            </button>
-            <button onClick={runResume} style={primaryButtonStyle}>
-              Resume
-            </button>
+            {phaseKind === 'running' && (
+              <React.Fragment>
+                <ConfirmButton label="drain" className="wf-btn" onConfirm={() => void runInterrupt('soft')} testId="drain-btn" />
+                <ConfirmButton label="interrupt" className="wf-btn wf-btn-danger" onConfirm={() => void runInterrupt('hard')} testId="interrupt-btn" />
+              </React.Fragment>
+            )}
+            {phaseKind === 'interrupted' && (
+              <ConfirmButton label="resume" className="wf-btn wf-btn-accent" onConfirm={() => void runResume()} testId="resume-btn" />
+            )}
           </div>
         </div>
 
         {halted && (
           <div
             style={{
-              background: 'var(--wf-bg-secondary)',
-              border: '1px solid var(--wf-accent-pink)',
-              color: 'var(--wf-accent-pink)',
-              borderRadius: 'var(--wf-radius)',
-              padding: '0.6rem 0.8rem',
+              marginTop: '0.75rem',
+              padding: '0.45rem 0.6rem',
+              borderLeft: '2px solid var(--wf-error)',
+              background: 'var(--wf-tint-error)',
+              color: 'var(--wf-error)',
               fontSize: '0.8rem',
-              marginBottom: '0.75rem',
             }}
           >
-            Halted: {project.phase.reason ?? 'a parked task blocks all work'}
+            Halted: {project.phase.reason ?? 'a parked task blocks all remaining work'} — unpark the blocking task to resume.
           </div>
         )}
 
-        <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
+        {pendingKillMove && pendingKillTask && (
+          <div
+            style={{
+              marginTop: '0.75rem',
+              padding: '0.45rem 0.6rem',
+              borderLeft: '2px solid var(--wf-warn)',
+              background: 'var(--wf-tint-warn)',
+              color: 'var(--wf-fg)',
+              fontSize: '0.8rem',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.75rem',
+            }}
+          >
+            <span>
+              Requeue <strong>{pendingKillTask.title}</strong>? Its running worker will be killed.
+            </span>
+            <button
+              className="wf-btn wf-btn-danger"
+              data-testid="confirm-kill-move"
+              onClick={() => {
+                const mv = pendingKillMove;
+                setPendingKillMove(null);
+                void sendMove(mv.taskId, mv.to, true);
+              }}
+            >
+              kill worker &amp; requeue
+            </button>
+            <button className="wf-btn wf-btn-ghost" onClick={() => setPendingKillMove(null)}>
+              cancel
+            </button>
+          </div>
+        )}
+
+        {/* koma-flat tabs: text + active underline, no boxes */}
+        <div style={{ display: 'flex', gap: '1.1rem', margin: '0.75rem 0 1rem', borderBottom: '1px solid var(--wf-border)' }}>
           {(['board', 'drilldown', 'depmap', 'prd'] as Tab[]).map((t) => (
-            <button key={t} onClick={() => setTab(t)} style={tab === t ? tabActiveStyle : tabStyle}>
-              {t === 'board' ? 'Board' : t === 'drilldown' ? 'Drilldown' : t === 'depmap' ? 'Dependency Map' : 'PRD & Office'}
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              style={{
+                padding: '0.35rem 0.1rem',
+                fontSize: '0.8rem',
+                color: tab === t ? 'var(--wf-fg)' : 'var(--wf-dim)',
+                borderBottom: tab === t ? '2px solid var(--wf-accent)' : '2px solid transparent',
+                marginBottom: -1,
+                borderRadius: 0,
+              }}
+            >
+              {t === 'board' ? 'board' : t === 'drilldown' ? 'drilldown' : t === 'depmap' ? 'dependencies' : 'prd'}
             </button>
           ))}
         </div>
 
         {tab === 'board' && (
           <React.Fragment>
-          {/* `alignItems: 'start'` overrides CSS grid's default row-stretch, which was
-              forcing every column in the row to match the height of the tallest one —
-              short columns (In Progress, Done) showed a large blank panel below their
-              last card (design-critique round 2). `minHeight` stays as a slim drop-zone
-              affordance rather than growing to fill the row. */}
+          {/* Flat columns: no background panel per column — a small header with a
+              hairline rule, cards below. The drop target affordance is a dashed
+              hairline around the column area while dragging.
+              The page keeps overflow-x hidden (drawer fix in index.css), so the
+              BOARD ITSELF is the horizontal scroll container on narrow viewports —
+              without this, columns past the viewport edge were simply unreachable. */}
+          <div style={{ overflowX: 'auto', paddingBottom: '0.5rem' }}>
           <div
             style={{
               display: 'grid',
               gridTemplateColumns: 'repeat(5, minmax(220px, 1fr))',
-              gap: '0.75rem',
+              gap: '1rem',
               alignItems: 'start',
+              minWidth: 1180,
             }}
           >
             {COLUMNS.map((col) => (
@@ -319,22 +433,22 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
                   void handleDrop(col.key);
                 }}
                 style={{
-                  background: 'var(--wf-bg-secondary)',
-                  borderRadius: 'var(--wf-radius)',
-                  padding: '0.6rem',
                   minHeight: 200,
-                  border:
-                    dragOverColumn === col.key
-                      ? '1px dashed var(--wf-accent-blue)'
-                      : '1px solid transparent',
+                  borderRadius: 'var(--wf-radius)',
+                  outline: dragOverColumn === col.key ? '1px dashed var(--wf-grip)' : 'none',
+                  outlineOffset: 4,
                 }}
               >
                 <div
                   style={{
-                    fontSize: '0.75rem',
-                    fontWeight: 700,
-                    color: 'var(--wf-fg-secondary)',
-                    marginBottom: '0.5rem',
+                    fontSize: '0.68rem',
+                    fontWeight: 600,
+                    letterSpacing: '0.08em',
+                    textTransform: 'uppercase',
+                    color: 'var(--wf-dim)',
+                    paddingBottom: '0.35rem',
+                    marginBottom: '0.6rem',
+                    borderBottom: '1px solid var(--wf-head)',
                     display: 'flex',
                     justifyContent: 'space-between',
                   }}
@@ -360,6 +474,7 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
                 </div>
               </div>
             ))}
+          </div>
           </div>
 
           <AnimatePresence>
@@ -410,13 +525,13 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
               position: 'fixed',
               bottom: '1.25rem',
               right: '1.25rem',
-              background: 'var(--wf-bg-secondary)',
-              border: '1px solid var(--wf-accent-orange)',
+              background: 'var(--wf-panel)',
+              borderLeft: '2px solid var(--wf-warn)',
+              border: '1px solid var(--wf-border)',
               color: 'var(--wf-fg)',
               borderRadius: 'var(--wf-radius)',
               padding: '0.6rem 0.9rem',
               fontSize: '0.8rem',
-              boxShadow: 'var(--wf-shadow)',
             }}
           >
             {toast}
@@ -425,56 +540,6 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
       </div>
     </div>
   );
-};
-
-const buttonBase: React.CSSProperties = {
-  fontSize: '0.75rem',
-  fontWeight: 600,
-  borderRadius: 'var(--wf-radius)',
-  padding: '0.4rem 0.75rem',
-  border: '1px solid transparent',
-  cursor: 'pointer',
-  background: 'var(--wf-bg-secondary)',
-  color: 'var(--wf-fg)',
-};
-
-const backButtonStyle: React.CSSProperties = {
-  ...buttonBase,
-  background: 'transparent',
-  color: 'var(--wf-fg-secondary)',
-  padding: '0.2rem 0',
-};
-
-const dangerButtonStyle: React.CSSProperties = {
-  ...buttonBase,
-  border: '1px solid var(--wf-accent-pink)',
-  color: 'var(--wf-accent-pink)',
-};
-
-const warnButtonStyle: React.CSSProperties = {
-  ...buttonBase,
-  border: '1px solid var(--wf-accent-orange)',
-  color: 'var(--wf-accent-orange)',
-};
-
-const primaryButtonStyle: React.CSSProperties = {
-  ...buttonBase,
-  border: '1px solid var(--wf-accent-green)',
-  color: 'var(--wf-accent-green)',
-};
-
-const tabStyle: React.CSSProperties = {
-  ...buttonBase,
-  background: 'transparent',
-  color: 'var(--wf-fg-secondary)',
-  border: '1px solid var(--wf-bg-secondary)',
-};
-
-const tabActiveStyle: React.CSSProperties = {
-  ...buttonBase,
-  background: 'var(--wf-bg-secondary)',
-  color: 'var(--wf-accent-blue)',
-  border: '1px solid var(--wf-accent-blue)',
 };
 
 export default Board;

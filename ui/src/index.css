@@ -25,35 +25,99 @@ body {
   overflow-x: hidden;
 }
 
-/* Input styling */
-input {
-  border: 1px solid var(--wf-accent-blue);
-  padding: 0.5rem;
+/* Inputs: quiet koma-style wells — hairline border, subtle surface, accent
+ * only on focus. Never a colored border at rest. */
+input,
+textarea,
+select {
+  background: var(--wf-panel2);
+  color: var(--wf-fg);
+  border: 1px solid var(--wf-border);
+  padding: 0.35rem 0.5rem;
   border-radius: var(--wf-radius);
+  font-family: inherit;
+  font-size: inherit;
   transition: border-color var(--wf-animation-duration);
 }
 
-input:focus {
+input:focus,
+textarea:focus,
+select:focus {
   outline: none;
-  border-color: var(--wf-accent-purple);
-  box-shadow: 0 0 0 2px var(--wf-tint-accent);
+  border-color: var(--wf-grip);
 }
 
+/* Buttons: flat. No lifts, no bounce — koma chrome does not move. */
 button {
   border: none;
   cursor: pointer;
   font-family: inherit;
-  transition: all var(--wf-animation-duration);
-}
-
-button:hover:not(:disabled) {
-  opacity: 0.9;
-  transform: translateY(-1px);
+  font-size: inherit;
+  background: transparent;
+  transition: background-color var(--wf-animation-duration), border-color var(--wf-animation-duration), color var(--wf-animation-duration);
 }
 
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Shared flat primitives */
+.wf-btn {
+  padding: 0.3rem 0.75rem;
+  border-radius: var(--wf-radius);
+  border: 1px solid var(--wf-border);
+  color: var(--wf-fg);
+  background: transparent;
+}
+.wf-btn:hover:not(:disabled) {
+  background: var(--wf-hover);
+}
+.wf-btn-accent {
+  border-color: color-mix(in srgb, var(--wf-accent) 45%, var(--wf-bg));
+  color: var(--wf-accent);
+}
+.wf-btn-danger {
+  border-color: color-mix(in srgb, var(--wf-error) 45%, var(--wf-bg));
+  color: var(--wf-error);
+}
+.wf-btn-ghost {
+  border-color: transparent;
+  color: var(--wf-dim);
+}
+.wf-btn-ghost:hover:not(:disabled) {
+  color: var(--wf-fg);
+  background: var(--wf-hover);
+}
+
+/* Section heading: small caps + hairline rule, the koma section grammar
+ * (whitespace + top-down rules, never a box). */
+.wf-section {
+  border-top: 1px solid var(--wf-border);
+  padding-top: 0.6rem;
+  margin-top: 1.25rem;
+}
+.wf-section-title {
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--wf-dim);
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+}
+
+/* Status dot + word, replaces filled chips everywhere outside the board */
+.wf-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+}
+.wf-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  flex: none;
 }
 
 /* Empty states */

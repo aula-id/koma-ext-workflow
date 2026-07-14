@@ -1,126 +1,117 @@
 /*
- * Design tokens, sourced from koma's host-pushed palette roles (see
- * src-agent/src/view/theme.rs `dark()`/`light()` in the koma repo).
+ * Design tokens — sourced from koma's REAL GUI design system
+ * (simple-coders/src-webgui/src/styles.css @theme block), not the TUI palette.
  *
- * Only two themes exist upstream in koma: `dark` (default) and `light` — there is
- * no separate "milk" palette (that name is just an inline comment on light()'s
- * off-white background), so the theme switcher only offers dark/light.
+ * koma's visual identity is a FORMULA, not a color list:
+ *   - exactly two base colors per theme: bg + fg
+ *   - every surface is a color-mix of fg into bg at small percentages:
+ *       panel  = 6% fg   (raised surface: kanban cards, code blocks)
+ *       panel2 = 4% fg   (secondary surface: inputs, wells)
+ *       border = 10% fg  (hairline dividers — deliberately quiet)
+ *       hover  = 8% fg
+ *       head   = 12% fg  (section heads / emphasized hairlines)
+ *       grip   = 22% fg  (drag affordances)
+ *   - one interactive accent + four status roles (info/success/warn/error)
+ *   - KomaMono (JetBrains Mono) for EVERYTHING — chrome, forms, buttons
+ *   - flat minimalist: sections separate by whitespace + hairline rules,
+ *     full boxes ONLY for contained things (kanban cards, code blocks)
  *
- * Role mapping (koma role -> --wf-* token):
- *   appBg              -> --wf-bg
- *   surfaceRaised       -> --wf-bg-secondary   (raised panel/card/box background)
- *   textPrimary         -> --wf-fg
- *   textSecondary_dim   -> --wf-fg-secondary
- *   border              -> --wf-border
- *   hover               -> --wf-hover
- *   info                -> --wf-accent-blue    (also --wf-status-running)
- *   success             -> --wf-accent-green   (also --wf-status-done)
- *   warn                -> --wf-accent-orange  (also --wf-status-parked, --wf-accent-yellow)
- *   error               -> --wf-accent-pink    (also --wf-status-blocked)
- *   accent              -> --wf-accent-purple  (primary interactive/selection accent)
+ * The host does not push --koma-* vars into extension panels, so the default
+ * dark values (#0b0e14 / #c8d3f5) and light values (#fafaf6 / #141414) are
+ * pinned here. If a host theme channel ever appears, only --wf-bg/--wf-fg
+ * need to move.
  *
- * Theme switching is attribute-driven: `theme.ts` sets `data-theme` on <html>, and
- * every color role is redefined per theme below. Nothing else in the app may declare
- * a literal hex/rgb/hsl color for anything the koma palette has a role for — new
- * colors belong here, as a token, not inline in a component.
+ * No component may declare a literal hex/rgb/hsl for anything these roles
+ * cover — new colors belong here as tokens.
  */
 
 :root {
   color-scheme: dark;
 
-  /* koma dark palette (default theme) */
-  --wf-bg: #000000;
-  --wf-bg-secondary: #2b2f38;
-  --wf-fg: #e6e6e6;
-  --wf-fg-secondary: #adadad;
+  /* base pair (koma GUI dark defaults) */
+  --wf-bg: #0b0e14;
+  --wf-fg: #c8d3f5;
 
-  /* Bumped from the koma-sourced #171717: that value sits at ~1.2:1 contrast
-   * against --wf-bg (#000000), i.e. invisible as a card/section border (WCAG
-   * non-text UI components want >=3:1). #606060 clears ~3.3:1 while staying
-   * subtle. See design-critique round 1: "Section card borders are invisible". */
-  --wf-border: #606060;
-  --wf-hover: #121212;
+  /* derived surfaces — the koma formula */
+  --wf-panel: color-mix(in srgb, var(--wf-fg) 6%, var(--wf-bg));
+  --wf-panel2: color-mix(in srgb, var(--wf-fg) 4%, var(--wf-bg));
+  --wf-border: color-mix(in srgb, var(--wf-fg) 10%, var(--wf-bg));
+  --wf-hover: color-mix(in srgb, var(--wf-fg) 8%, var(--wf-bg));
+  --wf-head: color-mix(in srgb, var(--wf-fg) 12%, var(--wf-bg));
+  --wf-grip: color-mix(in srgb, var(--wf-fg) 22%, var(--wf-bg));
 
-  --wf-accent-blue: #50c8ff;
-  --wf-accent-green: #00c853;
-  --wf-accent-orange: #ffb43c;
-  --wf-accent-pink: #ff3c3c;
-  --wf-accent-purple: #39ff14;
-  --wf-accent-yellow: #ffb43c;
+  /* text roles */
+  --wf-dim: color-mix(in srgb, var(--wf-fg) 60%, var(--wf-bg));
 
-  --wf-status-running: var(--wf-accent-blue);
-  --wf-status-done: var(--wf-accent-green);
-  --wf-status-parked: var(--wf-accent-orange);
-  --wf-status-blocked: var(--wf-accent-pink);
+  /* koma roles (dark fallback values, 1:1 with src-webgui) */
+  --wf-accent: #39ff14;
+  --wf-info: #50c8ff;
+  --wf-success: #00c853;
+  --wf-warn: #ffb43c;
+  --wf-error: #ff3c3c;
 
-  /* `--wf-accent-purple` is koma's "accent" role, but its actual sourced value is
-   * green in both themes (see below) — reusing it for the Review status pill made
-   * Review and Done render as the same hue (design-critique round 2). Review gets
-   * its own dedicated violet hue instead, distinct from every other status color. */
-  --wf-status-review: #a78bfa;
+  /* extension-local status hues with no koma role */
+  --wf-review: #a78bfa;
 
-  /* Design-critique round 2: "Drafting" read as gray-on-gray (near-invisible) when
-   * it shared --wf-fg-secondary for both the chip fill and, via the neutral-badge
-   * branch, ended up too close in lightness to the text on top of it. Drafting gets
-   * its own low-saturation indigo status color plus a tinted (not solid) chip fill. */
-  --wf-status-drafting: #a5b4fc;
-  --wf-tint-drafting: color-mix(in srgb, #6366f1 15%, var(--wf-bg-secondary));
+  /* status mapping */
+  --wf-status-running: var(--wf-info);
+  --wf-status-done: var(--wf-success);
+  --wf-status-parked: var(--wf-warn);
+  --wf-status-blocked: var(--wf-error);
+  --wf-status-review: var(--wf-review);
+  --wf-status-drafting: var(--wf-dim);
 
-  --wf-radius: 0.375rem;
-  --wf-shadow: 0 4px 6px rgba(0, 0, 0, 0.4);
-  --wf-animation-duration: 0.2s;
+  /* subtle tints for banners/toasts — background wash, never a box border */
+  --wf-tint-error: color-mix(in srgb, var(--wf-error) 10%, transparent);
+  --wf-tint-success: color-mix(in srgb, var(--wf-success) 10%, transparent);
+  --wf-tint-warn: color-mix(in srgb, var(--wf-warn) 10%, transparent);
+  --wf-tint-info: color-mix(in srgb, var(--wf-info) 10%, transparent);
+  --wf-tint-accent: color-mix(in srgb, var(--wf-accent) 10%, transparent);
 
-  /* Alpha tints (banners/toasts) derived from the roles above, no separate
-   * per-theme literals needed. */
-  --wf-tint-error: color-mix(in srgb, var(--wf-accent-pink) 12%, transparent);
-  --wf-tint-success: color-mix(in srgb, var(--wf-accent-green) 12%, transparent);
-  --wf-tint-warn: color-mix(in srgb, var(--wf-accent-orange) 12%, transparent);
-  --wf-tint-info: color-mix(in srgb, var(--wf-accent-blue) 12%, transparent);
-  --wf-tint-accent: color-mix(in srgb, var(--wf-accent-purple) 12%, transparent);
+  --wf-radius: 4px;
+  --wf-animation-duration: 0.15s;
+
+  /* ---- compat aliases (older components; migrate off, do not add uses) ---- */
+  --wf-bg-secondary: var(--wf-panel);
+  --wf-fg-secondary: var(--wf-dim);
+  --wf-accent-blue: var(--wf-info);
+  --wf-accent-green: var(--wf-success);
+  --wf-accent-orange: var(--wf-warn);
+  --wf-accent-yellow: var(--wf-warn);
+  --wf-accent-pink: var(--wf-error);
+  --wf-accent-purple: var(--wf-accent);
+  --wf-tint-drafting: var(--wf-panel);
+  --wf-shadow: none;
 }
 
 :root[data-theme='light'] {
   color-scheme: light;
 
-  /* koma light palette */
+  /* base pair (koma light / "milk") */
   --wf-bg: #fafaf6;
-  --wf-bg-secondary: #e4e6eb;
   --wf-fg: #141414;
 
-  /* Bumped from #787878 (~3.5:1 on --wf-bg-secondary, under the 4.5:1 text
-   * minimum): priority tokens and status subtitles rendered in this color were
-   * effectively unreadable in light mode (design-critique round 2). #52525b clears
-   * ~6.2:1 on --wf-bg-secondary. */
-  --wf-fg-secondary: #52525b;
+  /* light needs a darker-leaning dim for text contrast */
+  --wf-dim: color-mix(in srgb, var(--wf-fg) 55%, var(--wf-bg));
 
-  /* Same contrast fix as the dark theme above: #e3e3df on #fafaf6 was ~1.2:1. */
-  --wf-border: #909090;
-  --wf-hover: #e8e8e4;
+  /* koma light role values */
+  --wf-accent: #008000;
+  --wf-info: #1e78c8;
+  --wf-success: #00963c;
+  --wf-warn: #c87800;
+  --wf-error: #c82828;
 
-  --wf-accent-blue: #1e78c8;
-  --wf-accent-green: #00963c;
-  --wf-accent-orange: #c87800;
-  --wf-accent-pink: #c82828;
-  --wf-accent-purple: #008000;
-  --wf-accent-yellow: #c87800;
-
-  --wf-status-review: #7c3aed;
-  --wf-status-drafting: #4f46e5;
-
-  --wf-shadow: 0 4px 6px rgba(0, 0, 0, 0.12);
+  --wf-review: #7c3aed;
 }
 
-* {
-  color: var(--wf-fg);
-}
-
+/* koma runs everything in mono — chrome, panels, forms, buttons. */
 body {
   background-color: var(--wf-bg);
   color: var(--wf-fg);
   margin: 0;
   padding: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  font-family: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 13px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
