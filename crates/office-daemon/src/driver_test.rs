@@ -549,3 +549,75 @@ fn bootstrap_never_steals_a_fresh_lease_held_under_a_different_daemon_session() 
     let on_disk = lease::read(&lease_path).unwrap().unwrap();
     assert_eq!(on_disk.instance, "inst-owner", "the foreign live lease must be left untouched on disk");
 }
+
+// ---------------------------------------------------------------------------
+// project_create: the panel "New Project" op actually mints a Drafting project
+// ---------------------------------------------------------------------------
+
+#[test]
+fn project_create_mints_drafting_project_persists_and_leases() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    assert!(d.projects.is_empty(), "fresh driver starts with no projects");
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::ProjectCreate {
+            name: "My New Project".to_string(),
+        }),
+        1_000,
+    );
+
+    // In-memory: exactly one project, slugged from the name, in Drafting with an empty
+    // board and a default config. Before the fix this whole op was a no-op arm, so
+    // `d.project(...)` was `None` and every assertion below failed.
+    let p = d.project("my-new-project").expect("project_create must create a project");
+    assert_eq!(p.name, "My New Project");
+    assert_eq!(p.phase, ProjectPhase::Drafting);
+    assert!(p.tasks.is_empty() && p.epics.is_empty() && p.stories.is_empty());
+    assert_eq!(p.config, ProjectConfig::default_config());
+    assert!(d.holds_lease("my-new-project"), "the creator must hold the new project's lease");
+
+    // Durable: the project is on disk (state.json + registry row), so a fresh driver
+    // reloading the same store root sees it.
+    let reloaded = Driver::load(
+        Store::open(_dir.path()).expect("reopen store"),
+        FakeHost::new(),
+        "reload-instance".to_string(),
+        4243,
+    )
+    .expect("reload driver");
+    assert!(
+        reloaded.project("my-new-project").is_some(),
+        "the created project must survive a reload from the store"
+    );
+
+    // The panel got a repaint carrying the new project.
+    let (panel_id, envelope) = d.host.panel_pushes.last().expect("a board push");
+    assert_eq!(panel_id, "board");
+    let ids: Vec<&str> = envelope["projects"]
+        .as_array()
+        .expect("projects array")
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"my-new-project"), "the pushed snapshot must include the new project");
+}
+
+#[test]
+fn project_create_dedupes_colliding_slugs() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+
+    for _ in 0..2 {
+        d.handle(
+            handlers::Input::Command(handlers::Command::ProjectCreate { name: "Same Name".to_string() }),
+            1_000,
+        );
+    }
+
+    assert!(d.project("same-name").is_some(), "first create takes the bare slug");
+    assert!(d.project("same-name-2").is_some(), "second create must not clobber the first");
+    assert_eq!(d.projects.len(), 2, "both projects exist independently");
+}

@@ -425,6 +425,10 @@ impl<H: Host> Driver<H> {
             // An off-loop invoke completed: apply the driver's one retry, else route the
             // outcome into the kernel (5.1 / 6.2).
             DCmd::InvokeDone { req_id, result } => self.on_invoke_done(req_id, result, now_ms),
+            // A fresh project from the panel's "New Project" affordance (10.2, 6.1):
+            // construct an empty Drafting project so the PRD -> breakdown -> authorize ->
+            // Running pipeline has something to act on.
+            DCmd::ProjectCreate { name } => self.create_project(name, now_ms),
             // Remaining panel/tool surface not owned by W9; no-ops until their waves wire
             // them (status digests, board edits, project lifecycle).
             DCmd::Status { .. }
@@ -433,7 +437,6 @@ impl<H: Host> Driver<H> {
             | DCmd::EditTask { .. }
             | DCmd::EditDeps { .. }
             | DCmd::ConfigSet { .. }
-            | DCmd::ProjectCreate { .. }
             | DCmd::ProjectArchive { .. }
             | DCmd::TaskDetail { .. } => {}
             // hello/state/prd_get are answered INLINE by the handler off the snapshot
@@ -722,6 +725,83 @@ impl<H: Host> Driver<H> {
             }),
             now_ms,
         );
+    }
+
+    // -- project lifecycle (6.1 / 10.2) ------------------------------------
+
+    /// Create a fresh project from a panel `project_create` op: mint a unique slug from
+    /// `name`, persist an empty `Drafting` project (state.json + registry row) via the
+    /// store, acquire its dispatch lease using THIS daemon's own session (never a
+    /// foreign `bound_session`, see `bootstrap`), register it in memory, and repaint the
+    /// board. `bound_session`/`workspace` are seeded from this daemon so the later
+    /// authorize -> Running pipeline can dispatch (dispatch bails without a bound session
+    /// and a delivery path — kernel.rs `dispatch`). A store write failure aborts without
+    /// registering an in-memory project so on-disk and in-memory never diverge.
+    fn create_project(&mut self, name: String, now_ms: u64) {
+        let slug = self.mint_project_slug(&name);
+        let project = Project {
+            id: office_core::ProjectId(slug.clone()),
+            name,
+            phase: ProjectPhase::Drafting,
+            prd_markdown: String::new(),
+            office_transcript: Vec::new(),
+            office_summary: String::new(),
+            delivery_path: None,
+            bound_session: self.session.clone(),
+            workspace: self.workspace.clone(),
+            epics: Vec::new(),
+            stories: Vec::new(),
+            tasks: Vec::new(),
+            config: office_core::ProjectConfig::default_config(),
+            outbox: Vec::new(),
+            seq: 0,
+        };
+        if self.store.create_project(&project).is_err() {
+            log_line("project_create: store write failed; project not created");
+            return;
+        }
+        let path = self.store.lease_path(&slug);
+        let lease = lease::acquire(&path, &self.instance, self.session.as_deref(), self.pid, now_ms)
+            .ok()
+            .flatten();
+        self.projects.push(Owned { project, lease });
+        let idx = self.projects.len() - 1;
+        self.sync_prd_cache(idx);
+        self.ctx_dirty = true;
+        self.push_board(now_ms, true);
+    }
+
+    /// Turn a free-text project name into a unique, filesystem-safe slug: lowercase, every
+    /// run of non-`[a-z0-9]` collapsed to a single `-`, leading/trailing `-` trimmed;
+    /// empty result falls back to `project`. A collision with an already-loaded project
+    /// appends `-2`, `-3`, ... until unique (all projects on disk are loaded into
+    /// `self.projects`, so this set is authoritative).
+    fn mint_project_slug(&self, name: &str) -> String {
+        let mut base = String::new();
+        let mut prev_dash = false;
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() {
+                base.push(c.to_ascii_lowercase());
+                prev_dash = false;
+            } else if !prev_dash {
+                base.push('-');
+                prev_dash = true;
+            }
+        }
+        let base = base.trim_matches('-');
+        let base = if base.is_empty() { "project" } else { base };
+        let taken = |cand: &str| self.projects.iter().any(|o| o.project.id.0 == cand);
+        if !taken(base) {
+            return base.to_string();
+        }
+        let mut n = 2u64;
+        loop {
+            let candidate = format!("{base}-{n}");
+            if !taken(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     // -- off-loop invoke pool (5.1) ----------------------------------------
