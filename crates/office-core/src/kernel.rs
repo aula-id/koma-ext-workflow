@@ -710,6 +710,20 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
     }
 }
 
+/// Build the per-task desk directory (ARCHITECTURE.md 7.1): a single flat,
+/// human-readable, obviously-marked dir `desks/<project-slug>/<task-slug>--koma-workflow-desk/`.
+/// `TaskId.0` is the full hierarchical id `<project>/<epic-slug>/<story-slug>/<task-slug>`
+/// (see `office::apply_breakdown`); only the final `/`-delimited segment (the task slug)
+/// is used here, so nested epic/story path segments never leak into the desk tree.
+fn desk_dir(workspace: &Path, project_slug: &str, tid: &TaskId) -> PathBuf {
+    let task_slug = tid.0.rsplit('/').next().unwrap_or(&tid.0);
+    workspace
+        .join("koma-workflow")
+        .join("desks")
+        .join(project_slug)
+        .join(format!("{}--koma-workflow-desk", task_slug))
+}
+
 fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now_ms: u64, ctx: &mut Ctx) {
     let idx = match find_task(p, tid) {
         Some(i) => i,
@@ -719,10 +733,7 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
         Some(w) => w.clone(),
         None => return,
     };
-    let desk = workspace
-        .join("koma-workflow")
-        .join("desks")
-        .join(&tid.0);
+    let desk = desk_dir(&workspace, &p.id.0, tid);
     let attempt = next_attempt(&p.tasks[idx]);
     let review_notes = p.tasks[idx].last_review.clone();
 

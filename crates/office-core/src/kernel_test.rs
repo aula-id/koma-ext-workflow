@@ -391,6 +391,42 @@ fn pending_comment_stays_pending_through_first_try_done() {
 }
 
 // ---------------------------------------------------------------------------
+// Desk layout (ARCHITECTURE.md 7.1): flat, human-readable, obviously-marked
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dispatch_desk_dir_is_flat_project_slug_over_task_slug() {
+    // Real dispatch mints hierarchical TaskIds `<project>/<epic-slug>/<story-slug>/<task-slug>`
+    // (office::apply_breakdown). The desk dir must collapse that to the single flat,
+    // obviously-marked `desks/<project-slug>/<task-slug>--koma-workflow-desk` layout locked by
+    // ARCHITECTURE.md 7.1 -- never a nested epic/story nested directory tree.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task(
+            "shop-crawler/e1-ingest/s2-parser/t4-retry-logic",
+            TaskState::Todo,
+            0,
+            &[],
+        )],
+    );
+    p.id = ProjectId("shop-crawler".to_string());
+
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    let dir = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::EnsureDesk { dir, .. } => Some(dir.clone()),
+            _ => None,
+        })
+        .expect("EnsureDesk effect");
+
+    assert_eq!(
+        dir,
+        PathBuf::from("/ws/koma-workflow/desks/shop-crawler/t4-retry-logic--koma-workflow-desk")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Full lifecycle: exact effect sequence
 // ---------------------------------------------------------------------------
 
