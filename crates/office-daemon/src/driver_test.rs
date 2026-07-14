@@ -521,6 +521,70 @@ fn brief_runs_invoke_off_loop_and_result_lands_in_transcript_without_starving_di
 }
 
 #[test]
+fn brief_with_unknown_project_id_mints_a_drafting_project_instead_of_dropping() {
+    // Live-test bug 2026-07-15: `workflow_brief` with a fresh project id was acked
+    // ("office is thinking") and then silently dropped because resolve_office_project
+    // found nothing. A brief is the documented way to START a project, so an
+    // unresolved id must mint a Drafting project and land the message in it.
+    let (store, _dir) = temp_store();
+    let mut d = driver(store, FakeHost::new());
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::Brief {
+            project: Some("todoapp-simple".to_string()),
+            message: "Build a very simple todo app using Vite and React.".to_string(),
+        }),
+        1_000,
+    );
+
+    let p = d.project("todoapp-simple").expect("project was minted from the brief");
+    assert!(matches!(p.phase, ProjectPhase::Drafting));
+    assert_eq!(p.office_transcript.len(), 1, "the brief message landed in the transcript");
+    assert_eq!(p.office_transcript[0].text, "Build a very simple todo app using Vite and React.");
+    assert_eq!(fake.jobs.lock().unwrap().len(), 1, "persona invoke kicked off for the new project");
+}
+
+#[test]
+fn brief_with_no_project_and_empty_board_mints_a_named_drafting_project() {
+    let (store, _dir) = temp_store();
+    let mut d = driver(store, FakeHost::new());
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::Brief {
+            project: None,
+            message: "we want to make todo apps, very simple, using vite and react".to_string(),
+        }),
+        1_000,
+    );
+
+    // Name derives from the first words of the brief; project exists and is Drafting.
+    let minted = d
+        .projects_for_test()
+        .iter()
+        .find(|p| matches!(p.phase, ProjectPhase::Drafting))
+        .cloned()
+        .expect("a drafting project was minted");
+    assert_eq!(minted.name, derive_project_name("we want to make todo apps, very simple, using vite and react"));
+    assert_eq!(minted.office_transcript.len(), 1);
+    assert_eq!(fake.jobs.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn derive_project_name_takes_leading_words_and_never_returns_empty() {
+    assert_eq!(derive_project_name("build a crawler"), "build a crawler");
+    assert_eq!(
+        derive_project_name("we want to make todo apps, very simple, using vite and react"),
+        "we want to make todo apps,"
+    );
+    assert_eq!(derive_project_name("   "), "untitled");
+    assert!(derive_project_name(&"x".repeat(300)).len() <= 48);
+}
+
+#[test]
 fn invoke_timeout_retries_exactly_once_then_surfaces() {
     let (store, _dir) = temp_store();
     let mut d = driver(store, FakeHost::new());

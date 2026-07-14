@@ -396,7 +396,18 @@ impl<H: Host> Driver<H> {
             DCmd::Comment { task, text } => self.add_comment(&TaskId(task), text, now_ms),
             // ---- front office (W9, ARCHITECTURE.md 6.2 / 6.3) ----
             DCmd::Brief { project, message } => {
-                if let Some(i) = self.resolve_office_project(project.as_deref()) {
+                // A brief is the documented way to START a project ("use
+                // workflow_brief to get started"), so an id that doesn't resolve
+                // — or no projects at all — must MINT a Drafting project rather
+                // than silently dropping the message (live-test bug 2026-07-15:
+                // brief acked "office is thinking" and then went nowhere).
+                let idx = self.resolve_office_project(project.as_deref()).or_else(|| {
+                    let name = project
+                        .clone()
+                        .unwrap_or_else(|| derive_project_name(&message));
+                    self.create_project(name, now_ms)
+                });
+                if let Some(i) = idx {
                     self.step(
                         i,
                         kernel::Input::Command(kernel::Command::OfficeMessage { text: message }),
@@ -428,7 +439,9 @@ impl<H: Host> Driver<H> {
             // A fresh project from the panel's "New Project" affordance (10.2, 6.1):
             // construct an empty Drafting project so the PRD -> breakdown -> authorize ->
             // Running pipeline has something to act on.
-            DCmd::ProjectCreate { name } => self.create_project(name, now_ms),
+            DCmd::ProjectCreate { name } => {
+                let _ = self.create_project(name, now_ms);
+            }
             // A direct project-config edit (10.2 `config_set`). Only the lease holder
             // may apply it, matching Interrupt/Resume/Unpark above; a non-holder's
             // config_set is silently dropped the same way theirs would be.
@@ -718,7 +731,7 @@ impl<H: Host> Driver<H> {
 
     /// Resolve the project a `workflow_brief` targets: an explicit id, or (when absent)
     /// the single owned project still in `Drafting` (6.4 default).
-    fn resolve_office_project(&self, project: Option<&str>) -> Option<usize> {
+    pub(crate) fn resolve_office_project(&self, project: Option<&str>) -> Option<usize> {
         if let Some(id) = project {
             return self.owned_project_by_id(id);
         }
@@ -761,7 +774,7 @@ impl<H: Host> Driver<H> {
     /// authorize -> Running pipeline can dispatch (dispatch bails without a bound session
     /// and a delivery path — kernel.rs `dispatch`). A store write failure aborts without
     /// registering an in-memory project so on-disk and in-memory never diverge.
-    fn create_project(&mut self, name: String, now_ms: u64) {
+    fn create_project(&mut self, name: String, now_ms: u64) -> Option<usize> {
         let slug = self.mint_project_slug(&name);
         let project = Project {
             id: office_core::ProjectId(slug.clone()),
@@ -782,7 +795,7 @@ impl<H: Host> Driver<H> {
         };
         if self.store.create_project(&project).is_err() {
             log_line("project_create: store write failed; project not created");
-            return;
+            return None;
         }
         let path = self.store.lease_path(&slug);
         let lease = lease::acquire(&path, &self.instance, self.session.as_deref(), self.pid, now_ms)
@@ -793,6 +806,7 @@ impl<H: Host> Driver<H> {
         self.sync_prd_cache(idx);
         self.ctx_dirty = true;
         self.push_board(now_ms, true);
+        Some(idx)
     }
 
     /// Turn a free-text project name into a unique, filesystem-safe slug: lowercase, every
@@ -1243,6 +1257,11 @@ impl<H: Host> Driver<H> {
             .flatten();
         self.projects.push(Owned { project, lease });
     }
+
+    /// Snapshot of all loaded projects (tests).
+    pub fn projects_for_test(&self) -> Vec<Project> {
+        self.projects.iter().map(|o| o.project.clone()).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,6 +1342,26 @@ fn error_str(v: &Value) -> Option<&str> {
 
 /// Parse an ext-facing agent id from a reply, tolerating both `u64` and numeric-string forms
 /// (host mode is `u64`; `sessions.list`/demo can render ids as strings).
+/// Name a project minted implicitly by a brief that arrived without a project id:
+/// the first few words of the brief message, capped, so the dashboard row reads like
+/// a project and not a paragraph. Empty/whitespace briefs fall back to "untitled".
+pub(crate) fn derive_project_name(message: &str) -> String {
+    let name: String = message.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return "untitled".to_string();
+    }
+    if name.len() > 48 {
+        let mut cut = 48;
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        name[..cut].trim_end().to_string()
+    } else {
+        name
+    }
+}
+
 fn parse_agent_id(v: &Value) -> Option<u64> {
     match v.get("agentId") {
         Some(Value::Number(n)) => n.as_u64(),
