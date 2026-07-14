@@ -1,16 +1,25 @@
 import React, { useState } from 'react';
 import Dashboard from './views/Dashboard';
+import Board from './views/Board';
 
 const App: React.FC = () => {
-  const [currentView] = useState<'dashboard' | 'board'>('dashboard');
+  const [selectedProject, setSelectedProject] = useState<string | null>(null);
 
   const handleProjectClick = (projectId: string) => {
-    console.log('Project clicked:', projectId);
+    setSelectedProject(projectId);
+  };
+
+  const handleBack = () => {
+    setSelectedProject(null);
   };
 
   return (
-    <div className="bg-gray-900 min-h-screen">
-      {currentView === 'dashboard' && <Dashboard onProjectClick={handleProjectClick} />}
+    <div style={{ minHeight: '100vh', backgroundColor: 'var(--wf-bg)' }}>
+      {selectedProject ? (
+        <Board projectId={selectedProject} onBack={handleBack} />
+      ) : (
+        <Dashboard onProjectClick={handleProjectClick} />
+      )}
     </div>
   );
 };
