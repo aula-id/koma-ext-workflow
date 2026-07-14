@@ -391,6 +391,56 @@ fn panel_msg_edit_task_and_edit_deps_carry_opaque_patch() {
     );
 }
 
+/// Regression: `card_move`/`edit_task`/`edit_deps`/`config_set`/`project_archive` are not
+/// yet wired into the kernel (driver.rs no-ops them), so the ack must be an honest error,
+/// not `{ok:true, accepted:true}` — otherwise the panel shows no toast and the drag/edit
+/// silently reverts on the next snapshot push with no explanation to the user. The command
+/// must still be enqueued (a later wave can wire it up without a handler change) but the
+/// wire reply may never claim success for a write that never happens.
+#[test]
+fn panel_msg_unwired_write_ops_ack_with_error_not_false_success() {
+    let cases = [
+        json!({ "op": "card_move", "task": "t1", "to": "todo" }),
+        json!({ "op": "edit_task", "task": "t1", "priority": 5 }),
+        json!({ "op": "edit_deps", "task": "t1", "deps": [] }),
+        json!({ "op": "config_set", "project": "auth", "maxWorkers": 3 }),
+        json!({ "op": "project_archive", "project": "auth" }),
+    ];
+    for payload in cases {
+        let op = payload.get("op").and_then(Value::as_str).unwrap().to_string();
+        let (tx, rx) = channel();
+        let reply = on_invoke("panel.msg", json!({ "panelId": "board", "payload": payload }), &tx);
+
+        // The command is still enqueued for the driver (future-wave wiring)...
+        let _ = recv_command(&rx);
+        // ...but the immediate ack must not lie about success.
+        assert!(
+            reply.get("ok").is_none(),
+            "op {op}: expected no ok:true ack, got {reply:?}"
+        );
+        assert!(
+            reply.get("error").is_some(),
+            "op {op}: expected an error ack, got {reply:?}"
+        );
+    }
+}
+
+/// Ops the driver DOES act on must keep acking success (guards against the fix above
+/// over-broadening to every panel op).
+#[test]
+fn panel_msg_wired_write_ops_still_ack_success() {
+    let cases = [
+        json!({ "op": "comment_add", "task": "t1", "text": "lgtm" }),
+        json!({ "op": "unpark", "task": "t1" }),
+        json!({ "op": "project_create", "name": "New" }),
+    ];
+    for payload in cases {
+        let (tx, _rx) = channel();
+        let reply = on_invoke("panel.msg", json!({ "panelId": "board", "payload": payload }), &tx);
+        assert_eq!(reply, json!({ "ok": true, "accepted": true }));
+    }
+}
+
 #[test]
 fn panel_msg_missing_op_and_unknown_op_are_errors_not_panics() {
     let (tx, _rx) = channel();

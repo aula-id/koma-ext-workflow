@@ -281,6 +281,10 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
         _ => {}
     }
 
+    // Owned copy: some arms below move `payload` (e.g. `edit_task`'s opaque patch), which
+    // would otherwise end `op`'s borrow before the not-implemented check after the match.
+    let op_owned = op.to_string();
+
     let command = match op {
         "office_chat" => {
             let project = match str_field(&payload, "project") {
@@ -426,7 +430,23 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
         other => return error(&format!("unknown panel op: {other}")),
     };
 
+    // `driver::handle_command` currently no-ops these five ops (board edits + config +
+    // archive are not wired into the kernel yet). Telling the panel `{ok:true}` for a
+    // write that silently vanishes is worse than an honest error: the panel would show
+    // no toast and the very next snapshot push would revert the optimistic UI change
+    // with no explanation. Surface a real error until a later wave wires these through.
+    let unimplemented = matches!(
+        command,
+        Command::CardMove { .. }
+            | Command::EditTask { .. }
+            | Command::EditDeps { .. }
+            | Command::ConfigSet { .. }
+            | Command::ProjectArchive { .. }
+    );
     send(tx, command);
+    if unimplemented {
+        return error(&format!("panel op '{op_owned}' is not implemented yet"));
+    }
     serde_json::json!({ "ok": true, "accepted": true })
 }
 
