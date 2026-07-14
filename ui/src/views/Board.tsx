@@ -5,6 +5,8 @@ import { bridge } from '../bridge';
 import { Card, ColumnKey, Task, TaskStateKey } from '../components/Card';
 import Drilldown from './Drilldown';
 import DepMap from '../components/DepMap';
+import TaskDetail from './TaskDetail';
+import Prd from './Prd';
 
 /** Project shape, full mode, per docs/PANEL_PROTOCOL.md 2.1 (frozen W7 contract). */
 export interface ProjectPhase {
@@ -25,6 +27,22 @@ export interface Story {
   tasks: string[];
 }
 
+export interface ChatMsg {
+  who: 'user' | 'office';
+  text: string;
+}
+
+/** Not part of the frozen envelope (PANEL_PROTOCOL.md 2.1 does not serialize the
+ * domain model's `outbox` onto `Project`) — same documented gap as `epics`/`stories`
+ * below. Kept optional and forward-compatible: OfficeChat.tsx renders an empty
+ * notice log today and picks this up automatically the day a later wave adds it. */
+export interface OutboundNoticeView {
+  id: number;
+  text: string;
+  sent: boolean;
+  paused: boolean;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -35,6 +53,9 @@ export interface Project {
   epics?: Epic[];
   stories?: Story[];
   prdMarkdown?: string;
+  officeTranscript?: ChatMsg[];
+  officeSummary?: string;
+  outbox?: OutboundNoticeView[];
 }
 
 const COLUMNS: { key: ColumnKey; label: string }[] = [
@@ -88,7 +109,7 @@ export interface BoardProps {
   onBack?: () => void;
 }
 
-type Tab = 'board' | 'drilldown' | 'depmap';
+type Tab = 'board' | 'drilldown' | 'depmap' | 'prd';
 
 export const Board: React.FC<BoardProps> = ({ projectId, onBack }) => {
   const rawProject = useStore((s) => s.getProject(projectId));
@@ -98,6 +119,7 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack }) => {
   const [dragTaskId, setDragTaskId] = useState<string | null>(null);
   const [dragOverColumn, setDragOverColumn] = useState<ColumnKey | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 
   useEffect(() => {
     const unsubscribe = bridge.onSnapshot((snap) => {
@@ -115,6 +137,15 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack }) => {
     const t = setTimeout(() => setToast(null), 3500);
     return () => clearTimeout(t);
   }, [toast]);
+
+  useEffect(() => {
+    setSelectedTaskId(null);
+  }, [projectId]);
+
+  const selectedTask = useMemo(
+    () => project?.tasks.find((t) => t.id === selectedTaskId),
+    [project, selectedTaskId],
+  );
 
   const tasksByColumn = useMemo(() => {
     const grouped: Record<ColumnKey, Task[]> = {
@@ -240,15 +271,16 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack }) => {
         )}
 
         <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
-          {(['board', 'drilldown', 'depmap'] as Tab[]).map((t) => (
+          {(['board', 'drilldown', 'depmap', 'prd'] as Tab[]).map((t) => (
             <button key={t} onClick={() => setTab(t)} style={tab === t ? tabActiveStyle : tabStyle}>
-              {t === 'board' ? 'Board' : t === 'drilldown' ? 'Drilldown' : 'Dependency Map'}
+              {t === 'board' ? 'Board' : t === 'drilldown' ? 'Drilldown' : t === 'depmap' ? 'Dependency Map' : 'PRD & Office'}
             </button>
           ))}
         </div>
 
         {tab === 'board' && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(220px, 1fr))', gap: '0.75rem' }}>
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'flex-start' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(220px, 1fr))', gap: '0.75rem', flex: 1 }}>
             {COLUMNS.map((col) => (
               <div
                 key={col.key}
@@ -296,12 +328,22 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack }) => {
                           setDragTaskId(t.id);
                           e.dataTransfer?.setData('text/plain', t.id);
                         }}
+                        onClick={(t) => setSelectedTaskId(t.id)}
                       />
                     ))}
                   </AnimatePresence>
                 </div>
               </div>
             ))}
+          </div>
+
+          <AnimatePresence>
+            {selectedTaskId && selectedTask && (
+              <div style={{ width: 380, flexShrink: 0 }}>
+                <TaskDetail task={selectedTask} onClose={() => setSelectedTaskId(null)} />
+              </div>
+            )}
+          </AnimatePresence>
           </div>
         )}
 
@@ -313,6 +355,8 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack }) => {
             halted={halted}
           />
         )}
+
+        {tab === 'prd' && <Prd project={project} />}
 
         {toast && (
           <motion.div
