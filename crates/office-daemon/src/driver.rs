@@ -21,11 +21,14 @@
 //! `InvokeModel` effects are handed to a worker pool in W9 (the kernel emits none in
 //! W7, so the effect arm here is a documented no-op).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
+use koma_extension::Koma;
 use office_core::digest::{context_blob, panel_snapshot};
+use office_core::office::{self, InvokePurpose};
 use office_core::{
     kernel, CommentAuthor, Effect, Project, ProjectPhase, SnapshotMode, TaskId, TaskState,
 };
@@ -51,6 +54,11 @@ const PUSH_THROTTLE_MS: u64 = 250;
 /// Serialized-envelope size beyond which the driver drops to summary mode and sets
 /// `truncated: true` (10.2). Kept under the SDK's 1MiB `panel_push` hard drop.
 const PANEL_PUSH_GUARD: usize = 900_000;
+
+/// Max concurrent off-loop `models.invoke` calls (5.1 / 6.2): each runs on its own worker
+/// thread holding a `try_clone`'d `Koma`. Bounded so a burst of PRD/breakdown/fold invokes
+/// cannot exhaust threads or starve the host; the rest queue and start as slots free.
+const INVOKE_POOL_CAP: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Inline-reply snapshot cache (panel sync reads, 10.2 section 1.1)
@@ -134,6 +142,83 @@ struct Owned {
     lease: Option<Lease>,
 }
 
+/// A single off-loop `models.invoke` job (5.1 / W9). Carried by the [`Invoker`] to a
+/// worker thread; the result returns as `handlers::Command::InvokeDone`.
+#[derive(Clone, Debug)]
+pub struct InvokeJob {
+    /// Driver-minted id, matched against the pending map on completion (and on retry).
+    pub req_id: u64,
+    /// The project slug this invoke belongs to (resolved to an index on completion, so a
+    /// reorder of the projects vec cannot misroute a late result).
+    pub proj_slug: String,
+    /// What the kernel should do with the result (echoed into `kernel::Command::InvokeResult`).
+    pub purpose: InvokePurpose,
+    pub role: String,
+    pub system: String,
+    pub prompt: String,
+    /// Whether the one timeout retry has already been spent (5.1 / 6.2).
+    pub retried: bool,
+}
+
+/// Runs an [`InvokeJob`] OFF the driver tick loop (5.1). Production spawns a worker thread
+/// on a `try_clone`'d `Koma`; tests install a recording fake so the pool's routing, retry,
+/// and cap logic can be driven deterministically without threads or a live host. The
+/// result MUST arrive back as a `handlers::Command::InvokeDone { req_id, result }` on the
+/// driver's input channel.
+pub trait Invoker: Send {
+    fn run(&mut self, job: InvokeJob);
+}
+
+/// Default no-op invoker: drops every job. Used until the real pool is installed
+/// (`set_invoker`), and by the W7 driver tests that never emit an `InvokeModel` effect.
+struct NoopInvoker;
+impl Invoker for NoopInvoker {
+    fn run(&mut self, _job: InvokeJob) {}
+}
+
+/// Production invoker: each `run` spawns a thread holding its own `try_clone`'d `Koma`,
+/// performs the 25s `models.invoke`, and posts the outcome back on `tx` as an
+/// `InvokeDone` command. The driver's `INVOKE_POOL_CAP` bounds how many run at once.
+pub struct ThreadInvoker {
+    koma: Koma,
+    tx: Sender<DInput>,
+}
+
+impl ThreadInvoker {
+    pub fn new(koma: Koma, tx: Sender<DInput>) -> Self {
+        ThreadInvoker { koma, tx }
+    }
+}
+
+impl Invoker for ThreadInvoker {
+    fn run(&mut self, job: InvokeJob) {
+        let mut koma = self.koma.try_clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut params = json!({ "prompt": job.prompt });
+            if !job.role.is_empty() {
+                params["role"] = json!(job.role);
+            }
+            if !job.system.is_empty() {
+                params["system"] = json!(job.system);
+            }
+            let reply = koma.call("models.invoke", params);
+            let result = match reply.get("output").and_then(Value::as_str) {
+                Some(o) => Ok(o.to_string()),
+                None => Err(reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("models.invoke failed")
+                    .to_string()),
+            };
+            let _ = tx.send(DInput::Command(crate::handlers::Command::InvokeDone {
+                req_id: job.req_id,
+                result,
+            }));
+        });
+    }
+}
+
 /// Outcome of executing a single `Spawn` effect against the host.
 enum SpawnOutcome {
     /// Local, tracked spawn — the real agent id was recorded onto the binding.
@@ -162,6 +247,18 @@ pub struct Driver<H: Host> {
     push_pending: bool,
     /// State changed since the last context republish.
     ctx_dirty: bool,
+    /// Off-loop invoke execution (5.1). `NoopInvoker` until `set_invoker` installs the
+    /// real thread pool (production) or a fake (tests).
+    invoker: Box<dyn Invoker>,
+    /// Invoke jobs issued but not yet terminally routed to the kernel (keyed by req_id).
+    /// Retained across a retry so the same job can be re-run without re-minting an id.
+    invoke_pending: HashMap<u64, InvokeJob>,
+    /// req_ids waiting for a free pool slot (the pool was at `INVOKE_POOL_CAP`).
+    invoke_queue: VecDeque<u64>,
+    /// How many invoke jobs are currently running on the pool.
+    invoke_in_flight: usize,
+    /// Monotonic invoke request id source.
+    next_req_id: u64,
 }
 
 impl<H: Host> Driver<H> {
@@ -191,7 +288,19 @@ impl<H: Host> Driver<H> {
             push_seq: 0,
             push_pending: false,
             ctx_dirty: false,
+            invoker: Box::new(NoopInvoker),
+            invoke_pending: HashMap::new(),
+            invoke_queue: VecDeque::new(),
+            invoke_in_flight: 0,
+            next_req_id: 0,
         })
+    }
+
+    /// Install the off-loop invoke pool (production `ThreadInvoker`, or a test fake). The
+    /// driver starts with a `NoopInvoker`, so this must be called before any persona /
+    /// PRD / breakdown flow can run.
+    pub fn set_invoker(&mut self, invoker: Box<dyn Invoker>) {
+        self.invoker = invoker;
     }
 
     // -- boot ---------------------------------------------------------------
@@ -281,14 +390,41 @@ impl<H: Host> Driver<H> {
                 }
             }
             DCmd::Comment { task, text } => self.add_comment(&TaskId(task), text, now_ms),
-            // W8/W9 surface (office persona, PRD/breakdown/authorize, project lifecycle,
-            // board edits). Recognized here so the driver never drops them silently once
-            // those waves wire them; no-ops for now.
-            DCmd::Brief { .. }
-            | DCmd::Status { .. }
-            | DCmd::Authorize { .. }
+            // ---- front office (W9, ARCHITECTURE.md 6.2 / 6.3) ----
+            DCmd::Brief { project, message } => {
+                if let Some(i) = self.resolve_office_project(project.as_deref()) {
+                    self.step(
+                        i,
+                        kernel::Input::Command(kernel::Command::OfficeMessage { text: message }),
+                        now_ms,
+                    );
+                }
+            }
+            DCmd::OfficeChat { project, message } => {
+                if let Some(i) = self.owned_project_by_id(&project) {
+                    self.step(
+                        i,
+                        kernel::Input::Command(kernel::Command::OfficeMessage { text: message }),
+                        now_ms,
+                    );
+                }
+            }
+            DCmd::Authorize {
+                project,
+                delivery_path,
+            } => self.authorize_project(&project, &delivery_path, now_ms),
+            DCmd::Breakdown { project } => {
+                if let Some(i) = self.owned_project_by_id(&project) {
+                    self.step(i, kernel::Input::Command(kernel::Command::RequestBreakdown), now_ms);
+                }
+            }
+            // An off-loop invoke completed: apply the driver's one retry, else route the
+            // outcome into the kernel (5.1 / 6.2).
+            DCmd::InvokeDone { req_id, result } => self.on_invoke_done(req_id, result, now_ms),
+            // Remaining panel/tool surface not owned by W9; no-ops until their waves wire
+            // them (status digests, board edits, project lifecycle).
+            DCmd::Status { .. }
             | DCmd::Projects
-            | DCmd::OfficeChat { .. }
             | DCmd::CardMove { .. }
             | DCmd::EditTask { .. }
             | DCmd::EditDeps { .. }
@@ -451,8 +587,16 @@ impl<H: Host> Driver<H> {
                 Effect::PublishContext { text } => {
                     self.host.call("context.set", json!({ "text": text }));
                 }
-                // Wired in W9 onto the off-loop invoke pool; the W7 kernel emits none.
-                Effect::InvokeModel { .. } => {}
+                // Hand the invoke to the off-loop pool (5.1): NEVER run inline on the tick
+                // loop. `req_id` on the effect is a kernel placeholder; the driver mints
+                // the real id here.
+                Effect::InvokeModel {
+                    purpose,
+                    role,
+                    system,
+                    prompt,
+                    ..
+                } => self.submit_invoke(idx, purpose, role, system, prompt),
             }
         }
     }
@@ -537,6 +681,126 @@ impl<H: Host> Driver<H> {
             kernel::Input::Host(kernel::HostEvent::Result { agent_id, text }),
             now_ms,
         );
+    }
+
+    // -- front office (6.2 / 6.3) ------------------------------------------
+
+    /// Resolve the project a `workflow_brief` targets: an explicit id, or (when absent)
+    /// the single owned project still in `Drafting` (6.4 default).
+    fn resolve_office_project(&self, project: Option<&str>) -> Option<usize> {
+        if let Some(id) = project {
+            return self.owned_project_by_id(id);
+        }
+        self.projects
+            .iter()
+            .position(|o| o.lease.is_some() && matches!(o.project.phase, ProjectPhase::Drafting))
+    }
+
+    /// The authorization gate (6.3.3): validate the delivery path, `mkdir -p` it when
+    /// valid, then hand the gate to the kernel (which re-checks and transitions, or queues
+    /// a refusal notice). The escape hatch defaults off at the wire in v1.
+    fn authorize_project(&mut self, project: &str, delivery_path: &str, now_ms: u64) {
+        let idx = match self.owned_project_by_id(project) {
+            Some(i) => i,
+            None => return,
+        };
+        let path = PathBuf::from(delivery_path);
+        let allow_outside = false;
+        let workspace = self.projects[idx].project.workspace.clone();
+        if office::validate_delivery_path(&path, workspace.as_deref(), allow_outside).is_ok() {
+            let _ = std::fs::create_dir_all(&path);
+        }
+        self.step(
+            idx,
+            kernel::Input::Command(kernel::Command::Authorize {
+                delivery_path: path,
+                allow_outside_workspace: allow_outside,
+            }),
+            now_ms,
+        );
+    }
+
+    // -- off-loop invoke pool (5.1) ----------------------------------------
+
+    /// Register a new invoke job and start it if a pool slot is free (else queue it). The
+    /// job runs OFF the tick loop, so dispatch/reconcile/heartbeat/panel-reads stay
+    /// responsive through the 25-125s of a PRD/breakdown flow.
+    fn submit_invoke(&mut self, idx: usize, purpose: InvokePurpose, role: String, system: String, prompt: String) {
+        self.next_req_id += 1;
+        let req_id = self.next_req_id;
+        let job = InvokeJob {
+            req_id,
+            proj_slug: self.projects[idx].project.id.0.clone(),
+            purpose,
+            role,
+            system,
+            prompt,
+            retried: false,
+        };
+        self.invoke_pending.insert(req_id, job);
+        self.start_or_queue_invoke(req_id);
+    }
+
+    fn start_or_queue_invoke(&mut self, req_id: u64) {
+        if self.invoke_in_flight < INVOKE_POOL_CAP {
+            if let Some(job) = self.invoke_pending.get(&req_id).cloned() {
+                self.invoke_in_flight += 1;
+                self.invoker.run(job);
+            }
+        } else {
+            self.invoke_queue.push_back(req_id);
+        }
+    }
+
+    /// An off-loop invoke returned. Timeout + not-yet-retried -> re-run the SAME job once
+    /// (same slot, no new id). Otherwise free the slot, route the outcome into the kernel
+    /// as `Command::InvokeResult`, and start the next queued job.
+    fn on_invoke_done(&mut self, req_id: u64, result: Result<String, String>, now_ms: u64) {
+        let job = match self.invoke_pending.get(&req_id).cloned() {
+            Some(j) => j,
+            None => return, // stale or duplicate completion; ignore
+        };
+
+        if !job.retried {
+            if let Err(e) = &result {
+                if is_invoke_timeout(e) {
+                    if let Some(j) = self.invoke_pending.get_mut(&req_id) {
+                        j.retried = true;
+                    }
+                    if let Some(retry) = self.invoke_pending.get(&req_id).cloned() {
+                        self.invoker.run(retry); // reuses the in-flight slot
+                    }
+                    return;
+                }
+            }
+        }
+
+        self.invoke_pending.remove(&req_id);
+        self.invoke_in_flight = self.invoke_in_flight.saturating_sub(1);
+        if let Some(idx) = self.projects.iter().position(|o| o.project.id.0 == job.proj_slug) {
+            self.step(
+                idx,
+                kernel::Input::Command(kernel::Command::InvokeResult {
+                    purpose: job.purpose,
+                    outcome: result,
+                }),
+                now_ms,
+            );
+        }
+        self.pump_invoke_queue();
+    }
+
+    fn pump_invoke_queue(&mut self) {
+        while self.invoke_in_flight < INVOKE_POOL_CAP {
+            let req_id = match self.invoke_queue.pop_front() {
+                Some(r) => r,
+                None => break,
+            };
+            if let Some(job) = self.invoke_pending.get(&req_id).cloned() {
+                self.invoke_in_flight += 1;
+                self.invoker.run(job);
+            }
+        }
     }
 
     // -- reconciliation (9.1.3 / 9.1.4 / 5.2.4) ----------------------------
@@ -936,6 +1200,12 @@ fn is_agent_gone(reply: &Value) -> bool {
 
 fn is_terminal(status: &str) -> bool {
     matches!(status, "done" | "error" | "killed")
+}
+
+/// Whether an invoke error string is the host's 25s-budget timeout (`model call timed
+/// out`, EXTENSIONS.md:444) — the one class the driver retries exactly once (5.1 / 6.2).
+fn is_invoke_timeout(err: &str) -> bool {
+    err.contains("timed out") || err.contains("timeout")
 }
 
 fn error_str(v: &Value) -> Option<&str> {

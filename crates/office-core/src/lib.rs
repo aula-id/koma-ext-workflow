@@ -15,6 +15,9 @@ pub use report::{ReportStatus, ReportTrailer, ReviewTrailer, Verdict};
 pub mod digest;
 pub use digest::SnapshotMode;
 
+pub mod office;
+pub use office::{AuthError, BreakdownError, InvokePurpose};
+
 pub mod kernel;
 pub use kernel::{step, Command, Effect, HostEvent, Input};
 
@@ -38,3 +41,6 @@ mod digest_test;
 
 #[cfg(test)]
 mod kernel_test;
+
+#[cfg(test)]
+mod office_test;

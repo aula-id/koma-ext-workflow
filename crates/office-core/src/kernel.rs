@@ -30,11 +30,12 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    AgentBinding, AgentKind, Comment, CommentAuthor, CommentId, ParkReason, Project, ProjectPhase,
-    Receipt, Task, TaskEvent, TaskId, TaskState,
+    AgentBinding, AgentKind, ChatAuthor, ChatMsg, Comment, CommentAuthor, CommentId, ParkReason,
+    Project, ProjectPhase, Receipt, Task, TaskEvent, TaskId, TaskState,
 };
 use crate::graph::{self, ready_set};
 use crate::machine::{step_project, ProjectTransition};
+use crate::office::{self, InvokePurpose};
 use crate::prompts;
 use crate::report::{self, ReportStatus, Verdict};
 
@@ -80,6 +81,29 @@ pub enum Command {
         author: CommentAuthor,
         text: String,
     },
+    /// A user message to the front office (panel chat / `workflow_brief` / inbox brief).
+    /// Appends the turn to the transcript and issues a persona invoke (folding first if
+    /// the assembled prompt would cross the threshold, 6.2). Off-loop: the kernel only
+    /// emits the `InvokeModel` effect; the driver runs it.
+    OfficeMessage { text: String },
+    /// Ask the office to author the epic/story/task breakdown for the current PRD
+    /// (6.3.2). Emits a breakdown invoke; the result is validated on arrival.
+    RequestBreakdown,
+    /// Authorize `Ready -> Running` with a delivery path the driver has already
+    /// validated + `mkdir -p`'d (6.3.3). `delivery_valid` is the driver's containment
+    /// verdict; a false verdict never transitions (the hard gate).
+    Authorize {
+        delivery_path: PathBuf,
+        allow_outside_workspace: bool,
+    },
+    /// An off-loop `models.invoke` returned (5.1). `purpose` says which flow it belongs
+    /// to; `outcome` is the model text or the error string after the driver's one retry.
+    /// This is the concrete "consume invoke results as ordinary commands": the kernel
+    /// applies each result deterministically and never blocks on the model.
+    InvokeResult {
+        purpose: InvokePurpose,
+        outcome: Result<String, String>,
+    },
 }
 
 /// Facts fed back by the driver. `Tick`/`Reconcile` carry no clock — the authoritative
@@ -123,6 +147,7 @@ pub enum Effect {
     },
     InvokeModel {
         req_id: u64,
+        purpose: InvokePurpose,
         role: String,
         system: String,
         prompt: String,
@@ -241,7 +266,135 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 ctx.dirty = true;
             }
         }
+        Command::OfficeMessage { text } => office_message(p, text, ctx),
+        Command::RequestBreakdown => request_breakdown(p, ctx),
+        Command::Authorize {
+            delivery_path,
+            allow_outside_workspace,
+        } => authorize(p, delivery_path, allow_outside_workspace, now_ms, ctx),
+        Command::InvokeResult { purpose, outcome } => {
+            invoke_result(p, purpose, outcome, now_ms, ctx)
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Front office (6.2 / 6.3) — off-loop invoke choreography
+// ---------------------------------------------------------------------------
+
+/// Append the user turn and issue a persona invoke. If the assembled prompt would cross
+/// the fold threshold, a summarize invoke is issued FIRST (6.2); the persona invoke is
+/// re-issued from `invoke_result` once the fold lands.
+fn office_message(p: &mut Project, text: String, ctx: &mut Ctx) {
+    p.office_transcript.push(ChatMsg {
+        who: ChatAuthor::User,
+        text,
+    });
+    ctx.dirty = true;
+
+    if office::should_fold(p, "") {
+        let (system, prompt) = office::build_fold(p);
+        emit_invoke(ctx, InvokePurpose::Fold, &p.config.office_role, system, prompt);
+    } else {
+        let (system, prompt) = office::build_invoke(p, "");
+        emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
+    }
+}
+
+/// Issue the breakdown invoke for the current PRD (6.3.2).
+fn request_breakdown(p: &mut Project, ctx: &mut Ctx) {
+    let (system, prompt) = office::build_breakdown_prompt(p, None);
+    emit_invoke(ctx, InvokePurpose::Breakdown, &p.config.office_role, system, prompt);
+}
+
+/// The hard authorization gate (6.3.3). The driver has already validated + created the
+/// path; `delivery_valid` is its verdict, and `office::authorize` re-checks the shape
+/// before transitioning `Ready -> Running`.
+fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_ms: u64, ctx: &mut Ctx) {
+    match office::authorize(p, delivery_path, allow_outside) {
+        Ok(()) => ctx.dirty = true,
+        Err(e) => {
+            let notice = format!("authorization refused: {:?}; project stays in Ready", e);
+            queue_notice(p, now_ms, notice, ctx);
+            ctx.dirty = true;
+        }
+    }
+}
+
+/// Apply an off-loop invoke result (5.1). Purpose-tagged so no persistent per-request
+/// bookkeeping is needed — the kernel reacts to the result as an ordinary command.
+fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    match purpose {
+        InvokePurpose::Persona => {
+            let reply = match outcome {
+                Ok(t) => t,
+                Err(_) => "The office did not answer in time; please try again.".to_string(),
+            };
+            p.office_transcript.push(ChatMsg {
+                who: ChatAuthor::Office,
+                text: reply,
+            });
+            ctx.dirty = true;
+        }
+        InvokePurpose::Fold => {
+            if let Ok(summary) = outcome {
+                office::apply_fold(p, summary);
+                ctx.dirty = true;
+            }
+            // Fold done (or failed): re-issue the persona invoke. build_invoke hard-caps
+            // the prompt, so proceeding un-folded on a fold failure is still safe.
+            let (system, prompt) = office::build_invoke(p, "");
+            emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
+        }
+        InvokePurpose::Breakdown => handle_breakdown_result(p, outcome, false, now_ms, ctx),
+        InvokePurpose::BreakdownReask => handle_breakdown_result(p, outcome, true, now_ms, ctx),
+    }
+}
+
+/// Validate a breakdown result and land it, or (first failure) re-ask once, or (second
+/// failure) surface to the user (6.3.2).
+fn handle_breakdown_result(p: &mut Project, outcome: Result<String, String>, is_reask: bool, now_ms: u64, ctx: &mut Ctx) {
+    let text = match outcome {
+        Ok(t) => t,
+        Err(e) => {
+            queue_notice(p, now_ms, format!("office breakdown call failed: {e}"), ctx);
+            ctx.dirty = true;
+            return;
+        }
+    };
+    match office::parse_breakdown(&text) {
+        Ok(breakdown) => {
+            office::apply_breakdown(p, breakdown);
+            ctx.dirty = true;
+        }
+        Err(e) => {
+            if is_reask {
+                queue_notice(
+                    p,
+                    now_ms,
+                    format!("office breakdown rejected twice ({e:?}); edit the board manually"),
+                    ctx,
+                );
+                ctx.dirty = true;
+            } else {
+                let (system, prompt) = office::build_breakdown_prompt(p, Some(&format!("{e:?}")));
+                emit_invoke(ctx, InvokePurpose::BreakdownReask, &p.config.office_role, system, prompt);
+            }
+        }
+    }
+}
+
+/// Emit an `InvokeModel` effect. `req_id` is a placeholder (0) — the driver mints the
+/// real id when it hands the job to the off-loop invoke pool (5.1); the kernel matches
+/// results by `purpose`, not id.
+fn emit_invoke(ctx: &mut Ctx, purpose: InvokePurpose, role: &str, system: String, prompt: String) {
+    ctx.fx.push(Effect::InvokeModel {
+        req_id: 0,
+        purpose,
+        role: role.to_string(),
+        system,
+        prompt,
+    });
 }
 
 /// Hard interrupt (default): stop dispatch, kill every tracked binding, normalize

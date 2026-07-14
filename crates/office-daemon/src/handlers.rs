@@ -41,6 +41,17 @@ pub enum Command {
     Comment { task: String, text: String },
     /// `workflow_projects`.
     Projects,
+    /// `{ op: "breakdown", project }` — ask the office to author + land the epic/story/
+    /// task breakdown for the project's PRD (6.3.2). No contributed tool; panel-only.
+    Breakdown { project: String },
+    /// An off-loop `models.invoke` completed (W9): posted by the invoke worker pool onto
+    /// the driver channel, NOT parsed from the wire. `req_id` matches the driver's pending
+    /// job; `result` is the model output or the error string. The driver applies its one
+    /// retry, then routes the outcome into the kernel as `kernel::Command::InvokeResult`.
+    InvokeDone {
+        req_id: u64,
+        result: Result<String, String>,
+    },
 
     // ---- panel ops (ARCHITECTURE.md 10.2) not already covered above ----
     /// `{ op: "hello", uiVersion }` — rehydrate.
@@ -404,6 +415,13 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
                 _ => return error("op 'task_detail' requires a non-empty 'task'"),
             };
             Command::TaskDetail { task }
+        }
+        "breakdown" => {
+            let project = match str_field(&payload, "project") {
+                Some(p) if !p.is_empty() => p,
+                _ => return error("op 'breakdown' requires a non-empty 'project'"),
+            };
+            Command::Breakdown { project }
         }
         other => return error(&format!("unknown panel op: {other}")),
     };

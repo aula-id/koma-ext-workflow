@@ -133,6 +133,14 @@ fn run_host_driver(koma: &mut Koma) {
             return;
         }
     };
+
+    // Install the off-loop invoke pool (5.1): worker threads own `try_clone`'d handles and
+    // post results back onto CMD_TX as `InvokeDone`, so a 25-125s PRD flow never freezes the
+    // tick loop, reconcile, the heartbeat, or the 100ms panel-read oneshots.
+    if let Some(tx) = CMD_TX.get() {
+        d.set_invoker(Box::new(driver::ThreadInvoker::new(koma.try_clone(), tx.clone())));
+    }
+
     d.bootstrap(driver::now_ms());
 
     let rx = CMD_RX

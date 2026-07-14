@@ -9,10 +9,11 @@ use super::*;
 use crate::handlers;
 use crate::host::FakeHost;
 use office_core::{
-    AgentBinding, AgentKind, OutboundNotice, Project, ProjectConfig, ProjectPhase, Task, TaskId,
-    TaskState,
+    AgentBinding, AgentKind, ChatAuthor, InvokePurpose, OutboundNotice, Project, ProjectConfig,
+    ProjectPhase, Task, TaskId, TaskState,
 };
 use office_store::Store;
+use std::sync::{Arc, Mutex as StdMutex};
 
 const WORKER_REPORT: &str = "did the work\n\nOFFICE-REPORT\nstatus: complete\nsummary: built the login form\ndelivered: /ws/deliver/login.rs\n";
 
@@ -363,4 +364,147 @@ fn normal_snapshot_is_full_mode_not_truncated() {
     let (_p, envelope) = d.host.panel_pushes.last().expect("a board push");
     assert_eq!(envelope.get("truncated").and_then(Value::as_bool), Some(false));
     assert!(envelope["projects"][0]["tasks"][0].get("description").is_some(), "full mode carries bodies");
+}
+
+// ---------------------------------------------------------------------------
+// 8. off-loop invoke pool (W9, ARCHITECTURE.md 5.1 / 6.2)
+// ---------------------------------------------------------------------------
+
+/// Recording fake for the invoke pool: `run` just captures the job (no thread, no host)
+/// so a test can inspect what was submitted and hand results back deterministically via
+/// `d.handle(InvokeDone)`.
+#[derive(Clone, Default)]
+struct FakeInvoker {
+    jobs: Arc<StdMutex<Vec<InvokeJob>>>,
+}
+impl Invoker for FakeInvoker {
+    fn run(&mut self, job: InvokeJob) {
+        self.jobs.lock().unwrap().push(job);
+    }
+}
+
+fn drafting(slug: &str) -> Project {
+    project(slug, ProjectPhase::Drafting, vec![])
+}
+
+fn invoke_done(req_id: u64, result: Result<String, String>) -> handlers::Input {
+    handlers::Input::Command(handlers::Command::InvokeDone { req_id, result })
+}
+
+#[test]
+fn brief_runs_invoke_off_loop_and_result_lands_in_transcript_without_starving_dispatch() {
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    // The only host calls in this flow are B's dispatch — never `models.invoke`.
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" }));
+    let mut d = driver(store, host);
+
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    // A: the Drafting project we brief. B: a Running project with a ready task.
+    d.insert_for_test(drafting("a"), 1_000);
+    d.insert_for_test(project("b", ProjectPhase::Running, vec![task("b/t1", TaskState::Todo)]), 1_000);
+
+    // Brief the office: the kernel emits an InvokeModel the driver hands OFF-loop.
+    d.handle(
+        handlers::Input::Command(handlers::Command::Brief {
+            project: Some("a".to_string()),
+            message: "build a crawler".to_string(),
+        }),
+        1_000,
+    );
+
+    // Off-loop: exactly one job queued, and NO inline models.invoke host call.
+    {
+        let jobs = fake.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1, "one persona invoke submitted to the pool");
+        assert_eq!(jobs[0].purpose, InvokePurpose::Persona);
+        assert_eq!(jobs[0].proj_slug, "a");
+    }
+    assert_eq!(call_count(&d.host, "models.invoke"), 0, "the invoke never runs inline on the tick loop");
+
+    // The tick loop is NOT starved by the in-flight invoke: B still dispatches.
+    d.on_tick(1_000);
+    assert!(
+        d.host.calls.iter().any(|(m, _)| m == "sessions.spawn_into"),
+        "dispatch keeps running while an invoke is in flight"
+    );
+    // And a panel read (hello) is answerable without blocking.
+    let _ = super::cache_snapshot();
+
+    // The invoke returns: the office reply lands in A's transcript.
+    let req_id = fake.jobs.lock().unwrap()[0].req_id;
+    d.handle(invoke_done(req_id, Ok("Sure, here is my plan.".to_string())), 2_000);
+    let a = d.project("a").unwrap();
+    assert_eq!(a.office_transcript.len(), 2, "user turn + office reply");
+    assert_eq!(a.office_transcript[1].who, ChatAuthor::Office);
+    assert_eq!(a.office_transcript[1].text, "Sure, here is my plan.");
+}
+
+#[test]
+fn invoke_timeout_retries_exactly_once_then_surfaces() {
+    let (store, _dir) = temp_store();
+    let mut d = driver(store, FakeHost::new());
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+    d.insert_for_test(drafting("a"), 1_000);
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::Brief {
+            project: Some("a".to_string()),
+            message: "hi".to_string(),
+        }),
+        1_000,
+    );
+    let req_id = fake.jobs.lock().unwrap()[0].req_id;
+
+    // First timeout -> exactly one re-run of the SAME job (same slot), no kernel routing.
+    d.handle(invoke_done(req_id, Err("model call timed out".to_string())), 1_100);
+    {
+        let jobs = fake.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 2, "the timeout is retried exactly once");
+        assert!(jobs[1].retried, "the retry is marked");
+        assert_eq!(jobs[0].req_id, jobs[1].req_id, "the retry reuses the same request id");
+    }
+    assert_eq!(
+        d.project("a").unwrap().office_transcript.len(),
+        1,
+        "no office reply yet — still just the user turn"
+    );
+
+    // Second timeout on the retried job -> no third submit; the outcome surfaces to the user.
+    d.handle(invoke_done(req_id, Err("model call timed out".to_string())), 1_200);
+    assert_eq!(fake.jobs.lock().unwrap().len(), 2, "no further retries after the first");
+    let a = d.project("a").unwrap();
+    assert_eq!(a.office_transcript.len(), 2, "the failure is surfaced as an office message");
+    assert_eq!(a.office_transcript[1].who, ChatAuthor::Office);
+}
+
+#[test]
+fn invoke_pool_cap_is_honored_and_queue_drains_on_completion() {
+    let (store, _dir) = temp_store();
+    let mut d = driver(store, FakeHost::new());
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    // Three Drafting projects, each briefed -> three invokes; pool cap is 2.
+    for slug in ["a", "b", "c"] {
+        d.insert_for_test(drafting(slug), 1_000);
+    }
+    for slug in ["a", "b", "c"] {
+        d.handle(
+            handlers::Input::Command(handlers::Command::Brief {
+                project: Some(slug.to_string()),
+                message: "go".to_string(),
+            }),
+            1_000,
+        );
+    }
+
+    assert_eq!(fake.jobs.lock().unwrap().len(), 2, "only INVOKE_POOL_CAP (2) run at once; the third queues");
+
+    // Complete the first (req_id 1) -> a slot frees -> the queued third starts.
+    d.handle(invoke_done(1, Ok("done".to_string())), 1_100);
+    assert_eq!(fake.jobs.lock().unwrap().len(), 3, "the queued invoke starts when a slot frees");
 }
