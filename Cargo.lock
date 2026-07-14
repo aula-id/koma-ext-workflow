@@ -50,6 +50,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "koma-extension"
 version = "0.0.0"
+source = "git+ssh://git@github.com/aula-id/koma.git?branch=main#be5ee881c71ab2df32e268e031e6a254c053a11c"
 dependencies = [
  "serde",
  "serde_json",

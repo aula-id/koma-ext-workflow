@@ -1,0 +1,5 @@
+# The koma-extension dependency is fetched over SSH (git@github.com:aula-id/koma).
+# Cargo's built-in libgit2 transport cannot use the system SSH agent/keys, so
+# shell out to the real git CLI for all git fetches.
+[net]
+git-fetch-with-cli = true
