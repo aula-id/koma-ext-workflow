@@ -1,6 +1,6 @@
-//! The `workflow` MCP server: a hand-rolled [`ServerHandler`] exposing seven tools.
+//! The `workflow` MCP server: a hand-rolled [`ServerHandler`] exposing eight tools.
 //!
-//! Six are COMMAND tools (brief/authorize/comment/interrupt/resume/breakdown): each builds
+//! Seven are COMMAND tools (brief/authorize/comment/interrupt/resume/breakdown/delete_project): each builds
 //! the exact inbox JSON via `office_core::inboxmsg` and drops it into the resolved inbox
 //! directory — the office picks it up and answers as a CHAT NOTICE, so the tool result only
 //! confirms the drop. One is a READ tool (status): it reads the store directly and returns
@@ -23,9 +23,11 @@ use crate::write::{inbox_dir_for, write_inbox_file};
 /// Server-level instructions surfaced to the MCP client at initialize.
 const INSTRUCTIONS: &str = "Workflow office control tools. The command tools \
 (workflow_brief / workflow_authorize / workflow_comment / workflow_interrupt / \
-workflow_resume / workflow_breakdown) drop a request into the office inbox and return \
-immediately; the office's acknowledgement and any reply arrive as CHAT NOTICES, not in the \
-tool result. workflow_status is read-only and returns the board digest inline.";
+workflow_resume / workflow_breakdown / workflow_delete_project) drop a request into the office \
+inbox and return immediately; the office's acknowledgement and any reply arrive as CHAT \
+NOTICES, not in the tool result. workflow_delete_project is an IRREVERSIBLE two-step confirm: \
+pass confirm equal to the exact project slug, or it deletes nothing and tells you the value to \
+send. workflow_status is read-only and returns the board digest inline.";
 
 /// The `workflow` MCP server. Stateless: every call resolves its inbox dir / reads the store
 /// fresh, so a single instance is trivially `Send + Sync`.
@@ -114,6 +116,23 @@ impl ServerHandler for WorkflowServer {
                     return Ok(error_result("workflow_breakdown requires a non-empty 'project'"));
                 };
                 write_command(inboxmsg::breakdown(&project), workspace)
+            }
+            "workflow_delete_project" => {
+                let Some(project) = nonempty(&args, "project") else {
+                    return Ok(error_result(
+                        "workflow_delete_project requires a non-empty 'project'",
+                    ));
+                };
+                // Arm/fire two-step: an MCP call bypasses the panel's ConfirmButton, so require
+                // the caller to ECHO the exact slug in `confirm` before dropping the irreversible
+                // delete. Absent or mismatched `confirm` is a NORMAL reply (not a tool error) that
+                // tells the model precisely what to send next to fire.
+                if nonempty(&args, "confirm").as_deref() != Some(project.as_str()) {
+                    return Ok(text_result(format!(
+                        "confirmation required: call again with confirm=\"{project}\" to permanently delete project '{project}'"
+                    )));
+                }
+                write_command(inboxmsg::archive_project(&project), workspace)
             }
             other => {
                 // An unknown tool name is unroutable -> a JSON-RPC protocol error.
@@ -247,6 +266,24 @@ fn tool_defs() -> Vec<Tool> {
                     "workspace": { "type": "string", "description": "Optional workspace dir override for where the request file is written." }
                 }),
                 &["project"],
+            ),
+        ),
+        Tool::new(
+            "workflow_delete_project",
+            "Permanently delete (archive) a Workflow project and stop all of its running \
+             agents. IRREVERSIBLE. Two-step confirm: you MUST pass `confirm` set to the EXACT \
+             `project` slug. If `confirm` is missing or does not match, the tool deletes \
+             nothing and replies with the exact value to send — call again with that `confirm` \
+             to fire. Delivered code under the project's delivery path is left untouched. \
+             Dropped into the office inbox; the office acknowledges in chat, not in this tool \
+             result.",
+            object_schema(
+                json!({
+                    "project": { "type": "string", "description": "The project id/slug to permanently delete." },
+                    "confirm": { "type": "string", "description": "Must equal the project slug EXACTLY to confirm this irreversible delete. If absent or mismatched, nothing is deleted and the tool replies with the required value." },
+                    "workspace": { "type": "string", "description": "Optional workspace dir override for where the request file is written." }
+                }),
+                &["project", "confirm"],
             ),
         ),
     ]

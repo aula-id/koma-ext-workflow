@@ -682,11 +682,11 @@ impl<H: Host> Driver<H> {
         match e {
             // The private notify from `agents.spawn { notify: true }` — the ONLY event
             // carrying our ext-facing agent id (2.2). Correlate to the owning project.
-            DEvt::AgentsDone { agent_id, status } => {
+            DEvt::AgentsDone { agent_id, status, error } => {
                 if let Some(i) = self.owned_project_by_agent(agent_id) {
                     self.step(
                         i,
-                        kernel::Input::Host(kernel::HostEvent::AgentsDone { agent_id, status }),
+                        kernel::Input::Host(kernel::HostEvent::AgentsDone { agent_id, status, error }),
                         now_ms,
                     );
                 }
@@ -1106,29 +1106,56 @@ impl<H: Host> Driver<H> {
     }
 
     /// Manually delete a project (Settings panel "danger zone", 10.2 `project_archive`):
-    /// lease-holder only, silently dropped for a non-holder exactly like
-    /// `Interrupt`/`Resume`/`Unpark`/`ConfigSet` above. Best-effort kills every in-flight
-    /// worker/reviewer binding, deletes the project's desks working directory, releases the
-    /// lease, then removes the on-disk state (state.json + registry row, `Store::
-    /// archive_project`'s registry-row-before-dir-delete ordering) and the in-memory
-    /// project. NEVER touches `delivery_path` — delivered code stays exactly where it was
-    /// placed.
+    /// lease-holder only. A non-holder can't perform the delete, so instead of silently
+    /// dropping it (which would leave the panel's optimistic card-removal unexplained) it
+    /// posts an honest refusal chat notice and re-pushes the true board. For the holder:
+    /// best-effort kills every in-flight binding — the per-task worker/reviewer bindings AND
+    /// the project-level research (6.2b) / audit (6.2c) analyst bindings — deletes the
+    /// project's desks working directory, releases the lease, then removes the on-disk state
+    /// (state.json + registry row, `Store::archive_project`'s registry-row-before-dir-delete
+    /// ordering) and the in-memory project. NEVER touches `delivery_path` — delivered code
+    /// stays exactly where it was placed.
     fn archive_project(&mut self, project: &str, now_ms: u64) {
         let idx = match self.owned_project_by_id(project) {
             Some(i) => i,
-            None => return,
+            None => {
+                // Not the lease holder: only the leasing session can delete this project, so
+                // the delete cannot happen here. The panel already optimistically dropped the
+                // card on its `{ok:true}` ack (fire-and-forget mpsc, PANEL_PROTOCOL 1.2), so
+                // don't no-op silently — tell the user WHY and re-push the true board so the
+                // card comes back instead of vanishing unexplained. Distinguish a project owned
+                // by ANOTHER koma session from one this daemon has never loaded.
+                let known = self.projects.iter().any(|o| o.project.id.0 == project);
+                let text = if known {
+                    format!("workflow: delete refused — project '{project}' is owned by another koma session.")
+                } else {
+                    format!("workflow: delete refused — no project '{project}' is loaded here.")
+                };
+                self.host.call("chat.prompt", json!({ "text": text }));
+                self.push_board(now_ms, true);
+                return;
+            }
         };
         let slug = self.projects[idx].project.id.0.clone();
 
-        // Best-effort: kill every in-flight worker/reviewer binding so nothing keeps
-        // running against a project that is about to stop existing.
-        let agent_ids: Vec<u64> = self.projects[idx]
+        // Best-effort: kill every in-flight binding so nothing keeps running against a project
+        // that is about to stop existing — the per-task worker/reviewer bindings AND the
+        // project-level research (6.2b) / audit (6.2c) analyst bindings, which are NOT task
+        // bindings and so are missed by the task loop above.
+        let mut agent_ids: Vec<u64> = self.projects[idx]
             .project
             .tasks
             .iter()
             .filter_map(|t| binding_agent_id(&t.state))
             .filter(|id| *id != 0)
             .collect();
+        // `research_agent_id`/`audit_agent_id` already skip the provisional id 0.
+        if let Some(id) = research_agent_id(&self.projects[idx].project) {
+            agent_ids.push(id);
+        }
+        if let Some(id) = audit_agent_id(&self.projects[idx].project) {
+            agent_ids.push(id);
+        }
         for agent_id in agent_ids {
             self.host.call("agents.kill", json!({ "agentId": agent_id }));
         }
@@ -1276,6 +1303,8 @@ impl<H: Host> Driver<H> {
                     kernel::Input::Host(kernel::HostEvent::AgentsDone {
                         agent_id,
                         status: "killed".to_string(),
+                        // The status-poll liveness path carries no koma error text.
+                        error: None,
                     }),
                     now_ms,
                 );
@@ -1288,6 +1317,8 @@ impl<H: Host> Driver<H> {
                         kernel::Input::Host(kernel::HostEvent::AgentsDone {
                             agent_id,
                             status: s.to_string(),
+                            // The status-poll liveness path carries no koma error text.
+                            error: None,
                         }),
                         now_ms,
                     );

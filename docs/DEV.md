@@ -112,7 +112,7 @@ server that is a TYPED FRONT DOOR to the office. Because `dev-install.sh` regist
 `mcp__workflow__workflow_*` — usable even in `--daemon` sessions where contributed tools are
 invisible.
 
-Six tools:
+Seven tools:
 
 - `workflow_brief { message, project?, workspace? }` — start/continue the PRD conversation; a new/unknown project id mints a project.
 - `workflow_status { project? }` — READ-ONLY board digest, returned inline (never writes).
@@ -120,8 +120,9 @@ Six tools:
 - `workflow_comment { task, text, workspace? }` — comment on a task.
 - `workflow_interrupt { project, hard?, workspace? }` — interrupt (`hard` default true).
 - `workflow_resume { project, workspace? }` — resume an interrupted project.
+- `workflow_delete_project { project, confirm, workspace? }` — permanently delete a project (IRREVERSIBLE); `confirm` must equal the project slug or nothing is deleted and the tool replies with the value to send.
 
-The five COMMAND tools don't talk to the daemon directly: they write a JSON file into the
+The six COMMAND tools don't talk to the daemon directly: they write a JSON file into the
 SAME file inbox the daemon already consumes (ARCHITECTURE.md 6.4) using the shared
 `office_core::inboxmsg` builders, so acks and replies come back as CHAT NOTICES, not in the
 tool result. `workflow_status` reads the store directly and returns the digest inline.

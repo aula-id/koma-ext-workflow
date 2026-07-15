@@ -444,6 +444,13 @@ fn every_inboxmsg_builder_roundtrips_through_parse() {
                 project: "shop".to_string(),
             },
         ),
+        (
+            "10-archive.json",
+            inboxmsg::archive_project("shop"),
+            Command::ProjectArchive {
+                project: "shop".to_string(),
+            },
+        ),
     ];
 
     for (name, value, _expected) in &cases {
@@ -500,6 +507,10 @@ fn peek_target_classifies_every_op() {
     );
     assert_eq!(
         peek_target(r#"{"op":"breakdown","project":"shop"}"#),
+        Target::Project { project: Some("shop".to_string()) }
+    );
+    assert_eq!(
+        peek_target(r#"{"op":"archive_project","project":"shop"}"#),
         Target::Project { project: Some("shop".to_string()) }
     );
     // Undeterminable: bad JSON, unknown op, non-object, comment with no task.

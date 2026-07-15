@@ -118,6 +118,9 @@ pub enum HostEvent {
     AgentsDone {
         agent_id: u64,
         status: String,
+        /// koma's optional additive failure text, sent alongside a non-`done` status; `None`
+        /// when absent (old komas), so the wire shape parses unchanged either way.
+        error: Option<String>,
     },
 }
 
@@ -174,7 +177,10 @@ pub fn on_event(name: &str, params: Value, tx: &Sender<Input>) {
         "agents.done" => {
             let agent_id = params.get("agentId").and_then(Value::as_u64).unwrap_or_default();
             let status = str_field(&params, "status").unwrap_or_default();
-            HostEvent::AgentsDone { agent_id, status }
+            // Additive `error` text koma now sends on a failing agent; absent on old komas
+            // (and on a clean `done`), so this stays `None` and the event parses unchanged.
+            let error = opt_str_field(&params, "error");
+            HostEvent::AgentsDone { agent_id, status, error }
         }
         _ => return,
     };
@@ -253,6 +259,24 @@ fn handle_tool_call(params: Value, tx: &Sender<Input>) -> Value {
         }
         "workflow_projects" => {
             send(tx, Command::Projects);
+            output("queued")
+        }
+        "workflow_delete_project" => {
+            let project = match str_field(&args, "project") {
+                Some(p) if !p.is_empty() => p,
+                _ => return error("workflow_delete_project requires a non-empty 'project'"),
+            };
+            // Arm/fire: a direct tool.call bypasses the panel's ConfirmButton, so require the
+            // caller to ECHO the exact slug in `confirm` before the irreversible delete is
+            // enqueued. A missing/mismatched confirm is a NORMAL `output` reply (not an error)
+            // telling the model exactly what to send next — the same two-step the workflow-mcp
+            // server runs for the inbox door.
+            if str_field(&args, "confirm").as_deref() != Some(project.as_str()) {
+                return output(&format!(
+                    "confirmation required: call again with confirm=\"{project}\" to permanently delete project '{project}'"
+                ));
+            }
+            send(tx, Command::ProjectArchive { project });
             output("queued")
         }
         other => error(&format!("unknown tool: {other}")),

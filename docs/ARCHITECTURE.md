@@ -124,7 +124,8 @@ schema drift fails loudly (same pattern as the host samples).
       { "name": "workflow_interrupt", "description": "Interrupt a running project (mode: soft|hard, default hard).", "input_schema": { "type": "object", "properties": { "project": { "type": "string" }, "mode": { "type": "string" } }, "required": ["project"] } },
       { "name": "workflow_resume",    "description": "Resume an interrupted or halted project.", "input_schema": { "type": "object", "properties": { "project": { "type": "string" } }, "required": ["project"] } },
       { "name": "workflow_comment",   "description": "Attach a comment to a task card; the task's agent will consume it.", "input_schema": { "type": "object", "properties": { "task": { "type": "string" }, "text": { "type": "string" } }, "required": ["task", "text"] } },
-      { "name": "workflow_projects",  "description": "List office projects with phase and progress.", "input_schema": { "type": "object" } }
+      { "name": "workflow_projects",  "description": "List office projects with phase and progress.", "input_schema": { "type": "object" } },
+      { "name": "workflow_delete_project", "description": "Permanently delete (archive) a project and stop its agents. IRREVERSIBLE. Two-step confirm: 'confirm' must equal the exact project slug.", "input_schema": { "type": "object", "properties": { "project": { "type": "string" }, "confirm": { "type": "string" } }, "required": ["project", "confirm"] } }
     ]
   }
 }
@@ -1155,6 +1156,7 @@ model as `mcp__<sanitized aula.workflow>__workflow_*`.
 | workflow_resume | { project } | confirmation |
 | workflow_comment | { task, text } | "comment c<id> filed (receipt: pending)" |
 | workflow_projects | {} | one line per project: id, phase, progress |
+| workflow_delete_project | { project, confirm } | two-step confirm (confirm must equal the slug); ack, then IRREVERSIBLE delete via chat notice |
 
 ---
 
