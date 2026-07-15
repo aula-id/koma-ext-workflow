@@ -46,6 +46,12 @@ export interface Task {
   history?: TaskHistoryEntry[];
 }
 
+/** Last segment of a hierarchical task id — `<project>/<epic>/<story>/<task-slug>`
+ * ids are far too long for chrome; UI shows the slug and tooltips the full id. */
+export function taskSlug(id: string): string {
+  return id.split('/').pop() || id;
+}
+
 export interface CardProps {
   task: Task;
   draggable?: boolean;
@@ -132,7 +138,7 @@ export const Card: React.FC<CardProps> = ({ task, draggable = false, culprit = f
 
         {task.blockedBy.length > 0 && (
           <span title={`blocked by ${task.blockedBy.join(', ')}`}>
-            blocked by {task.blockedBy.join(', ')}
+            blocked by {task.blockedBy.map(taskSlug).join(', ')}
           </span>
         )}
       </div>

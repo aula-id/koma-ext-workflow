@@ -284,14 +284,15 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
             <h1 style={{ color: 'var(--wf-fg)', fontSize: '1rem', fontWeight: 700, margin: 0 }} className="truncate">
               {project.name}
             </h1>
-            <span className="wf-status" style={{ color: PHASE_COLOR[phaseKind] }}>
+            <span className="wf-status" style={{ color: PHASE_COLOR[phaseKind], flex: 'none', whiteSpace: 'nowrap' }}>
               <span className="wf-status-dot" style={{ background: PHASE_COLOR[phaseKind] }} />
               {phaseKind}
             </span>
           </div>
           {/* Phase-dependent actions: one set at a time, never three alarm
-              buttons side by side for every state. */}
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
+              buttons side by side for every state. flex:none so a long project
+              name can never crush the buttons. */}
+          <div style={{ display: 'flex', gap: '0.5rem', flex: 'none' }}>
             {phaseKind === 'running' && (
               <React.Fragment>
                 <ConfirmButton label="drain" className="wf-btn" onConfirm={() => void runInterrupt('soft')} testId="drain-btn" />

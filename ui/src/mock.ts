@@ -114,7 +114,7 @@ function buildRunningProject() {
       history: [historyEvent(T0, 'created')],
     },
     {
-      id: 'notif/t7', title: 'Build fanout consumer worker', column: 'onprogress', state: 'onprogress',
+      id: 'notif/core-notification-pipeline/fanout-channel-delivery/build-fanout-consumer-worker', title: 'Build fanout consumer worker', column: 'onprogress', state: 'onprogress',
       priority: 7, blockedBy: [], bounces: 1, agentId: 4021,
       description: 'Consume the fanout bus and route events to the delivery queue per channel.',
       acceptance: ['at-least-once delivery', 'dead-letter queue for poison events'],
@@ -139,7 +139,7 @@ function buildRunningProject() {
     },
     {
       id: 'notif/t9', title: 'Email channel adapter', column: 'review', state: 'review',
-      priority: 6, blockedBy: ['notif/t7'], bounces: 2,
+      priority: 6, blockedBy: ['notif/core-notification-pipeline/fanout-channel-delivery/build-fanout-consumer-worker'], bounces: 2,
       description: 'Adapt the delivery queue output to the transactional email provider.',
       acceptance: ['unsubscribe link injected', 'bounce webhook updates preference store'],
       comments: [
@@ -241,7 +241,7 @@ function buildRunningProject() {
       { id: 'notif/epic-ui', title: 'Notification UI', stories: ['notif/story-inbox'] },
     ],
     stories: [
-      { id: 'notif/story-fanout', title: 'Fanout & channel delivery', tasks: ['notif/t1', 'notif/t4', 'notif/t7', 'notif/t9'] },
+      { id: 'notif/story-fanout', title: 'Fanout & channel delivery', tasks: ['notif/t1', 'notif/t4', 'notif/core-notification-pipeline/fanout-channel-delivery/build-fanout-consumer-worker', 'notif/t9'] },
       { id: 'notif/story-prefs', title: 'Preferences', tasks: ['notif/t2', 'notif/t5', 'notif/t10'] },
       { id: 'notif/story-inbox', title: 'Inbox surface', tasks: ['notif/t3', 'notif/t6', 'notif/t8'] },
     ],

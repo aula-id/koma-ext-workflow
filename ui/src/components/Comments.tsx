@@ -114,7 +114,7 @@ export const Comments: React.FC<CommentsProps> = ({ taskId, comments, taskDone }
                     {formatTime(c.createdMs)}
                   </span>
                 </div>
-                <p style={{ fontSize: '0.8rem', color: 'var(--wf-fg)', margin: '0.2rem 0' }}>{c.text}</p>
+                <p style={{ fontSize: '0.8rem', color: 'var(--wf-fg)', margin: '0.2rem 0', overflowWrap: 'anywhere' }}>{c.text}</p>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.65rem' }}>
                   <span className="wf-status-dot" style={{ background: pill.colorVar, width: 5, height: 5 }} />
                   <span style={{ color: pill.colorVar }}>{pill.label}</span>
