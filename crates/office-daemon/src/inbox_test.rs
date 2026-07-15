@@ -489,6 +489,13 @@ fn every_inboxmsg_builder_roundtrips_through_parse() {
                 project: "shop".to_string(),
             },
         ),
+        (
+            "12-skip.json",
+            inboxmsg::skip("shop"),
+            Command::Skip {
+                project: "shop".to_string(),
+            },
+        ),
     ];
 
     for (name, value, _expected) in &cases {
@@ -534,6 +541,11 @@ fn peek_target_classifies_every_op() {
     assert_eq!(
         peek_target(r#"{"op":"resume","project":"shop"}"#),
         Target::Project { project: Some("shop".to_string()) }
+    );
+    assert_eq!(
+        peek_target(r#"{"op":"skip","project":"shop"}"#),
+        Target::Project { project: Some("shop".to_string()) },
+        "skip is owner-only (design-speedup item 7)"
     );
     assert_eq!(
         peek_target(r#"{"op":"status"}"#),

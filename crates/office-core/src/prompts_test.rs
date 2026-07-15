@@ -44,6 +44,8 @@ mod tests {
             outbox: Vec::new(),
             trace: Vec::new(),
             interrupted_from: None,
+            gate_cleared: false,
+            pending_breakdown: None,
             seq: 1,
         }
     }

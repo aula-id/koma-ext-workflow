@@ -339,6 +339,8 @@ mod tests {
                 assumption_check: false,
                 safeguard_role: "safeguard".to_string(),
                 assumption_mode: "ask".to_string(),
+                research_mode: "always".to_string(),
+                drafter_model: Some("claude-opus".to_string()),
             },
             outbox: vec![
                 OutboundNotice {
@@ -360,6 +362,8 @@ mod tests {
                 summary: "hard interrupt from running".to_string(),
             }],
             interrupted_from: Some(ProjectPhase::Running),
+            gate_cleared: false,
+            pending_breakdown: None,
             seq: 42,
         };
 

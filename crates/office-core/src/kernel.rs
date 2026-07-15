@@ -27,28 +27,28 @@
 //! the helpers below (`next_attempt`, `spawn_failure_streak`). `bounces` is the one
 //! counter the domain models directly, and it is used verbatim.
 //!
-//! ## Drafting pipeline + resume rule (6.2b / 6.2c)
-//! Drafting is a linear pipeline: `PRD -> [gate] -> research -> TRD -> [gate] -> CRD -> [gate] ->
-//! breakdown -> Ready`. Each `[gate]` is the safeguard no-assume check (feature C): after a
-//! ```prd/```trd/```crd fence is captured, the kernel emits an `AssumeCheck{Prd,Trd,Crd}` invoke
-//! whose CLEAN verdict proceeds to that doc's successor stage (PRD->research, TRD->CRD,
-//! CRD->breakdown), and whose ASSUMPTIONS verdict STOPS the pipeline by storing
-//! `Project.pending_assumptions` and noticing the user.
+//! ## Drafting pipeline (design-speedup 2026-07-15)
+//! Drafting is a PARALLEL pipeline with two doc-sets and two JOINs:
+//! `PRD -> {research ∥ PRD gate} -join-> TRD+CRD -> {early breakdown ∥ TRD+CRD gate} -join-> Ready`.
+//! At PRD capture the researcher is spawned (per `research_mode`, item 4) CONCURRENTLY with the PRD
+//! safeguard gate; the TRD+CRD authoring invoke fires only once BOTH settle (`maybe_author_trdcrd`).
+//! One combined invoke authors BOTH docs (item 3), gated together by the single TRD+CRD gate. When
+//! that gate finalizes the TRD it starts the epic/story/task breakdown EARLY, in parallel with the
+//! gate's verify; the breakdown is stashed and applied (Drafting -> Ready) at the second JOIN
+//! (`maybe_apply_breakdown`, item 8). One shared `gate_cleared` flag serves both JOINs because the
+//! stages are strictly sequential and every fresh capture resets it.
 //!
-//! **No hidden "which stage is deferred" state is kept.** The successor stage is a pure function
-//! of the doc identity carried on the check's `InvokePurpose`, so it is always recomputable and
-//! survives a store reload. `pending_assumptions` (persisted) records only that the LAST gate
-//! found ungrounded assumptions; ANY subsequent clean check clears it. A stopped gate is
-//! re-entered three ways, all off pure state: (1) the persona re-emits the fence and the fresh
-//! capture re-runs the gate; (2) the persona replies WITHOUT a new fence while
-//! `pending_assumptions` is set — the Persona arm then re-emits the gate for the newest captured
-//! doc (`recheck_pending_assumptions`) so the transcript-grown-by-the-user's-reply is re-judged
-//! (exactly one re-check per persona exchange, since an AssumeCheck result is not a persona
-//! result); (3) `Command::ApproveAssumptions` (workflow_approve) — explicit human approval clears
-//! `pending_assumptions` directly and resumes the deferred stage with no invoke. If a reload lands
-//! mid-invoke the in-flight check is simply lost (like any invoke) and the next `OfficeMessage`
-//! re-runs it. So the resume point is reconstructible from pure state: `phase` + which docs are
-//! non-empty + `pending_assumptions` + `assumption_check`.
+//! Each gate is the ONE-SHOT safeguard (item 5 + amendment A): in `assumption_mode == "auto"` the
+//! ENUMERATE pass ALSO resolves the non-critical items inline and re-emits the revised doc(s), then
+//! a single VERIFY pass may only CLEAR or DISCLOSE — so a clean doc is one invoke, a dirty doc two,
+//! never a loop. `ask` mode keeps enumerate as its own pass (critical items surface before any
+//! rewrite), then resolves the non-critical remainder + verifies. Which doc-set a gate belongs to
+//! is a pure function of which docs are non-empty (`newest_gated_doc`), so nothing "which stage"
+//! needs persisting. A stopped gate (critical freeze) re-enters via a re-emitted fence, a fenceless
+//! reply while `pending_assumptions` is set (`recheck_pending_assumptions`), or `ApproveAssumptions`.
+//! An interrupted Drafting project respawns its researcher on resume (item 6); `workflow_skip`
+//! (item 7) cancels research and advances the join. `drafter_model` (item 4) overrides the model on
+//! the doc-drafting invokes only.
 //!
 //! ## Completion audit gate (6.2c)
 //! When the last task passes and the project would complete, [`maybe_complete_project`] spawns
@@ -97,6 +97,16 @@ const PRD_NUDGE_MIN_REPLY_BYTES: usize = 500;
 /// The system-appended instruction on a capture-miss nudge re-invoke (feature: capture nudge).
 const PRD_NUDGE_INSTRUCTION: &str = "\nYour previous reply did not include the required ```prd \
 fence. Emit ONLY the complete document in the fence now — no prose.\n";
+
+/// The system-appended instruction on a combined TRD+CRD capture-miss nudge (design-speedup item 3):
+/// the reply dropped one or both fences, so re-ask for BOTH, fenced, nothing else.
+const TRDCRD_NUDGE_INSTRUCTION: &str = "\nYour previous reply was missing the required ```trd and/or \
+```crd fence. Emit ONLY the two complete documents, each in its own fence (```trd ... ``` then \
+```crd ... ```), nothing else.\n";
+
+/// The per-doc fence tags of each drafting doc-set, passed to the gate/resolve prompt builders.
+const PRD_TAGS: &[&str] = &["prd"];
+const TRDCRD_TAGS: &[&str] = &["trd", "crd"];
 
 // ---------------------------------------------------------------------------
 // Public protocol
@@ -170,6 +180,14 @@ pub enum Command {
         /// (Unification 2026-07-15: the single knob that supersedes the branch's `assumption_trust`
         /// bool — `"auto"` = old trust ON, `"ask"` = old trust OFF.)
         assumption_mode: Option<String>,
+        /// The research policy (design-speedup item 4): `"auto"` | `"always"` | `"never"`. Only those
+        /// three values are accepted (case-insensitive); any other string is ignored like an absent
+        /// field, so a typo never silently changes behavior.
+        research_mode: Option<String>,
+        /// The doc-drafting model override (design-speedup item 4). `Some("")` CLEARS the override
+        /// back to `None` (resolve the role's model); any other `Some(m)` sets it; `None` leaves it
+        /// unchanged (additive partial update).
+        drafter_model: Option<String>,
     },
     /// Explicit human approval of the safeguard's pending assumptions (`workflow_approve`,
     /// ARCHITECTURE.md 6.2c). Records the approval in the office transcript, then — human approval
@@ -177,6 +195,11 @@ pub enum Command {
     /// drafting stage for the newest gated doc, WITHOUT waiting on another safeguard invoke. A
     /// no-op notice when nothing is pending.
     ApproveAssumptions,
+    /// User-driven "skip research" (design-speedup item 7, `workflow_skip`). When the web-research
+    /// analyst is in flight during Drafting, kill it, mark research skipped (empty notes are fine),
+    /// and advance the pipeline toward the TRD+CRD authoring join. When no research is in flight,
+    /// it is a no-op beyond a friendly notice naming the project's current phase.
+    SkipResearch,
 }
 
 /// Facts fed back by the driver. `Tick`/`Reconcile` carry no clock — the authoritative
@@ -273,6 +296,12 @@ pub enum Effect {
         req_id: u64,
         purpose: InvokePurpose,
         role: String,
+        /// Optional `models.invoke` `model` override (design-speedup item 4, `drafter_model`). `Some`
+        /// only on the doc-drafting invokes (persona / TRD+CRD / ask-mode auto-resolve) when the
+        /// project set a `drafter_model`; the driver forwards it as the `model` param when `Some`,
+        /// exactly as `worker_model`/`reviewer_model` ride `sessions.spawn_into`. `None` = resolve
+        /// the role's model as before.
+        model: Option<String>,
         system: String,
         prompt: String,
         /// The `models.invoke` output format (feature 5): `Some("json")` for the structured
@@ -364,6 +393,15 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 trace(p, now_ms, "phase", format!("resumed to {}", phase_label(&ph)), ctx);
                 p.phase = ph;
                 p.interrupted_from = None;
+                // Design-speedup item 6: a hard interrupt during Drafting KILLED any in-flight
+                // researcher; resuming would otherwise wait for a user message before the pipeline
+                // moved again. If the project is back in Drafting with a captured PRD, no research
+                // notes yet, no researcher in flight, research not disabled, and TRD+CRD not yet
+                // authored, respawn the researcher immediately so drafting continues on its own.
+                if resume_should_respawn_research(p) {
+                    trace(p, now_ms, "research", "respawned on resume", ctx);
+                    start_research(p, now_ms, ctx);
+                }
             }
         }
         Command::Unpark { task } => {
@@ -437,6 +475,8 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
             crd_pass_grade,
             assumption_check,
             assumption_mode,
+            research_mode,
+            drafter_model,
         } => {
             if let Some(w) = max_workers {
                 p.config.max_workers = w.clamp(1, MAX_PROJECT_WORKERS);
@@ -482,8 +522,34 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                     _ => {}
                 }
             }
+            if let Some(m) = research_mode {
+                // Accept only the three known policies (case-insensitive); any other value is
+                // ignored like an absent field (design-speedup item 4).
+                match m.trim().to_ascii_lowercase().as_str() {
+                    "auto" => {
+                        p.config.research_mode = "auto".to_string();
+                        ctx.dirty = true;
+                    }
+                    "always" => {
+                        p.config.research_mode = "always".to_string();
+                        ctx.dirty = true;
+                    }
+                    "never" => {
+                        p.config.research_mode = "never".to_string();
+                        ctx.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(m) = drafter_model {
+                // An empty string clears the override back to None (resolve the role's model); any
+                // other value sets it (design-speedup item 4).
+                p.config.drafter_model = if m.trim().is_empty() { None } else { Some(m) };
+                ctx.dirty = true;
+            }
         }
         Command::ApproveAssumptions => approve_assumptions(p, now_ms, ctx),
+        Command::SkipResearch => skip_research(p, now_ms, ctx),
     }
 }
 
@@ -584,7 +650,7 @@ fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
     } else {
         let (system, prompt) = office::build_invoke(p, "");
         trace(p, now_ms, "invoke", "persona reply", ctx);
-        emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
+        emit_draft_invoke(p, ctx, InvokePurpose::Persona, system, prompt);
     }
 }
 
@@ -633,9 +699,11 @@ fn on_research_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: 
     }
 }
 
-/// The researcher finished (6.2b): parse the OFFICE-RESEARCH findings (tolerant; a missing
-/// block falls back to the whole reply text), store the capped notes, clear the binding, and
-/// draft the TRD.
+/// The researcher finished (6.2b / design-speedup item 2): parse the OFFICE-RESEARCH findings
+/// (tolerant; a missing block falls back to the whole reply text), store the capped notes, clear
+/// the binding, and try the TRD+CRD authoring join. Because research now runs IN PARALLEL with the
+/// PRD gate, completion does not author the docs directly — it settles the research side of the
+/// join and lets [`maybe_author_trdcrd`] author only once the PRD gate has ALSO cleared.
 fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
     p.research_notes = office::extract_research(&text);
     p.research = None;
@@ -643,16 +711,16 @@ fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx)
     queue_notice(
         p,
         now_ms,
-        format!("office[{}]: research done — drafting the TRD.", p.id.0),
+        format!("office[{}]: research done — drafting the TRD + clean-build requirements.", p.id.0),
         ctx,
     );
-    start_trd_invoke(p, now_ms, ctx);
+    maybe_author_trdcrd(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
 /// Research could not run or died — spawn failure, dead researcher, or runtime ceiling (6.2b).
-/// Degrade gracefully: clear the binding, tell the user, and draft the TRD from the PRD alone.
-/// Never wedges Drafting.
+/// Degrade gracefully: clear the binding, tell the user, and settle the research side of the
+/// TRD+CRD join from the PRD alone. Never wedges Drafting.
 fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
     p.research = None;
     trace(p, now_ms, "research", format!("degraded: {}", trace_preview(&reason, 80)), ctx);
@@ -660,225 +728,365 @@ fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx)
         p,
         now_ms,
         format!(
-            "office[{}]: research skipped: {}; drafting the TRD from the PRD alone.",
+            "office[{}]: research skipped: {}; drafting the TRD + clean-build requirements from the PRD alone.",
             p.id.0, reason
         ),
         ctx,
     );
-    start_trd_invoke(p, now_ms, ctx);
+    maybe_author_trdcrd(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
-/// Issue the TRD authoring invoke (6.2b): PRD (+ research notes when present) -> a ```trd
-/// fenced markdown document. Off-loop like every other invoke.
-fn start_trd_invoke(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
-    let (system, prompt) = office::build_trd_prompt(p);
-    trace(p, now_ms, "invoke", "TRD authoring", ctx);
-    emit_invoke(ctx, InvokePurpose::Trd, &p.config.office_role, system, prompt);
+/// Whether a resumed Drafting project should have its researcher respawned (design-speedup item 6):
+/// a captured PRD, no research notes yet, no researcher in flight, research not disabled by config,
+/// and the TRD+CRD not yet authored. Derived purely from state — a hard interrupt clears the
+/// research binding, so "was mid-research" is exactly this window.
+fn resume_should_respawn_research(p: &Project) -> bool {
+    matches!(p.phase, ProjectPhase::Drafting)
+        && !p.prd_markdown.trim().is_empty()
+        && p.research_notes.trim().is_empty()
+        && p.research.is_none()
+        && p.config.research_mode != "never"
+        && p.trd_markdown.trim().is_empty()
+        && p.crd_markdown.trim().is_empty()
 }
 
-/// The TRD invoke returned (6.2b). `Ok` with a ```trd fence -> store it and run the safeguard
-/// gate (feature C) whose clean verdict proceeds to the CRD (feature A). A missing fence, or any
-/// `Err` (e.g. a second timeout after the driver's one pool-level retry), still proceeds to the
-/// CRD invoke — from whatever docs exist — so Drafting never wedges on a TRD failure.
-fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
-    match outcome {
-        Ok(text) => match office::extract_fenced(&text, "trd") {
-            Some(trd) => {
-                p.trd_markdown = trd;
-                p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
-                trace(p, now_ms, "capture", format!("TRD drafted ({} bytes)", p.trd_markdown.len()), ctx);
-                queue_notice(
-                    p,
-                    now_ms,
-                    format!(
-                        "office[{}]: TRD drafted (panel) — checking assumptions before the clean-build requirements.",
-                        p.id.0
-                    ),
-                    ctx,
-                );
-                let body = p.trd_markdown.clone();
-                gate_doc(p, InvokePurpose::AssumeCheckTrd, "TRD", &body, Deferred::Crd, now_ms, ctx);
-                ctx.dirty = true;
-                return;
-            }
-            None => queue_notice(
+/// Kick off research at PRD-capture time per `research_mode` (design-speedup item 2 + 4):
+/// `"always"` -> spawn now (in PARALLEL with the PRD gate); `"never"` -> skip (traced); `"auto"` ->
+/// DEFER the decision to the PRD gate's enumerate result, which asks the well-known boolean.
+fn start_research_at_capture(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    match p.config.research_mode.as_str() {
+        "never" => trace(p, now_ms, "research", "research skipped (config)", ctx),
+        "always" => start_research(p, now_ms, ctx),
+        _ => {} // "auto": decided from the PRD gate's well-known answer
+    }
+}
+
+/// In `research_mode == "auto"`, decide whether to run research from the PRD gate's `well-known:`
+/// answer (design-speedup item 4). Only fires when research has not already been started or
+/// completed (so an `"always"` spawn, or a completed run, is never disturbed). A missing/unparseable
+/// answer defaults to running research.
+fn research_decide_from_check(p: &mut Project, text: &str, now_ms: u64, ctx: &mut Ctx) {
+    if p.config.research_mode != "auto" || p.research.is_some() || !p.research_notes.trim().is_empty() {
+        return;
+    }
+    match office::parse_well_known(text) {
+        Some(true) => trace(p, now_ms, "research", "research skipped — stack well-known", ctx),
+        _ => start_research(p, now_ms, ctx),
+    }
+}
+
+/// When there is no PRD gate result to read a well-known answer from (the gate was disabled/approved
+/// or errored), `research_mode == "auto"` cannot ask — so it DEFAULTS to running research (item 4:
+/// "if no or unparseable, run research"). No-op unless auto and research is still undecided.
+fn research_decide_default(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if p.config.research_mode == "auto" && p.research.is_none() && p.research_notes.trim().is_empty() {
+        start_research(p, now_ms, ctx);
+    }
+}
+
+/// Kill the in-flight researcher (if any) and respawn it against the just-revised PRD (design-speedup
+/// item 2): a gate auto-resolution that REVISES the PRD makes any research based on the old PRD
+/// stale. No-op when no researcher is running (e.g. `research_mode == "auto"` before the decision, or
+/// a completed/degraded run).
+fn restart_research_if_running(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if let Some(b) = p.research.take() {
+        if b.ext_agent_id != PROVISIONAL {
+            ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
+        }
+        trace(p, now_ms, "research", "research restarted — PRD revised", ctx);
+        start_research(p, now_ms, ctx);
+    }
+}
+
+/// The TRD+CRD authoring join (design-speedup items 2 + 3): author BOTH docs in ONE invoke, but
+/// ONLY once the PRD gate has cleared AND research has SETTLED (done / degraded / skipped =
+/// `research` is `None`). Called from both settle events (the PRD gate clearing, and research
+/// completing/degrading/being skipped), so whichever finishes LAST triggers the authoring. Guarded
+/// by "TRD+CRD not already captured" so it authors exactly once.
+fn maybe_author_trdcrd(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if p.gate_cleared
+        && p.research.is_none()
+        && p.trd_markdown.trim().is_empty()
+        && p.crd_markdown.trim().is_empty()
+    {
+        start_trdcrd_invoke(p, now_ms, ctx);
+    }
+}
+
+/// Issue the COMBINED TRD+CRD authoring invoke (design-speedup item 3): one invoke authors BOTH
+/// docs. Uses `drafter_model` when set (a doc-drafting invoke, item 4).
+fn start_trdcrd_invoke(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let (system, prompt) = office::build_trdcrd_prompt(p);
+    trace(p, now_ms, "invoke", "TRD+CRD authoring", ctx);
+    emit_draft_invoke(p, ctx, InvokePurpose::TrdCrd, system, prompt);
+}
+
+/// The combined TRD+CRD invoke returned (design-speedup item 3 + 8). Capture BOTH fences (```trd
+/// and ```crd); a capture-miss nudge fires (shared budget with the PRD nudge) if EITHER is missing,
+/// so a model that drops one fence gets one narrower re-ask. Once at least one doc is captured, the
+/// early breakdown will start when the gate finalizes the TRD, and the single combined TRD+CRD gate
+/// runs over both docs. Any `Err` (after the driver's one retry) proceeds to the breakdown from
+/// whatever docs exist so Drafting never wedges.
+fn handle_trdcrd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    let text = match outcome {
+        Ok(t) => t,
+        Err(e) => {
+            queue_notice(
                 p,
                 now_ms,
                 format!(
-                    "office[{}]: TRD draft arrived without a fenced block; drafting the clean-build requirements from the PRD.",
-                    p.id.0
+                    "office[{}]: TRD+CRD call failed: {}; requesting the breakdown from the PRD.",
+                    p.id.0, e
                 ),
                 ctx,
-            ),
-        },
-        Err(e) => queue_notice(
-            p,
-            now_ms,
-            format!(
-                "office[{}]: TRD call failed: {}; drafting the clean-build requirements from the PRD alone.",
-                p.id.0, e
-            ),
-            ctx,
-        ),
+            );
+            start_early_breakdown(p, now_ms, ctx);
+            run_gate_cleared(p, Deferred::Breakdown, now_ms, ctx);
+            ctx.dirty = true;
+            return;
+        }
+    };
+    let (trd, crd) = office::extract_trd_crd(&text);
+
+    // Capture-miss nudge (shared budget): a long reply missing EITHER fence gets one narrower re-ask.
+    if (trd.is_none() || crd.is_none())
+        && text.len() > PRD_NUDGE_MIN_REPLY_BYTES
+        && p.capture_nudge_count < MAX_CAPTURE_NUDGES
+    {
+        p.capture_nudge_count += 1;
+        trace(p, now_ms, "nudge", format!("TRD+CRD capture-miss nudge #{}", p.capture_nudge_count), ctx);
+        let (mut system, prompt) = office::build_trdcrd_prompt(p);
+        system.push_str(TRDCRD_NUDGE_INSTRUCTION);
+        emit_draft_invoke(p, ctx, InvokePurpose::TrdCrd, system, prompt);
+        ctx.dirty = true;
+        return;
     }
-    // No TRD captured -> nothing to safeguard-check; proceed straight to the CRD invoke.
-    start_crd_invoke(p, now_ms, ctx);
+
+    // Fresh doc-set capture: reset the gate + discard any stale early breakdown (item 8 redo).
+    reset_trdcrd_capture(p, now_ms, ctx);
+    p.capture_nudge_count = 0;
+    if let Some(t) = trd {
+        p.trd_markdown = t;
+    }
+    if let Some(c) = crd {
+        p.crd_markdown = c;
+    }
+    trace(
+        p,
+        now_ms,
+        "capture",
+        format!("TRD+CRD drafted (trd {}B, crd {}B)", p.trd_markdown.len(), p.crd_markdown.len()),
+        ctx,
+    );
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: TRD + clean-build requirements drafted (panel) — checking assumptions before the breakdown.", p.id.0),
+        ctx,
+    );
+    gate_doc(p, Deferred::Breakdown, now_ms, ctx);
     ctx.dirty = true;
 }
 
-/// Issue the CRD authoring invoke (6.2c): PRD (+ TRD when present) -> a ```crd fenced Clean-build
-/// Requirement Document. Off-loop, on the office role, like the TRD invoke.
-fn start_crd_invoke(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
-    let (system, prompt) = office::build_crd_prompt(p);
-    trace(p, now_ms, "invoke", "CRD authoring", ctx);
-    emit_invoke(ctx, InvokePurpose::Crd, &p.config.office_role, system, prompt);
-}
-
-/// The CRD invoke returned (6.2c). `Ok` with a ```crd fence -> store it and run the safeguard
-/// gate whose clean verdict requests the breakdown. A missing fence or any `Err` STILL requests
-/// the breakdown — the project simply completes without a clean-build audit (never wedges).
-fn handle_crd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
-    match outcome {
-        Ok(text) => match office::extract_fenced(&text, "crd") {
-            Some(crd) => {
-                p.crd_markdown = crd;
-                p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
-                trace(p, now_ms, "capture", format!("CRD drafted ({} bytes)", p.crd_markdown.len()), ctx);
-                queue_notice(
-                    p,
-                    now_ms,
-                    format!(
-                        "office[{}]: clean-build requirements drafted (panel) — checking assumptions before the breakdown.",
-                        p.id.0
-                    ),
-                    ctx,
-                );
-                let body = p.crd_markdown.clone();
-                gate_doc(p, InvokePurpose::AssumeCheckCrd, "CRD", &body, Deferred::Breakdown, now_ms, ctx);
-                ctx.dirty = true;
-                return;
-            }
-            None => queue_notice(
-                p,
-                now_ms,
-                format!(
-                    "office[{}]: CRD call skipped (no fenced block); the project will complete without a clean-build audit.",
-                    p.id.0
-                ),
-                ctx,
-            ),
-        },
-        Err(e) => queue_notice(
-            p,
-            now_ms,
-            format!(
-                "office[{}]: CRD call failed: {}; the project will complete without a clean-build audit.",
-                p.id.0, e
-            ),
-            ctx,
-        ),
+/// Reset the per-doc-set gate + early-breakdown state on a fresh TRD+CRD capture (design-speedup
+/// item 8 redo): a revised TRD invalidates any stashed early breakdown, so discard it and re-open
+/// the gate. Traced when a stash was actually discarded.
+fn reset_trdcrd_capture(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    p.gate_cleared = false;
+    if p.pending_breakdown.take().is_some() {
+        trace(p, now_ms, "breakdown", "breakdown redone — TRD revised", ctx);
     }
-    // No CRD captured -> nothing to safeguard-check and no audit later; break down anyway.
-    request_breakdown(p, now_ms, ctx);
-    ctx.dirty = true;
 }
 
 // ---------------------------------------------------------------------------
-// Safeguard no-assume gate (6.2c feature C) — Drafting doc captures
+// Safeguard one-shot gate + parallel joins (design-speedup items 2/3/5/8)
 // ---------------------------------------------------------------------------
 
-/// The pipeline stage a captured drafting doc proceeds to once its safeguard gate is clean. The
-/// gate is stateless: the AssumeCheck result's purpose (`AssumeCheck{Prd,Trd,Crd}`) names the
-/// doc, and this maps doc -> successor stage deterministically, so which stage was deferred is
-/// always recomputable and never needs persisting (kernel.rs pipeline resume rule).
+/// What a captured drafting doc-set's safeguard gate advances to once it clears. There are only two
+/// doc-sets now (PRD, then combined TRD+CRD), and each is a JOIN — the gate clearing is only one of
+/// two conditions. `PostPrd` = the PRD gate cleared; join with research to author TRD+CRD. `Breakdown`
+/// = the TRD+CRD gate cleared; join with the early breakdown to build the board. The deferred is a
+/// pure function of which docs are non-empty (`newest_gated_doc`), so it never needs persisting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Deferred {
-    Research,
-    Crd,
+    PostPrd,
     Breakdown,
 }
 
-/// Run the pipeline stage a doc capture was gating (6.2c). PRD -> research, TRD -> CRD, CRD ->
-/// breakdown.
-fn run_deferred(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
+/// A gate cleared: record it on the shared `gate_cleared` flag (one flag serves both stages because
+/// the PRD stage strictly precedes the TRD+CRD stage and each fresh capture resets it), drop any
+/// pending assumptions, and run the stage's JOIN — which fires the next pipeline step only once BOTH
+/// join conditions hold (the parallel research / early breakdown may still be in flight).
+fn run_gate_cleared(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
+    p.gate_cleared = true;
+    p.pending_assumptions.clear();
     match deferred {
-        Deferred::Research => start_research(p, now_ms, ctx),
-        Deferred::Crd => start_crd_invoke(p, now_ms, ctx),
-        Deferred::Breakdown => request_breakdown(p, now_ms, ctx),
+        Deferred::PostPrd => maybe_author_trdcrd(p, now_ms, ctx),
+        Deferred::Breakdown => maybe_apply_breakdown(p, now_ms, ctx),
     }
 }
 
-/// Gate a freshly-captured drafting doc through the safeguard no-assume check (6.2c). The gate is a
-/// straight pass-through to the deferred stage when it is disabled (`config.assumption_check ==
-/// false`) OR already approved for this project (`assumptions_approved`, set by a deterministic
-/// approval in `office_message`) — both are the same fail-open shape, and the approval one is what
-/// breaks the audit's re-emit -> re-gate -> stop loop. Otherwise it emits an `AssumeCheck*` invoke
-/// on the `safeguard_role`; the result (in [`handle_assume_check_result`]) either proceeds to
-/// `deferred` (clean / fail-open) or stops the pipeline with `pending_assumptions`.
-fn gate_doc(
-    p: &mut Project,
-    purpose: InvokePurpose,
-    label: &str,
-    body: &str,
-    deferred: Deferred,
-    now_ms: u64,
-    ctx: &mut Ctx,
-) {
+/// The early-breakdown JOIN (design-speedup item 8): apply the stashed breakdown and move Drafting
+/// -> Ready, but ONLY once the TRD+CRD gate has cleared AND the early breakdown has landed
+/// (`pending_breakdown` stashed). Called from both settle events, so whichever finishes LAST builds
+/// the board — so by the time the user authorizes, the workers can start immediately.
+fn maybe_apply_breakdown(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if !p.gate_cleared {
+        return;
+    }
+    let text = match p.pending_breakdown.take() {
+        Some(t) => t,
+        None => return, // breakdown still in flight (or failed/surfaced) — wait
+    };
+    match office::parse_breakdown(&text) {
+        // Apply DIRECTLY (never via apply_or_stash_breakdown, which would re-stash + re-enter here
+        // in Drafting — an infinite loop): the stash is being consumed, so land it now.
+        Ok(breakdown) => land_breakdown(p, breakdown, now_ms, ctx),
+        Err(_) => {
+            // Defensive only: a stash that re-parses invalid should be impossible (it validated on
+            // the way in). Fall back to an inline breakdown rather than wedging.
+            trace(p, now_ms, "breakdown", "stashed breakdown invalid — re-running inline", ctx);
+            request_breakdown(p, now_ms, ctx);
+        }
+    }
+}
+
+/// Kick off the epic/story/task breakdown EARLY (design-speedup item 8): as soon as the TRD is
+/// finalized by the gate, in parallel with the gate's verify pass. Its result is stashed
+/// (`pending_breakdown`) rather than applied, and the JOIN (`maybe_apply_breakdown`) builds the
+/// board once the gate clears. Structured-JSON invoke on the office role — NOT a doc-drafting invoke,
+/// so it does NOT take `drafter_model`.
+fn start_early_breakdown(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let (system, prompt) = office::build_breakdown_prompt(p, None, false);
+    trace(p, now_ms, "breakdown", "started early (parallel with the gate verify)", ctx);
+    emit_invoke(ctx, InvokePurpose::Breakdown, &p.config.office_role, system, prompt);
+}
+
+/// The Breakdown-stage finalize side-effect: when the TRD+CRD gate is about to CLEAR without going
+/// through the verify path (a clean enumerate, a skipped gate, an approval, an errored check, or a
+/// failed resolve), kick off the early breakdown now so the JOIN has a plan to apply. The verify
+/// path finalizes inside [`emit_verify`] instead, so this and that are mutually exclusive per run.
+fn finalize_trdcrd_if_needed(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
+    if matches!(deferred, Deferred::Breakdown) {
+        start_early_breakdown(p, now_ms, ctx);
+    }
+}
+
+/// User-driven skip-research (design-speedup item 7, `workflow_skip`). If the researcher is in
+/// flight, kill it, mark research skipped (empty notes are fine), and advance the TRD+CRD authoring
+/// join. If nothing is running, a friendly notice naming the project's phase (the pipeline is not
+/// waiting on research, so there is nothing to skip).
+fn skip_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if let Some(b) = p.research.take() {
+        if b.ext_agent_id != PROVISIONAL {
+            ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
+        }
+        trace(p, now_ms, "research", "research skipped by user", ctx);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: research skipped by user — drafting the TRD + clean-build requirements.",
+                p.id.0
+            ),
+            ctx,
+        );
+        maybe_author_trdcrd(p, now_ms, ctx);
+        ctx.dirty = true;
+    } else {
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: no research is running to skip (project is {}).",
+                p.id.0,
+                phase_label(&p.phase)
+            ),
+            ctx,
+        );
+        ctx.dirty = true;
+    }
+}
+
+/// Gate a captured drafting doc-set through the ONE-SHOT safeguard gate (design-speedup item 5 +
+/// amendment A). Fails OPEN when disabled (`assumption_check == false`) or already approved for this
+/// project (`assumptions_approved`) — same shape as before, and the approval one is what breaks the
+/// audit re-emit -> re-gate -> stop loop. Otherwise it emits the ENUMERATE pass on `safeguard_role`:
+/// in `assumption_mode == "auto"` the pass ALSO resolves the non-critical items inline (compressed
+/// gate), and on the PRD stage with `research_mode == "auto"` it also answers the well-known boolean.
+/// The fixed gate parameters for a doc-set stage: the enumerate purpose, human label, and fence
+/// tags. Purely a function of `deferred`, so callers need only supply the stage.
+fn gate_params(deferred: Deferred) -> (InvokePurpose, &'static str, &'static [&'static str]) {
+    match deferred {
+        Deferred::PostPrd => (InvokePurpose::AssumeCheckPrd, "PRD", PRD_TAGS),
+        Deferred::Breakdown => (InvokePurpose::AssumeCheckTrdCrd, "TRD+CRD", TRDCRD_TAGS),
+    }
+}
+
+fn gate_doc(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
+    let (purpose, label, tags) = gate_params(deferred);
     if p.assumptions_approved || !p.config.assumption_check {
-        // Gate skipped: either approved for this project (sticky, set by a chat approval intent or
-        // workflow_approve) or disabled outright. Clear any stale pending (a re-check that reaches a
-        // now-skipped gate) and pass straight through to the deferred stage.
         let why = if p.assumptions_approved { "already approved" } else { "gate off" };
         p.pending_assumptions.clear();
         trace(p, now_ms, "gate", format!("{label} gate skipped ({why})"), ctx);
-        run_deferred(p, deferred, now_ms, ctx);
+        // Fail-open still owes the stage's finalize side-effects: the PRD stage decides research
+        // (auto defaults to running, having no well-known answer to read); the TRD+CRD stage starts
+        // the early breakdown.
+        if matches!(deferred, Deferred::PostPrd) {
+            research_decide_default(p, now_ms, ctx);
+        }
+        finalize_trdcrd_if_needed(p, deferred, now_ms, ctx);
+        run_gate_cleared(p, deferred, now_ms, ctx);
         return;
     }
-    let (system, prompt) = office::build_assume_check_prompt(p, label, body);
+    let resolve_inline = p.config.assumption_mode == "auto";
+    let ask_wellknown = matches!(deferred, Deferred::PostPrd) && p.config.research_mode == "auto";
+    let body = gate_body(p, deferred);
+    let (system, prompt) =
+        office::build_assume_check_prompt(p, label, &body, tags, resolve_inline, ask_wellknown);
     trace(p, now_ms, "gate", format!("checking {label} for assumptions"), ctx);
     emit_invoke(ctx, purpose, &p.config.safeguard_role, system, prompt);
 }
 
-/// The newest non-empty drafting doc and its gate parameters (purpose, human label, a body clone,
-/// deferred stage). Because the pipeline authors PRD -> TRD -> CRD strictly in order and only past
-/// a clean gate, the LAST gate always ran on the newest non-empty doc — so this recovers exactly
-/// which doc `pending_assumptions` belongs to, with no extra persisted state (kernel.rs resume
-/// rule). CRD wins over TRD wins over PRD. `None` only when no doc exists yet (never while
-/// `pending_assumptions` is set).
-fn newest_gated_doc(p: &Project) -> Option<(InvokePurpose, &'static str, String, Deferred)> {
-    if !p.crd_markdown.trim().is_empty() {
-        Some((InvokePurpose::AssumeCheckCrd, "CRD", p.crd_markdown.clone(), Deferred::Breakdown))
-    } else if !p.trd_markdown.trim().is_empty() {
-        Some((InvokePurpose::AssumeCheckTrd, "TRD", p.trd_markdown.clone(), Deferred::Crd))
+/// The newest non-empty drafting doc-set + its gate parameters (human label, deferred join, fence
+/// tags). The pipeline authors PRD then the combined TRD+CRD strictly in order, so the LAST gate
+/// always ran on the newest doc-set: the TRD+CRD set (either doc present) wins over the PRD. Recovers
+/// exactly what `pending_assumptions` / an in-flight resolve/verify belongs to with no extra
+/// persisted state. `None` only before any doc exists. (The enumerate purpose + body are re-derived
+/// on demand from `deferred` via `gate_params`/`gate_body`, so they are not returned here.)
+fn newest_gated_doc(p: &Project) -> Option<(&'static str, Deferred, &'static [&'static str])> {
+    if !p.trd_markdown.trim().is_empty() || !p.crd_markdown.trim().is_empty() {
+        Some(("TRD+CRD", Deferred::Breakdown, TRDCRD_TAGS))
     } else if !p.prd_markdown.trim().is_empty() {
-        Some((InvokePurpose::AssumeCheckPrd, "PRD", p.prd_markdown.clone(), Deferred::Research))
+        Some(("PRD", Deferred::PostPrd, PRD_TAGS))
     } else {
         None
     }
 }
 
-/// Re-run the safeguard gate on the newest captured drafting doc (feature 1). Called from the
-/// Persona arm when a fenceless reply arrives while `pending_assumptions` is set: the transcript
-/// now carries the user's fresh approval / answers / delegation, so the SAME gate (same purpose ->
-/// same deferred stage) is re-emitted to re-judge it. A clean verdict then clears the list and
-/// resumes the deferred stage in [`handle_assume_check_result`]; a still-dirty verdict refreshes
-/// the list. No-op if there is somehow no doc to gate.
+/// The current body of the doc-set a gate is operating on, for the resolve/verify prompts.
+fn gate_body(p: &Project, deferred: Deferred) -> String {
+    match deferred {
+        Deferred::PostPrd => p.prd_markdown.clone(),
+        Deferred::Breakdown => office::trdcrd_body(p),
+    }
+}
+
+/// Re-run the safeguard gate on the newest captured drafting doc-set (feature 1). Called from the
+/// Persona arm when a fenceless reply arrives while `pending_assumptions` is set: the transcript now
+/// carries the user's fresh approval / answers / delegation, so the SAME gate is re-emitted to
+/// re-judge it. No-op if there is somehow no doc to gate.
 fn recheck_pending_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
-    if let Some((purpose, label, body, deferred)) = newest_gated_doc(p) {
-        gate_doc(p, purpose, label, &body, deferred, now_ms, ctx);
+    if let Some((_, deferred, _)) = newest_gated_doc(p) {
+        gate_doc(p, deferred, now_ms, ctx);
     }
 }
 
 /// Explicit human approval of the pending safeguard assumptions (feature 2, `workflow_approve`).
-/// Human approval OUTRANKS the checker: record the approval as a User turn (so any later gate sees
-/// the delegation in the transcript), then clear `pending_assumptions` DIRECTLY and resume the
-/// deferred stage for the newest gated doc — no re-invoke, no waiting on the model. With nothing
-/// pending it is a no-op beyond a notice.
-///
-/// Unification 2026-07-15: like a chat approval intent (`office_message`), the explicit tool ALSO
-/// sets the sticky `assumptions_approved` flag, so the safeguard gate is closed for THIS project and
-/// later docs proceed without re-stopping — ONE coherent approval model across both entry points.
+/// Human approval OUTRANKS the checker: record the approval as a User turn, set the sticky
+/// `assumptions_approved`, clear `pending_assumptions` DIRECTLY, and clear the gate for the newest
+/// doc-set — no re-invoke. With nothing pending it is a no-op beyond a notice.
 fn approve_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     p.office_transcript.push(ChatMsg {
         who: ChatAuthor::User,
@@ -898,28 +1106,30 @@ fn approve_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         format!("office[{}]: assumptions approved by user — resuming.", p.id.0),
         ctx,
     );
-    if let Some((_, _, _, deferred)) = newest_gated_doc(p) {
-        run_deferred(p, deferred, now_ms, ctx);
+    if let Some((_, deferred, _)) = newest_gated_doc(p) {
+        // The gate ran (it froze), so research was already decided; only the stage finalize is owed.
+        finalize_trdcrd_if_needed(p, deferred, now_ms, ctx);
+        run_gate_cleared(p, deferred, now_ms, ctx);
     }
 }
 
-/// A safeguard assumption-check returned (6.2c). `clean` (or an unparseable block) clears
-/// `pending_assumptions` and proceeds to the deferred stage. An `assumptions` verdict is routed by
-/// `handle_assumptions` per `config.assumption_mode` ('ask' freezes on every material item; 'auto'
-/// freezes only on `[critical]` items and auto-resolves the rest) — UNLESS an active approval
-/// (`assumptions_approved`) is set, in which case the flagged items are recorded onto
-/// `self_resolved_assumptions` and the pipeline proceeds instead (the belt for a check that was in
-/// flight when the user approved). `Err` FAILS OPEN: proceed with a notice — a flaky safeguard must
-/// never wedge Drafting.
+/// The ENUMERATE pass returned (design-speedup one-shot gate). Order of work: (1) apply any inline
+/// revision the compressed auto-mode gate returned; (2) settle research for the PRD stage (well-known
+/// decision, or restart on a PRD revision); (3) route the verdict — clean/approved -> clear;
+/// [critical] -> freeze; all-[auto] auto-mode -> the doc is already revised, run VERIFY; all-[auto]
+/// ask-mode -> emit the batch RESOLVE. An `Err` fails open. Never loops: the resolution is bounded to
+/// one pass and the verify may only clear or disclose.
 fn handle_assume_check_result(
     p: &mut Project,
     deferred: Deferred,
     doc_label: &str,
+    tags: &'static [&'static str],
     outcome: Result<String, String>,
     now_ms: u64,
     ctx: &mut Ctx,
 ) {
-    match outcome {
+    ctx.dirty = true;
+    let text = match outcome {
         Err(e) => {
             trace(p, now_ms, "gate", format!("{doc_label} check errored — failing open"), ctx);
             queue_notice(
@@ -928,102 +1138,239 @@ fn handle_assume_check_result(
                 format!("office[{}]: assumption check skipped: {}; continuing.", p.id.0, e),
                 ctx,
             );
-            p.pending_assumptions.clear();
-            run_deferred(p, deferred, now_ms, ctx);
+            if matches!(deferred, Deferred::PostPrd) {
+                research_decide_default(p, now_ms, ctx);
+            }
+            finalize_trdcrd_if_needed(p, deferred, now_ms, ctx);
+            run_gate_cleared(p, deferred, now_ms, ctx);
+            return;
+        }
+        Ok(t) => t,
+    };
+
+    let check = report::parse_assume_check(&text);
+    let verdict = check.as_ref().map(|c| c.verdict).unwrap_or(report::AssumeVerdict::Clean);
+    let items: Vec<String> = check.map(|c| c.items).unwrap_or_default();
+    let auto_mode = p.config.assumption_mode == "auto";
+
+    // (1) Inline revision — only the compressed auto-mode gate revises, and only on an assumptions
+    // verdict.
+    let revised = auto_mode
+        && verdict == report::AssumeVerdict::Assumptions
+        && apply_revised_docs(p, tags, &text);
+    if revised {
+        trace(p, now_ms, "gate", format!("{doc_label}: resolved assumption(s) inline"), ctx);
+    }
+
+    // (2) Research settle (PRD stage only). Restart FIRST (a no-op unless a researcher is already
+    // running, i.e. always-mode) so a PRD revised inline restarts against the new PRD; THEN decide
+    // from the well-known answer (auto-mode), which starts a fresh researcher against the
+    // already-revised PRD — so the two never double-spawn.
+    if matches!(deferred, Deferred::PostPrd) {
+        if revised {
+            restart_research_if_running(p, now_ms, ctx);
+        }
+        research_decide_from_check(p, &text, now_ms, ctx);
+    }
+
+    // (3) Verdict routing.
+    if verdict == report::AssumeVerdict::Clean {
+        trace(p, now_ms, "gate", format!("{doc_label} clean — proceeding"), ctx);
+        if !p.pending_assumptions.is_empty() {
+            queue_notice(p, now_ms, format!("office[{}]: assumptions resolved — resuming.", p.id.0), ctx);
+        }
+        finalize_trdcrd_if_needed(p, deferred, now_ms, ctx);
+        run_gate_cleared(p, deferred, now_ms, ctx);
+        return;
+    }
+
+    // assumptions verdict — race belt first.
+    if p.assumptions_approved {
+        let n = items.len();
+        record_self_resolved(p, &items);
+        trace(p, now_ms, "gate", format!("{doc_label} self-resolved {n} assumption(s) (approved)"), ctx);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: no-assume (approved): self-resolved {} assumption{}, proceeding.",
+                p.id.0,
+                n,
+                if n == 1 { "" } else { "s" }
+            ),
+            ctx,
+        );
+        finalize_trdcrd_if_needed(p, deferred, now_ms, ctx);
+        run_gate_cleared(p, deferred, now_ms, ctx);
+        return;
+    }
+
+    let (critical, auto) = partition_assumptions(&items);
+
+    if !critical.is_empty() {
+        // BOTH modes stop on critical items (auto mode already resolved the [auto] ones inline; ask
+        // mode surfaces critical BEFORE any rewrite). No finalize — the pipeline is frozen.
+        freeze_critical(p, doc_label, critical, now_ms, ctx);
+        return;
+    }
+
+    if auto.is_empty() {
+        // A dirty verdict with no usable items -> nothing to resolve; clear + proceed.
+        finalize_trdcrd_if_needed(p, deferred, now_ms, ctx);
+        run_gate_cleared(p, deferred, now_ms, ctx);
+        return;
+    }
+
+    if auto_mode {
+        // The doc-set was already revised inline; go straight to the single VERIFY pass.
+        emit_verify(p, deferred, doc_label, now_ms, ctx);
+    } else {
+        // 'ask' mode: batch-resolve the non-critical remainder, then verify.
+        emit_resolve(p, deferred, doc_label, auto, tags, now_ms, ctx);
+    }
+}
+
+/// Emit the batch RESOLVE invoke ('ask' mode, one-shot gate). The office decides every non-critical
+/// item itself and re-emits the revised doc(s). Doc-drafting/revision invoke, so it takes
+/// `drafter_model` (item 4).
+fn emit_resolve(
+    p: &mut Project,
+    deferred: Deferred,
+    doc_label: &str,
+    auto: Vec<String>,
+    tags: &'static [&'static str],
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    let n = auto.len();
+    p.pending_assumptions.clear();
+    trace(p, now_ms, "gate", format!("{doc_label} resolving {n} auto assumption(s)"), ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: {} has {} non-critical assumption{} — resolving {} autonomously.",
+            p.id.0,
+            doc_label,
+            n,
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        ),
+        ctx,
+    );
+    let body = gate_body(p, deferred);
+    let (system, prompt) = office::build_assume_resolve_prompt(p, doc_label, &body, &auto, tags);
+    emit_draft_invoke(p, ctx, InvokePurpose::AssumeResolve, system, prompt);
+}
+
+/// Emit the FINAL VERIFY pass (one-shot gate, item 5c). For the TRD+CRD stage this is also where the
+/// early breakdown starts (parallel with the verify), so the finalize happens exactly once. Runs on
+/// the `safeguard_role`.
+fn emit_verify(p: &mut Project, deferred: Deferred, doc_label: &str, now_ms: u64, ctx: &mut Ctx) {
+    if matches!(deferred, Deferred::Breakdown) {
+        start_early_breakdown(p, now_ms, ctx);
+    }
+    let body = gate_body(p, deferred);
+    let (system, prompt) = office::build_assume_verify_prompt(p, doc_label, &body);
+    trace(p, now_ms, "gate", format!("verifying {doc_label}"), ctx);
+    emit_invoke(ctx, InvokePurpose::AssumeVerify, &p.config.safeguard_role, system, prompt);
+}
+
+/// The batch RESOLVE invoke returned ('ask' mode). `Ok` with a revised fence -> update the doc(s),
+/// restart research on a PRD revision, and run the single VERIFY pass. A missing fence or any `Err`
+/// PROCEEDS (never wedges). The doc-set is recovered from pure state (`newest_gated_doc`).
+fn handle_assume_resolve_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    ctx.dirty = true;
+    let (label, deferred, tags) = match newest_gated_doc(p) {
+        Some(x) => x,
+        None => return,
+    };
+    match outcome {
+        Ok(text) => {
+            if apply_revised_docs(p, tags, &text) {
+                trace(p, now_ms, "capture", format!("{label} revised by auto-resolve"), ctx);
+                if matches!(deferred, Deferred::PostPrd) {
+                    restart_research_if_running(p, now_ms, ctx);
+                }
+                emit_verify(p, deferred, label, now_ms, ctx);
+            } else {
+                proceed_after_failed_resolve(p, deferred, "the resolver returned no revised document", now_ms, ctx);
+            }
+        }
+        Err(e) => proceed_after_failed_resolve(p, deferred, &e, now_ms, ctx),
+    }
+}
+
+/// The FINAL VERIFY pass returned (one-shot gate, item 5c). It may only CLEAR or DISCLOSE: any items
+/// it flags are recorded as disclosed (`self_resolved_assumptions`) and the gate clears anyway — it
+/// NEVER triggers another resolve round. An `Err` proceeds. The early breakdown was already emitted
+/// when the verify was requested, so this only clears the gate.
+fn handle_assume_verify_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    ctx.dirty = true;
+    let (label, deferred, _tags) = match newest_gated_doc(p) {
+        Some(x) => x,
+        None => return,
+    };
+    match outcome {
+        Err(e) => {
+            trace(p, now_ms, "gate", format!("{label} verify errored — proceeding"), ctx);
+            queue_notice(p, now_ms, format!("office[{}]: verification skipped: {}; proceeding.", p.id.0, e), ctx);
+            run_gate_cleared(p, deferred, now_ms, ctx);
         }
         Ok(text) => match report::parse_assume_check(&text) {
             Some(check)
                 if check.verdict == report::AssumeVerdict::Assumptions && !check.items.is_empty() =>
             {
                 let n = check.items.len();
-                if p.assumptions_approved {
-                    // An approval landed while this check was still in flight (the race belt): the
-                    // gate is closed for THIS project, so do NOT stop. Record the flagged items on
-                    // the audit trail (capped) and take the SAME proceed path as a clean verdict.
-                    record_self_resolved(p, &check.items);
-                    trace(p, now_ms, "gate", format!("{doc_label} self-resolved {n} assumption(s) (approved)"), ctx);
-                    queue_notice(
-                        p,
-                        now_ms,
-                        format!(
-                            "office[{}]: no-assume (approved): self-resolved {} assumption{}, proceeding.",
-                            p.id.0,
-                            n,
-                            if n == 1 { "" } else { "s" }
-                        ),
-                        ctx,
-                    );
-                    p.pending_assumptions.clear();
-                    run_deferred(p, deferred, now_ms, ctx);
-                } else {
-                    // Mode-aware handling (autonomous-safeguard pivot): 'ask' freezes on every
-                    // material item; 'auto' freezes only on [critical] items and auto-resolves the
-                    // rest. Trace lives inside handle_assumptions per the branch it takes.
-                    handle_assumptions(p, deferred, doc_label, check.items, now_ms, ctx);
-                }
+                record_self_resolved(p, &check.items);
+                trace(p, now_ms, "gate", format!("verified — {n} new item(s) disclosed, not re-looped"), ctx);
+                queue_notice(
+                    p,
+                    now_ms,
+                    format!(
+                        "office[{}]: verified — {} assumption{} disclosed, proceeding.",
+                        p.id.0,
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    ctx,
+                );
+                run_gate_cleared(p, deferred, now_ms, ctx);
             }
             _ => {
-                // Clean, or an unparseable/inconclusive block -> fail open and proceed. When this
-                // CLEARS a stopped gate (pending was non-empty), tell the user the pipeline is
-                // resuming — both the re-check-on-reply path (recheck_pending_assumptions) and a
-                // re-emitted fence land here.
-                trace(p, now_ms, "gate", format!("{doc_label} clean — proceeding"), ctx);
-                if !p.pending_assumptions.is_empty() {
-                    queue_notice(
-                        p,
-                        now_ms,
-                        format!("office[{}]: assumptions resolved — resuming.", p.id.0),
-                        ctx,
-                    );
-                }
-                p.pending_assumptions.clear();
-                run_deferred(p, deferred, now_ms, ctx);
+                trace(p, now_ms, "gate", format!("{label} verified — clean"), ctx);
+                run_gate_cleared(p, deferred, now_ms, ctx);
             }
         },
     }
-    ctx.dirty = true;
 }
 
-/// Append safeguard-flagged assumptions that an active approval (`assumptions_approved`)
-/// auto-resolved to the project's audit trail, capped to the most recent [`SELF_RESOLVED_CAP`]
-/// entries so a long drafting session can never balloon the state file.
-fn record_self_resolved(p: &mut Project, items: &[String]) {
-    const SELF_RESOLVED_CAP: usize = 100;
-    p.self_resolved_assumptions.extend(items.iter().cloned());
-    let len = p.self_resolved_assumptions.len();
-    if len > SELF_RESOLVED_CAP {
-        p.self_resolved_assumptions.drain(0..len - SELF_RESOLVED_CAP);
-    }
+/// Auto-resolution could not finish (invoke `Err` or a missing fence): disclose, run the stage
+/// finalize (early breakdown for TRD+CRD), and clear the gate. Never wedges.
+fn proceed_after_failed_resolve(p: &mut Project, deferred: Deferred, reason: &str, now_ms: u64, ctx: &mut Ctx) {
+    trace(p, now_ms, "gate", format!("auto-resolve failed: {}", trace_preview(reason, 60)), ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: auto-resolution could not finish ({}); proceeding anyway — ultra-automatic mode never stalls.",
+            p.id.0, reason
+        ),
+        ctx,
+    );
+    finalize_trdcrd_if_needed(p, deferred, now_ms, ctx);
+    run_gate_cleared(p, deferred, now_ms, ctx);
 }
 
-/// Autonomous auto-resolution round cap (autonomous-safeguard pivot). After this many auto-
-/// resolution rounds on ONE doc capture, the pipeline PROCEEDS with the undecided items documented
-/// in the doc rather than looping forever — ultra-automatic mode never stalls on paperwork. Reset
-/// per fresh doc capture (`Project.assumption_rounds = 0`).
-const AUTO_ROUND_CAP: u32 = 2;
-
-/// Route a dirty AssumeCheck verdict (non-empty flagged items) per `assumption_mode`
-/// (autonomous-safeguard pivot 2026-07-15):
-///   - `ask` -> freeze on ALL material items (tags stripped) — the original behavior.
-///   - `auto` + ANY `[critical]` item -> freeze on the CRITICAL items ONLY (auto items are dropped
-///     this round; the user's approval/answers cover them, or a later re-check auto-resolves them).
-///   - `auto`, all `[auto]` -> resolve them autonomously (bounded by `AUTO_ROUND_CAP`), leaving NO
-///     disk waiting-state so the panel shows ACTIVITY, not attention, and the pipeline never stalls.
-fn handle_assumptions(
-    p: &mut Project,
-    deferred: Deferred,
-    doc_label: &str,
-    items: Vec<String>,
-    now_ms: u64,
-    ctx: &mut Ctx,
-) {
-    // Partition + strip criticality tags. Untagged items are auto (report::classify_assumption).
-    let mut critical: Vec<String> = Vec::new();
-    let mut auto: Vec<String> = Vec::new();
-    for item in &items {
+/// Partition flagged items into (critical, auto), stripping the `[critical]`/`[auto]` tags. Bare
+/// tags with no item text are dropped.
+fn partition_assumptions(items: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut critical = Vec::new();
+    let mut auto = Vec::new();
+    for item in items {
         let c = report::classify_assumption(item);
         if c.text.is_empty() {
-            continue; // a bare tag with no item text -> nothing to flag
+            continue;
         }
         if c.critical {
             critical.push(c.text);
@@ -1031,100 +1378,74 @@ fn handle_assumptions(
             auto.push(c.text);
         }
     }
+    (critical, auto)
+}
 
-    // 'ask' mode: freeze on EVERY material item exactly like before the pivot (tags stripped for a
-    // clean display; critical-first only affects ordering).
-    if p.config.assumption_mode == "ask" {
-        let mut all = critical;
-        all.extend(auto);
-        if all.is_empty() {
-            // Every item was a bare tag -> nothing actionable; clear + proceed.
-            p.pending_assumptions.clear();
-            run_deferred(p, deferred, now_ms, ctx);
-            return;
+/// Apply the gate's revised fenced document(s) to the project (design-speedup gate revision). For
+/// each tag in the doc-set, capture its fence and overwrite the matching doc if it changed. Returns
+/// whether anything actually changed (drives the research restart + trace).
+fn apply_revised_docs(p: &mut Project, tags: &[&str], text: &str) -> bool {
+    let mut changed = false;
+    // The combined TRD+CRD set needs the two-doc splitter so the first fence does not swallow the
+    // second (extract_fenced is greedy by design); the PRD set is a single fence.
+    if tags == TRDCRD_TAGS {
+        let (trd, crd) = office::extract_trd_crd(text);
+        if let Some(d) = trd {
+            if p.trd_markdown != d {
+                p.trd_markdown = d;
+                changed = true;
+            }
         }
-        freeze_pending(p, doc_label, all, now_ms, ctx);
-        return;
+        if let Some(d) = crd {
+            if p.crd_markdown != d {
+                p.crd_markdown = d;
+                changed = true;
+            }
+        }
+        return changed;
     }
-
-    // 'auto' mode. Any critical item stops for the human — but ONLY the critical ones.
-    if !critical.is_empty() {
-        freeze_critical(p, doc_label, critical, now_ms, ctx);
-        return;
+    for tag in tags {
+        if let Some(doc) = office::extract_fenced(text, tag) {
+            match *tag {
+                "prd" if p.prd_markdown != doc => {
+                    p.prd_markdown = doc;
+                    changed = true;
+                }
+                "trd" if p.trd_markdown != doc => {
+                    p.trd_markdown = doc;
+                    changed = true;
+                }
+                "crd" if p.crd_markdown != doc => {
+                    p.crd_markdown = doc;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
     }
-
-    // All non-critical (or nothing usable) -> autonomous resolution.
-    if auto.is_empty() {
-        // Defensive: a dirty verdict with no usable items -> nothing to resolve; clear + proceed.
-        p.pending_assumptions.clear();
-        run_deferred(p, deferred, now_ms, ctx);
-        return;
-    }
-
-    if p.assumption_rounds >= AUTO_ROUND_CAP {
-        proceed_with_undecided(p, deferred, auto.len(), now_ms, ctx);
-        return;
-    }
-
-    // Kick off one autonomous resolution round. Pending stays EMPTY on disk (no waiting-state): the
-    // in-flight AssumeResolve invoke — then the follow-up AssumeCheck it re-runs — IS the live
-    // signal, surfaced as ACTIVITY ("resolving assumptions"), never as attention. The office decides
-    // each item itself; its revised doc re-runs the gate.
-    p.assumption_rounds += 1;
-    p.pending_assumptions.clear();
-    let n = auto.len();
-    trace(
-        p,
-        now_ms,
-        "gate",
-        format!("{doc_label} resolving {n} auto assumption(s) (round {}/{})", p.assumption_rounds, AUTO_ROUND_CAP),
-        ctx,
-    );
-    queue_notice(
-        p,
-        now_ms,
-        format!(
-            "office[{}]: {} has {} non-critical assumption{} — resolving {} autonomously (round {}/{}).",
-            p.id.0,
-            doc_label,
-            n,
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "it" } else { "them" },
-            p.assumption_rounds,
-            AUTO_ROUND_CAP
-        ),
-        ctx,
-    );
-    let body = doc_body_for(p, doc_label);
-    let (system, prompt) = office::build_assume_resolve_prompt(p, doc_label, &body, &auto);
-    emit_invoke(ctx, InvokePurpose::AssumeResolve, &p.config.office_role, system, prompt);
+    changed
 }
 
-/// 'ask'-mode freeze: store EVERY material item as pending and notice the user with the original
-/// call-to-action text (kept verbatim so the freeze contract is unchanged for the 'ask' path).
-fn freeze_pending(p: &mut Project, doc_label: &str, items: Vec<String>, now_ms: u64, ctx: &mut Ctx) {
-    let preview = clip_assumptions(&items);
-    let n = items.len();
-    queue_notice(
-        p,
-        now_ms,
-        format!(
-            "office[{}]: {} drafted but contains {} unapproved assumption{}: {} — approve them, answer in chat, or say 'you decide'.",
-            p.id.0,
-            doc_label,
-            n,
-            if n == 1 { "" } else { "s" },
-            preview
-        ),
-        ctx,
-    );
-    p.pending_assumptions = items;
-    trace(p, now_ms, "gate", format!("{doc_label} STOPPED (ask) — {n} assumption(s) flagged"), ctx);
-    // STOP: the doc is stored/visible; the user must act before the pipeline proceeds.
+/// Append safeguard-flagged assumptions to the project's disclosed-assumptions audit trail (tags
+/// stripped), capped to the most recent [`SELF_RESOLVED_CAP`] entries so a long drafting session can
+/// never balloon the state file. Shared by the approval race-belt and the verify-disclose path.
+fn record_self_resolved(p: &mut Project, items: &[String]) {
+    const SELF_RESOLVED_CAP: usize = 100;
+    for item in items {
+        let t = report::classify_assumption(item).text;
+        if !t.is_empty() {
+            p.self_resolved_assumptions.push(t);
+        }
+    }
+    let len = p.self_resolved_assumptions.len();
+    if len > SELF_RESOLVED_CAP {
+        p.self_resolved_assumptions.drain(0..len - SELF_RESOLVED_CAP);
+    }
 }
 
-/// 'auto'-mode critical freeze: store ONLY the critical items as pending and notice the user that
-/// these specific decisions need a human before anything happens.
+/// A critical freeze: store ONLY the critical items as pending and notice the user that these
+/// specific decisions need a human before anything happens. Both modes route here for critical items
+/// (`ask` still stops on critical; `auto` freezes only the critical ones).
 fn freeze_critical(p: &mut Project, doc_label: &str, critical: Vec<String>, now_ms: u64, ctx: &mut Ctx) {
     let preview = clip_assumptions(&critical);
     let n = critical.len();
@@ -1143,103 +1464,6 @@ fn freeze_critical(p: &mut Project, doc_label: &str, critical: Vec<String>, now_
     );
     p.pending_assumptions = critical;
     trace(p, now_ms, "gate", format!("{doc_label} STOPPED (critical) — {n} assumption(s) flagged"), ctx);
-}
-
-/// The round cap was hit: proceed with the deferred stage anyway, disclosing that N assumptions were
-/// left undecided (they remain documented in the doc). Ultra-automatic mode never stalls on paperwork.
-fn proceed_with_undecided(p: &mut Project, deferred: Deferred, n: usize, now_ms: u64, ctx: &mut Ctx) {
-    p.pending_assumptions.clear();
-    trace(p, now_ms, "gate", format!("round cap hit — proceeding with {n} undecided assumption(s)"), ctx);
-    queue_notice(
-        p,
-        now_ms,
-        format!(
-            "office[{}]: proceeding with {} undecided assumption{} (documented in the doc) — ultra-automatic mode never stalls on paperwork.",
-            p.id.0,
-            n,
-            if n == 1 { "" } else { "s" }
-        ),
-        ctx,
-    );
-    run_deferred(p, deferred, now_ms, ctx);
-}
-
-/// The autonomous resolution invoke returned (autonomous-safeguard pivot). `Ok` carrying the doc's
-/// fence -> update that doc and RE-RUN its AssumeCheck gate on the revised body (which re-partitions:
-/// a clean verdict resumes the deferred stage, still-dirty auto items spend the next round, and the
-/// round cap eventually proceeds anyway). A missing fence or any `Err` PROCEEDS with the deferred
-/// stage + a disclosure notice — a flaky resolver never wedges Drafting. The doc under resolution is
-/// recovered from pure state (`newest_gated_doc`), stable because no other doc can be captured while
-/// this invoke is in flight — so a single `AssumeResolve` variant (no per-doc payload) suffices.
-fn handle_assume_resolve_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
-    let (purpose, label, _old_body, deferred) = match newest_gated_doc(p) {
-        Some(x) => x,
-        None => {
-            // No doc to resolve against (should not happen mid-resolve); a later capture re-drives.
-            ctx.dirty = true;
-            return;
-        }
-    };
-    match outcome {
-        Ok(text) => {
-            let tag = label.to_ascii_lowercase();
-            match office::extract_fenced(&text, &tag) {
-                Some(revised) => {
-                    set_doc_body(p, label, revised.clone());
-                    trace(p, now_ms, "capture", format!("{label} revised by auto-resolve ({} bytes)", revised.len()), ctx);
-                    // Re-run the SAME gate on the revised doc (re-partition + re-check). Does NOT
-                    // reset assumption_rounds — this is a resolution capture, not a fresh doc.
-                    gate_doc(p, purpose, label, &revised, deferred, now_ms, ctx);
-                }
-                None => proceed_after_failed_resolve(
-                    p,
-                    deferred,
-                    "the resolver returned no revised document",
-                    now_ms,
-                    ctx,
-                ),
-            }
-        }
-        Err(e) => proceed_after_failed_resolve(p, deferred, &e, now_ms, ctx),
-    }
-    ctx.dirty = true;
-}
-
-/// Auto-resolution could not finish (invoke `Err` or a missing fence): clear any pending, disclose,
-/// and proceed with the deferred stage. Never wedges.
-fn proceed_after_failed_resolve(p: &mut Project, deferred: Deferred, reason: &str, now_ms: u64, ctx: &mut Ctx) {
-    p.pending_assumptions.clear();
-    trace(p, now_ms, "gate", format!("auto-resolve failed: {}", trace_preview(reason, 60)), ctx);
-    queue_notice(
-        p,
-        now_ms,
-        format!(
-            "office[{}]: auto-resolution could not finish ({}); proceeding anyway — ultra-automatic mode never stalls.",
-            p.id.0, reason
-        ),
-        ctx,
-    );
-    run_deferred(p, deferred, now_ms, ctx);
-}
-
-/// A clone of the drafting doc named by `doc_label` ("PRD"/"TRD"/"CRD"), for building the resolution
-/// prompt. Mirrors `newest_gated_doc`'s doc identity but keyed by the label already in hand.
-fn doc_body_for(p: &Project, doc_label: &str) -> String {
-    match doc_label {
-        "CRD" => p.crd_markdown.clone(),
-        "TRD" => p.trd_markdown.clone(),
-        _ => p.prd_markdown.clone(),
-    }
-}
-
-/// Overwrite the drafting doc named by `doc_label` with the resolver's revised body. Does NOT touch
-/// `assumption_rounds` (a resolution capture is not a fresh capture).
-fn set_doc_body(p: &mut Project, doc_label: &str, body: String) {
-    match doc_label {
-        "CRD" => p.crd_markdown = body,
-        "TRD" => p.trd_markdown = body,
-        _ => p.prd_markdown = body,
-    }
 }
 
 /// Clip the assumption list to a short, single-line preview for a chat notice (the full list is
@@ -1325,51 +1549,55 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             // replies are clipped for the notice — the full text is always in the
             // panel transcript.
             //
-            // Drafting doc captures (6.2 / 6.2b / 6.2c): a ```prd / ```trd / ```crd fence in a
-            // Drafting reply IS that doc. Land it, then run the safeguard gate (feature C) whose
-            // clean verdict PROCEEDS to that doc's pipeline stage — PRD -> research, TRD -> CRD,
-            // CRD -> breakdown. Without capture the persona chats forever while the board stays
-            // empty (live-test 2026-07-15). A re-emitted fence after a stopped gate re-runs the
-            // check; a fenceless reply while `pending_assumptions` is set ALSO re-runs the gate on
-            // the newest captured doc (recheck_pending_assumptions) so the updated transcript is
-            // re-judged (kernel.rs pipeline resume rule).
+            // Drafting doc captures (design-speedup): a ```prd fence in a Drafting reply IS the PRD.
+            // Land it, then start research IN PARALLEL (item 2, per `research_mode`) and run the PRD
+            // safeguard gate at the SAME time; the TRD+CRD authoring join fires once both settle.
+            // A chat-authored ```trd/```crd (a user pasting a revised doc) captures whichever is
+            // present and runs the combined TRD+CRD gate. Without capture the persona chats forever
+            // while the board stays empty (live-test 2026-07-15). A fenceless reply while
+            // `pending_assumptions` is set re-runs the gate on the newest doc-set so the updated
+            // transcript is re-judged.
             if matches!(p.phase, ProjectPhase::Drafting) {
                 if let Some(prd) = office::extract_prd(&reply) {
                     p.prd_markdown = prd;
                     p.capture_nudge_count = 0; // a successful capture resets the nudge cap
-                    p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
+                    p.gate_cleared = false; // fresh doc-set: the PRD gate has not cleared yet
                     trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
                     queue_notice(
                         p,
                         now_ms,
                         format!(
-                            "office[{}]: PRD drafted (full text in the Workflow panel) — checking assumptions before I research the stack. I will report as the board fills in; do not authorize yet.",
+                            "office[{}]: PRD drafted (full text in the Workflow panel) — researching the stack and checking assumptions in parallel; do not authorize yet.",
                             p.id.0
                         ),
                         ctx,
                     );
-                    let body = p.prd_markdown.clone();
-                    gate_doc(p, InvokePurpose::AssumeCheckPrd, "PRD", &body, Deferred::Research, now_ms, ctx);
+                    // Item 2/4: spawn research now (or defer/skip per research_mode), concurrently
+                    // with the PRD gate below.
+                    start_research_at_capture(p, now_ms, ctx);
+                    gate_doc(p, Deferred::PostPrd, now_ms, ctx);
                     ctx.dirty = true;
                     return;
                 }
-                if let Some(trd) = office::extract_fenced(&reply, "trd") {
-                    p.trd_markdown = trd;
-                    p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
-                    trace(p, now_ms, "capture", format!("TRD captured via chat ({} bytes)", p.trd_markdown.len()), ctx);
-                    queue_notice(p, now_ms, format!("office[{}]: TRD updated (panel).", p.id.0), ctx);
-                    let body = p.trd_markdown.clone();
-                    gate_doc(p, InvokePurpose::AssumeCheckTrd, "TRD", &body, Deferred::Crd, now_ms, ctx);
-                    ctx.dirty = true;
-                    return;
-                }
-                if let Some(crd) = office::extract_fenced(&reply, "crd") {
-                    p.crd_markdown = crd;
-                    p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
-                    trace(p, now_ms, "capture", format!("CRD captured via chat ({} bytes)", p.crd_markdown.len()), ctx);
-                    queue_notice(p, now_ms, format!("office[{}]: CRD updated (panel).", p.id.0), ctx);
-                    let body = p.crd_markdown.clone();
-                    gate_doc(p, InvokePurpose::AssumeCheckCrd, "CRD", &body, Deferred::Breakdown, now_ms, ctx);
+                let (chat_trd, chat_crd) = office::extract_trd_crd(&reply);
+                if chat_trd.is_some() || chat_crd.is_some() {
+                    reset_trdcrd_capture(p, now_ms, ctx);
+                    p.capture_nudge_count = 0;
+                    if let Some(t) = chat_trd {
+                        p.trd_markdown = t;
+                    }
+                    if let Some(c) = chat_crd {
+                        p.crd_markdown = c;
+                    }
+                    trace(
+                        p,
+                        now_ms,
+                        "capture",
+                        format!("TRD+CRD captured via chat (trd {}B, crd {}B)", p.trd_markdown.len(), p.crd_markdown.len()),
+                        ctx,
+                    );
+                    queue_notice(p, now_ms, format!("office[{}]: TRD + clean-build requirements updated (panel).", p.id.0), ctx);
+                    gate_doc(p, Deferred::Breakdown, now_ms, ctx);
                     ctx.dirty = true;
                     return;
                 }
@@ -1425,7 +1653,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 trace(p, now_ms, "nudge", format!("PRD capture-miss nudge #{}", p.capture_nudge_count), ctx);
                 let (mut system, prompt) = office::build_invoke(p, "");
                 system.push_str(PRD_NUDGE_INSTRUCTION);
-                emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
+                emit_draft_invoke(p, ctx, InvokePurpose::Persona, system, prompt);
                 ctx.dirty = true;
                 return;
             }
@@ -1442,23 +1670,20 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             // Fold done (or failed): re-issue the persona invoke. build_invoke hard-caps
             // the prompt, so proceeding un-folded on a fold failure is still safe.
             let (system, prompt) = office::build_invoke(p, "");
-            emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
+            emit_draft_invoke(p, ctx, InvokePurpose::Persona, system, prompt);
         }
         InvokePurpose::Breakdown => handle_breakdown_result(p, outcome, now_ms, ctx),
         InvokePurpose::BreakdownReask => handle_breakdown_reask_result(p, outcome, now_ms, ctx),
         InvokePurpose::BreakdownCompact => handle_breakdown_compact_result(p, outcome, now_ms, ctx),
-        InvokePurpose::Trd => handle_trd_result(p, outcome, now_ms, ctx),
-        InvokePurpose::Crd => handle_crd_result(p, outcome, now_ms, ctx),
+        InvokePurpose::TrdCrd => handle_trdcrd_result(p, outcome, now_ms, ctx),
         InvokePurpose::AssumeCheckPrd => {
-            handle_assume_check_result(p, Deferred::Research, "PRD", outcome, now_ms, ctx)
+            handle_assume_check_result(p, Deferred::PostPrd, "PRD", PRD_TAGS, outcome, now_ms, ctx)
         }
-        InvokePurpose::AssumeCheckTrd => {
-            handle_assume_check_result(p, Deferred::Crd, "TRD", outcome, now_ms, ctx)
-        }
-        InvokePurpose::AssumeCheckCrd => {
-            handle_assume_check_result(p, Deferred::Breakdown, "CRD", outcome, now_ms, ctx)
+        InvokePurpose::AssumeCheckTrdCrd => {
+            handle_assume_check_result(p, Deferred::Breakdown, "TRD+CRD", TRDCRD_TAGS, outcome, now_ms, ctx)
         }
         InvokePurpose::AssumeResolve => handle_assume_resolve_result(p, outcome, now_ms, ctx),
+        InvokePurpose::AssumeVerify => handle_assume_verify_result(p, outcome, now_ms, ctx),
     }
 }
 
@@ -1485,7 +1710,7 @@ fn handle_breakdown_result(p: &mut Project, outcome: Result<String, String>, now
         }
     };
     match office::parse_breakdown(&text) {
-        Ok(breakdown) => land_breakdown(p, breakdown, now_ms, ctx),
+        Ok(breakdown) => apply_or_stash_breakdown(p, breakdown, text, now_ms, ctx),
         Err(e) => {
             let (system, prompt) = office::build_breakdown_prompt(p, Some(&format!("{e:?}")), false);
             emit_invoke(ctx, InvokePurpose::BreakdownReask, &p.config.office_role, system, prompt);
@@ -1508,7 +1733,7 @@ fn handle_breakdown_reask_result(p: &mut Project, outcome: Result<String, String
         }
     };
     match office::parse_breakdown(&text) {
-        Ok(breakdown) => land_breakdown(p, breakdown, now_ms, ctx),
+        Ok(breakdown) => apply_or_stash_breakdown(p, breakdown, text, now_ms, ctx),
         Err(e) => {
             queue_notice(
                 p,
@@ -1536,13 +1761,35 @@ fn handle_breakdown_compact_result(p: &mut Project, outcome: Result<String, Stri
         }
     };
     match office::parse_breakdown(&text) {
-        Ok(breakdown) => land_breakdown(p, breakdown, now_ms, ctx),
+        Ok(breakdown) => apply_or_stash_breakdown(p, breakdown, text, now_ms, ctx),
         Err(e) => surface_compact_breakdown_failure(
             p,
             now_ms,
             format!("office breakdown (compact retry) rejected: {e:?}"),
             ctx,
         ),
+    }
+}
+
+/// Route a validated breakdown by phase (design-speedup item 8). In Drafting the breakdown was
+/// computed EARLY (parallel with the TRD+CRD gate verify): STASH its raw validated text and let the
+/// JOIN (`maybe_apply_breakdown`) build the board once the gate clears. In Ready (a manual
+/// `workflow_breakdown` re-plan) apply it immediately, replacing the board. `text` is the raw model
+/// output that just validated, re-parsed at apply time.
+fn apply_or_stash_breakdown(
+    p: &mut Project,
+    breakdown: office::Breakdown,
+    text: String,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    if matches!(p.phase, ProjectPhase::Drafting) {
+        p.pending_breakdown = Some(text);
+        trace(p, now_ms, "breakdown", "breakdown stashed (early)", ctx);
+        maybe_apply_breakdown(p, now_ms, ctx);
+        ctx.dirty = true;
+    } else {
+        land_breakdown(p, breakdown, now_ms, ctx);
     }
 }
 
@@ -1596,14 +1843,31 @@ fn is_breakdown_timeout(err: &str) -> bool {
     err.contains("timed out") || err.contains("timeout")
 }
 
-/// Emit an `InvokeModel` effect. `req_id` is a placeholder (0) — the driver mints the
-/// real id when it hands the job to the off-loop invoke pool (5.1); the kernel matches
-/// results by `purpose`, not id.
+/// Emit an `InvokeModel` effect (no model override — resolve the role's model). `req_id` is a
+/// placeholder (0) — the driver mints the real id when it hands the job to the off-loop invoke pool
+/// (5.1); the kernel matches results by `purpose`, not id.
 fn emit_invoke(ctx: &mut Ctx, purpose: InvokePurpose, role: &str, system: String, prompt: String) {
     ctx.fx.push(Effect::InvokeModel {
         req_id: 0,
         purpose,
         role: role.to_string(),
+        model: None,
+        system,
+        prompt,
+        format: invoke_format(purpose),
+    });
+}
+
+/// Emit a DOC-DRAFTING invoke (design-speedup item 4): the persona reply, the TRD+CRD authoring,
+/// and the ask-mode auto-resolve rewrite. Runs on the `office_role`, but carries `drafter_model` as
+/// the model override when the project set one (mirroring `worker_model`/`reviewer_model` on spawns).
+/// The gate/safeguard checks keep using their roles with no override, so they stay on the fast model.
+fn emit_draft_invoke(p: &Project, ctx: &mut Ctx, purpose: InvokePurpose, system: String, prompt: String) {
+    ctx.fx.push(Effect::InvokeModel {
+        req_id: 0,
+        purpose,
+        role: p.config.office_role.clone(),
+        model: p.config.drafter_model.clone(),
         system,
         prompt,
         format: invoke_format(purpose),
@@ -1625,14 +1889,13 @@ fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
             Some("json")
         }
         InvokePurpose::Persona
-        | InvokePurpose::Trd
-        | InvokePurpose::Crd
+        | InvokePurpose::TrdCrd
         | InvokePurpose::Fold
         | InvokePurpose::AssumeCheckPrd
-        | InvokePurpose::AssumeCheckTrd
-        | InvokePurpose::AssumeCheckCrd
-        // AssumeResolve re-emits a fenced markdown doc (prose), never JSON — same as Trd/Crd.
-        | InvokePurpose::AssumeResolve => None,
+        | InvokePurpose::AssumeCheckTrdCrd
+        // AssumeResolve / AssumeVerify re-emit / report prose text blocks, never JSON.
+        | InvokePurpose::AssumeResolve
+        | InvokePurpose::AssumeVerify => None,
     }
 }
 

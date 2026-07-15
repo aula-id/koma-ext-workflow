@@ -36,6 +36,8 @@ fn project(phase: ProjectPhase) -> Project {
         outbox: vec![],
         trace: vec![],
         interrupted_from: None,
+        gate_cleared: false,
+        pending_breakdown: None,
         seq: 1,
     }
 }
@@ -357,24 +359,50 @@ fn extract_fenced_tolerates_trailing_text_after_the_tag() {
 }
 
 #[test]
-fn build_trd_prompt_folds_prd_and_research_notes_with_the_trd_contract() {
+fn build_trdcrd_prompt_folds_prd_and_research_and_asks_for_both_fences() {
+    // ADAPTED (design-speedup item 3): the old separate build_trd_prompt/build_crd_prompt are now
+    // ONE combined authoring invoke that must emit BOTH ```trd and ```crd.
     let mut p = project(ProjectPhase::Drafting);
     p.prd_markdown = "# PRD\nCrawler.".to_string();
     p.research_notes = "use reqwest 0.12".to_string();
-    let (system, prompt) = office::build_trd_prompt(&p);
+    let (system, prompt) = office::build_trdcrd_prompt(&p);
     assert!(system.contains("front office"));
     assert!(prompt.contains("Crawler"), "PRD is included");
     assert!(prompt.contains("reqwest 0.12"), "research notes are included when present");
     assert!(prompt.contains("```trd"), "the ```trd capture contract is stated");
+    assert!(prompt.contains("```crd"), "the ```crd capture contract is stated");
+    assert!(prompt.contains("SUM TO EXACTLY 100"), "the CRD rubric contract is stated");
     assert!(prompt.len() <= office::HARD_PROMPT_CAP);
 }
 
 #[test]
-fn build_trd_prompt_omits_the_research_section_when_notes_are_empty() {
+fn build_trdcrd_prompt_omits_the_research_section_when_notes_are_empty() {
     let mut p = project(ProjectPhase::Drafting);
     p.prd_markdown = "# PRD".to_string();
-    let (_system, prompt) = office::build_trd_prompt(&p);
+    let (_system, prompt) = office::build_trdcrd_prompt(&p);
     assert!(!prompt.contains("RESEARCH FINDINGS"), "no research section without notes");
+}
+
+#[test]
+fn every_doc_drafting_prompt_ends_with_an_explicit_fence_reminder() {
+    // NEW (design-speedup item 1: fence hardening). Recency compliance — the LAST thing the model
+    // reads on a doc-drafting prompt is the exact required fence wrapper.
+    let mut p = project(ProjectPhase::Drafting);
+    p.prd_markdown = "# PRD".to_string();
+    let (_s1, prd) = office::build_invoke(&p, "write the PRD");
+    assert!(prd.contains("Reminder: your reply MUST END"), "PRD prompt carries the fence reminder");
+    assert!(prd.trim_end().ends_with("```"), "PRD prompt ends on the fence wrapper");
+    assert!(prd.contains("```prd"), "PRD reminder names the ```prd tag");
+
+    let (_s2, trdcrd) = office::build_trdcrd_prompt(&p);
+    assert!(trdcrd.contains("Reminder: your reply MUST END"), "TRD+CRD prompt carries the fence reminder");
+    // Both fence tags appear in the trailing reminder.
+    let reminder = &trdcrd[trdcrd.rfind("Reminder:").unwrap()..];
+    assert!(reminder.contains("```trd") && reminder.contains("```crd"), "reminder names both tags");
+
+    // The ask-mode auto-resolve rewrite is a revision invoke and also ends with the reminder.
+    let (_s3, resolve) = office::build_assume_resolve_prompt(&p, "PRD", "# PRD", &["x".to_string()], &["prd"]);
+    assert!(resolve.contains("Reminder: your reply MUST END"), "resolve prompt carries the fence reminder");
 }
 
 #[test]
@@ -406,39 +434,26 @@ fn build_breakdown_prompt_folds_the_trd_when_present() {
     assert!(compact.contains("COMPACT MODE"));
 }
 
-// ---- CRD + safeguard prompt builders (6.2c) ----
+// ---- combined TRD+CRD body + one-shot safeguard gate builders (design-speedup) ----
 
 #[test]
-fn build_crd_prompt_folds_prd_and_trd_with_the_crd_contract_and_rubric() {
+fn trdcrd_body_labels_both_docs() {
+    // NEW: the combined doc-set body the single TRD+CRD gate operates on.
     let mut p = project(ProjectPhase::Drafting);
-    p.prd_markdown = "# PRD\nCrawler.".to_string();
-    p.trd_markdown = "# TRD\nUse axum 0.7".to_string();
-    let (system, prompt) = office::build_crd_prompt(&p);
-    assert!(system.contains("front office"));
-    assert!(prompt.contains("Crawler"), "PRD is folded in");
-    assert!(prompt.contains("axum 0.7"), "TRD is folded in when present");
-    assert!(prompt.contains("```crd"), "the ```crd capture contract is stated");
-    assert!(prompt.contains("rubric") || prompt.contains("Grading rubric"), "asks for a grading rubric");
-    assert!(prompt.contains("SUM TO EXACTLY 100"), "rubric weights must total 100");
-    assert!(prompt.len() <= office::HARD_PROMPT_CAP);
-}
-
-#[test]
-fn build_crd_prompt_omits_trd_section_when_absent() {
-    let mut p = project(ProjectPhase::Drafting);
-    p.prd_markdown = "# PRD".to_string();
-    let (_s, prompt) = office::build_crd_prompt(&p);
-    assert!(!prompt.contains("TRD (technical requirements"), "no TRD section without a TRD");
+    p.trd_markdown = "# TRD\naxum 0.7".to_string();
+    p.crd_markdown = "# CRD\nREADME present".to_string();
+    let body = office::trdcrd_body(&p);
+    assert!(body.contains("Technical Requirements Document") && body.contains("axum 0.7"));
+    assert!(body.contains("Clean-build Requirement Document") && body.contains("README present"));
 }
 
 #[test]
 fn no_assume_clause_is_on_every_doc_contract() {
+    // ADAPTED: the TRD and CRD contracts now live in the ONE combined authoring prompt.
     let p = project(ProjectPhase::Drafting);
-    // The PRD persona contract, the TRD prompt, and the CRD prompt all carry the no-assume gate.
     let (_s1, prd_prompt) = office::build_invoke(&p, "write the PRD");
-    let (_s2, trd_prompt) = office::build_trd_prompt(&p);
-    let (_s3, crd_prompt) = office::build_crd_prompt(&p);
-    for prompt in [&prd_prompt, &trd_prompt, &crd_prompt] {
+    let (_s2, trdcrd_prompt) = office::build_trdcrd_prompt(&p);
+    for prompt in [&prd_prompt, &trdcrd_prompt] {
         assert!(prompt.contains("Do NOT assume"), "no-assume clause present");
         assert!(prompt.contains("Open questions"), "ungrounded choices routed to Open questions");
         assert!(prompt.contains("Delegated decision"), "delegated choices are recorded, not assumed");
@@ -447,13 +462,16 @@ fn no_assume_clause_is_on_every_doc_contract() {
 
 #[test]
 fn build_assume_check_prompt_uses_only_user_turns_and_states_the_block() {
+    // ADAPTED (design-speedup one-shot gate): the enumerate builder now takes tags + resolve_inline
+    // + ask_wellknown. Plain enumerate (no inline resolve, no well-known) here.
     let mut p = project(ProjectPhase::Drafting);
     p.office_transcript = vec![
         turn(ChatAuthor::User, "build a todo app"),
         turn(ChatAuthor::Office, "I assumed you want Postgres"),
     ];
     p.research_notes = "reqwest 0.12 is current".to_string();
-    let (system, prompt) = office::build_assume_check_prompt(&p, "PRD", "# PRD\nUses Postgres.");
+    let (system, prompt) =
+        office::build_assume_check_prompt(&p, "PRD", "# PRD\nUses Postgres.", &["prd"], false, false);
     assert!(system.contains("safeguard"), "system frames the safeguard role");
     assert!(prompt.contains("build a todo app"), "the user's own turn is ground truth");
     assert!(!prompt.contains("I assumed you want Postgres"), "the office's own reply is NOT ground truth");
@@ -461,5 +479,43 @@ fn build_assume_check_prompt_uses_only_user_turns_and_states_the_block() {
     assert!(prompt.contains("PRD UNDER REVIEW"), "the doc under review is labelled");
     assert!(prompt.contains("ASSUME-CHECK"), "the output block contract is stated");
     assert!(prompt.contains("verdict: clean | assumptions"));
+    assert!(!prompt.contains("well-known:"), "no well-known line unless ask_wellknown");
+    assert!(!prompt.contains("re-emit the COMPLETE revised"), "no inline-resolve unless resolve_inline");
     assert!(prompt.len() <= office::HARD_PROMPT_CAP);
+}
+
+#[test]
+fn build_assume_check_prompt_auto_mode_folds_resolve_and_well_known() {
+    // NEW (design-speedup item 4 + amendment A): the compressed auto-mode PRD enumerate asks for
+    // BOTH the inline resolve (revised fences) AND the well-known boolean in one invoke.
+    let mut p = project(ProjectPhase::Drafting);
+    p.prd_markdown = "# PRD".to_string();
+    let (_system, prompt) =
+        office::build_assume_check_prompt(&p, "PRD", "# PRD", &["prd"], true, true);
+    assert!(prompt.contains("re-emit the COMPLETE revised"), "inline resolve instruction present");
+    assert!(prompt.contains("```prd"), "the revised fence tag is named for re-emission");
+    assert!(prompt.contains("well-known:"), "the well-known boolean is requested");
+}
+
+#[test]
+fn build_assume_verify_prompt_reports_only_no_rewrite() {
+    // NEW (design-speedup item 5c): the final verify pass may only clear or DISCLOSE — never rewrite.
+    let mut p = project(ProjectPhase::Drafting);
+    p.trd_markdown = "# TRD".to_string();
+    let body = office::trdcrd_body(&p);
+    let (system, prompt) = office::build_assume_verify_prompt(&p, "TRD+CRD", &body);
+    assert!(system.contains("VERIFY"), "system frames the verify-only role");
+    assert!(prompt.contains("ASSUME-CHECK"), "reuses the ASSUME-CHECK block");
+    assert!(prompt.contains("no rewrite") || prompt.contains("no fenced document"), "forbids a rewrite");
+    assert!(!prompt.contains("re-emit the COMPLETE revised"), "verify never resolves");
+}
+
+#[test]
+fn parse_well_known_reads_yes_no_and_defaults_none() {
+    // NEW (design-speedup item 4): the research-decision boolean parser is tolerant.
+    assert_eq!(office::parse_well_known("ASSUME-CHECK\nverdict: clean\nwell-known: yes\n"), Some(true));
+    assert_eq!(office::parse_well_known("well-known: no"), Some(false));
+    assert_eq!(office::parse_well_known("Well-Known: YES please"), Some(true));
+    assert_eq!(office::parse_well_known("- well-known: false"), Some(false));
+    assert_eq!(office::parse_well_known("verdict: clean\n"), None, "absent -> None (run research)");
 }

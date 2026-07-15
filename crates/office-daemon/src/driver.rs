@@ -157,6 +157,9 @@ pub struct InvokeJob {
     /// What the kernel should do with the result (echoed into `kernel::Command::InvokeResult`).
     pub purpose: InvokePurpose,
     pub role: String,
+    /// Optional `models.invoke` `model` override (design-speedup item 4, `drafter_model`), forwarded
+    /// as the `model` param when `Some`. `None` = resolve the role's model, as before.
+    pub model: Option<String>,
     pub system: String,
     pub prompt: String,
     /// Whether the one timeout retry has already been spent (5.1 / 6.2).
@@ -205,6 +208,13 @@ impl Invoker for ThreadInvoker {
             let mut params = json!({ "prompt": job.prompt });
             if !job.role.is_empty() {
                 params["role"] = json!(job.role);
+            }
+            // design-speedup item 4: a doc-drafting invoke may carry a `drafter_model` override,
+            // forwarded as the `model` param exactly like `worker_model` rides `sessions.spawn_into`.
+            if let Some(m) = &job.model {
+                if !m.is_empty() {
+                    params["model"] = json!(m);
+                }
             }
             if !job.system.is_empty() {
                 params["system"] = json!(job.system);
@@ -453,6 +463,13 @@ impl<H: Host> Driver<H> {
                     self.step(i, kernel::Input::Command(kernel::Command::ApproveAssumptions), now_ms);
                 }
             }
+            // User-driven skip-research (design-speedup item 7). Lease-holder only, mirroring
+            // Approve/Breakdown above; a non-holder's skip is dropped.
+            DCmd::Skip { project } => {
+                if let Some(i) = self.owned_project_by_id(&project) {
+                    self.step(i, kernel::Input::Command(kernel::Command::SkipResearch), now_ms);
+                }
+            }
             // An off-loop invoke completed: apply the driver's one retry, else route the
             // outcome into the kernel (5.1 / 6.2).
             DCmd::InvokeDone { req_id, result } => self.on_invoke_done(req_id, result, now_ms),
@@ -475,6 +492,8 @@ impl<H: Host> Driver<H> {
                 crd_pass_grade,
                 assumption_check,
                 assumption_mode,
+                research_mode,
+                drafter_model,
             } => {
                 if let Some(i) = self.owned_project_by_id(&project) {
                     self.step(
@@ -488,6 +507,8 @@ impl<H: Host> Driver<H> {
                             crd_pass_grade,
                             assumption_check,
                             assumption_mode,
+                            research_mode,
+                            drafter_model,
                         }),
                         now_ms,
                     );
@@ -775,11 +796,12 @@ impl<H: Host> Driver<H> {
                 Effect::InvokeModel {
                     purpose,
                     role,
+                    model,
                     system,
                     prompt,
                     format,
                     ..
-                } => self.submit_invoke(idx, purpose, role, system, prompt, format, now_ms),
+                } => self.submit_invoke(idx, purpose, role, model, system, prompt, format, now_ms),
             }
         }
     }
@@ -1069,6 +1091,8 @@ impl<H: Host> Driver<H> {
             outbox: Vec::new(),
             trace: Vec::new(),
             interrupted_from: None,
+            gate_cleared: false,
+            pending_breakdown: None,
             seq: 0,
         };
         if self.store.create_project(&project).is_err() {
@@ -1197,11 +1221,13 @@ impl<H: Host> Driver<H> {
     /// Register a new invoke job and start it if a pool slot is free (else queue it). The
     /// job runs OFF the tick loop, so dispatch/reconcile/heartbeat/panel-reads stay
     /// responsive through the (up to several-minute) PRD/breakdown flow.
+    #[allow(clippy::too_many_arguments)]
     fn submit_invoke(
         &mut self,
         idx: usize,
         purpose: InvokePurpose,
         role: String,
+        model: Option<String>,
         system: String,
         prompt: String,
         format: Option<&'static str>,
@@ -1215,6 +1241,7 @@ impl<H: Host> Driver<H> {
             proj_slug: self.projects[idx].project.id.0.clone(),
             purpose,
             role,
+            model,
             system,
             prompt,
             retried: false,
@@ -1713,14 +1740,13 @@ fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Opti
             InvokePurpose::Persona => "office is replying",
             InvokePurpose::Fold => "summarizing the conversation",
             InvokePurpose::AssumeCheckPrd => "fact-checking the PRD",
-            InvokePurpose::AssumeCheckTrd => "fact-checking the TRD",
-            InvokePurpose::AssumeCheckCrd => "fact-checking the CRD",
-            // Autonomous assumption resolution (autonomous-safeguard pivot): surfaced as ACTIVITY,
-            // never attention — the office is deciding the non-critical assumptions itself. The
-            // docs tab keys the gated doc's 'resolving' card off this exact label.
+            InvokePurpose::AssumeCheckTrdCrd => "fact-checking the TRD + CRD",
+            // Autonomous assumption resolution / final verify (design-speedup one-shot gate):
+            // surfaced as ACTIVITY, never attention — the office is deciding / verifying the
+            // non-critical assumptions itself. The docs tab keys the 'resolving' card off these.
             InvokePurpose::AssumeResolve => "resolving assumptions",
-            InvokePurpose::Trd => "drafting the TRD",
-            InvokePurpose::Crd => "drafting the CRD",
+            InvokePurpose::AssumeVerify => "verifying assumptions",
+            InvokePurpose::TrdCrd => "drafting the TRD + CRD",
             InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {
                 "breaking down the plan"
             }

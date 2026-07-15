@@ -86,6 +86,8 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         outbox: vec![],
         trace: vec![],
         interrupted_from: None,
+        gate_cleared: false,
+        pending_breakdown: None,
         seq: 1,
     }
 }
@@ -450,6 +452,8 @@ fn config_set_applies_partial_update_including_keep_desks() {
             crd_pass_grade: None,
             assumption_check: None,
             assumption_mode: None,
+            research_mode: None,
+            drafter_model: None,
         }),
         2_000,
     );
@@ -482,6 +486,8 @@ fn config_set_max_workers_is_clamped_to_the_project_ceiling() {
             crd_pass_grade: None,
             assumption_check: None,
             assumption_mode: None,
+            research_mode: None,
+            drafter_model: None,
         }),
         2_000,
     );
@@ -507,6 +513,8 @@ fn config_set_on_a_non_owned_project_is_dropped_not_applied() {
             crd_pass_grade: None,
             assumption_check: None,
             assumption_mode: None,
+            research_mode: None,
+            drafter_model: None,
         }),
         2_000,
     );
@@ -733,18 +741,20 @@ fn persona_reply_with_prd_fence_lands_prd_and_kicks_research() {
         Some(b) => assert_eq!(b.ext_agent_id, 700, "the real research agent id is recorded on the project"),
         None => panic!("a research binding must be recorded after the spawn"),
     }
-    // No breakdown or TRD invoke yet — those wait until the researcher finishes.
+    // No breakdown or TRD+CRD invoke yet — the TRD+CRD authoring join waits for research to settle
+    // (design-speedup item 2/3: research runs in parallel with the PRD gate, then the join fires).
     let jobs = fake.jobs.lock().unwrap();
     assert!(
-        jobs.iter().all(|j| j.purpose != InvokePurpose::Breakdown && j.purpose != InvokePurpose::Trd),
-        "breakdown/TRD do not run until after research completes"
+        jobs.iter().all(|j| j.purpose != InvokePurpose::Breakdown && j.purpose != InvokePurpose::TrdCrd),
+        "breakdown/TRD+CRD do not run until after research settles"
     );
 }
 
 #[test]
 fn research_agents_done_fetches_findings_and_drafts_the_trd() {
-    // Full research leg (6.2b): PRD fence -> research spawn (id recorded) -> agents.done ->
-    // agents.result -> findings stored -> TRD invoke submitted off-loop.
+    // Full research leg (design-speedup item 2/3): PRD fence -> research spawn (id recorded, gate
+    // off so the PRD gate clears immediately) -> agents.done -> agents.result -> findings stored ->
+    // the TRD+CRD authoring join fires (research settled + gate cleared) -> combined TrdCrd invoke.
     let (store, _dir) = temp_store();
     let mut host = FakeHost::new();
     host.script("sessions.spawn_into", json!({ "agentId": 700, "status": "spawned" }));
@@ -779,8 +789,8 @@ fn research_agents_done_fetches_findings_and_drafts_the_trd() {
     assert!(a.research.is_none(), "binding cleared after findings land");
     assert_eq!(call_count(&d.host, "agents.result"), 1, "findings fetched via agents.result");
     assert!(
-        fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::Trd && j.proj_slug == "a"),
-        "the TRD invoke is submitted after research completes"
+        fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::TrdCrd && j.proj_slug == "a"),
+        "the combined TRD+CRD invoke is submitted once research settles"
     );
 }
 
@@ -797,6 +807,10 @@ fn reconcile_runtime_ceiling_kills_over_age_researcher_and_degrades() {
     d.set_invoker(Box::new(fake.clone()));
 
     let mut p = drafting("a");
+    p.prd_markdown = "# App".to_string();
+    // design-speedup: the PRD gate has already cleared (research runs in parallel with it), so the
+    // over-age researcher being killed settles the research side of the join and authoring fires.
+    p.gate_cleared = true;
     p.research = Some(AgentBinding {
         ext_agent_id: 700,
         session: "sess-x".to_string(),
@@ -817,8 +831,8 @@ fn reconcile_runtime_ceiling_kills_over_age_researcher_and_degrades() {
     let a = d.project("a").unwrap();
     assert!(a.research.is_none(), "the researcher binding is cleared");
     assert!(
-        fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::Trd),
-        "Drafting degrades to a PRD-only TRD invoke"
+        fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::TrdCrd),
+        "Drafting degrades to a PRD-only TRD+CRD invoke"
     );
 }
 
@@ -833,6 +847,7 @@ fn invoke_job(req_id: u64, proj_slug: &str, purpose: InvokePurpose, submitted_at
         proj_slug: proj_slug.to_string(),
         purpose,
         role: String::new(),
+        model: None,
         system: String::new(),
         prompt: String::new(),
         retried: false,
@@ -862,15 +877,16 @@ fn audit_binding(agent_id: u64, spawned_at_ms: u64) -> AgentBinding {
 
 #[test]
 fn office_activity_labels_every_invoke_purpose() {
+    // design-speedup: the old separate Trd/Crd/AssumeCheckTrd/AssumeCheckCrd purposes are gone,
+    // replaced by the combined TrdCrd + AssumeCheckTrdCrd + the one-shot gate's AssumeVerify.
     let cases: Vec<(InvokePurpose, &str)> = vec![
         (InvokePurpose::Persona, "office is replying"),
         (InvokePurpose::Fold, "summarizing the conversation"),
         (InvokePurpose::AssumeCheckPrd, "fact-checking the PRD"),
-        (InvokePurpose::AssumeCheckTrd, "fact-checking the TRD"),
-        (InvokePurpose::AssumeCheckCrd, "fact-checking the CRD"),
+        (InvokePurpose::AssumeCheckTrdCrd, "fact-checking the TRD + CRD"),
         (InvokePurpose::AssumeResolve, "resolving assumptions"),
-        (InvokePurpose::Trd, "drafting the TRD"),
-        (InvokePurpose::Crd, "drafting the CRD"),
+        (InvokePurpose::AssumeVerify, "verifying assumptions"),
+        (InvokePurpose::TrdCrd, "drafting the TRD + CRD"),
         (InvokePurpose::Breakdown, "breaking down the plan"),
         (InvokePurpose::BreakdownReask, "breaking down the plan"),
         (InvokePurpose::BreakdownCompact, "breaking down the plan"),
@@ -908,12 +924,12 @@ fn office_activity_audit_only_yields_audit_label() {
 #[test]
 fn office_activity_pending_invoke_wins_over_research_and_audit() {
     let mut pending: HashMap<u64, InvokeJob> = HashMap::new();
-    pending.insert(1, invoke_job(1, "a", InvokePurpose::Trd, 3_000));
+    pending.insert(1, invoke_job(1, "a", InvokePurpose::TrdCrd, 3_000));
     let mut p = drafting("a");
     p.research = Some(research_binding(700, 1_000));
     p.audit = Some(audit_binding(701, 2_000));
     let activity = office_activity(&pending, &p).expect("invoke activity wins");
-    assert_eq!(activity.label, "drafting the TRD");
+    assert_eq!(activity.label, "drafting the TRD + CRD");
     assert_eq!(activity.since_ms, 3_000);
 }
 

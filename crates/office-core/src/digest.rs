@@ -324,6 +324,10 @@ fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeAct
             "crdPassGrade": p.config.crd_pass_grade,
             "assumptionCheck": p.config.assumption_check,
             "assumptionMode": p.config.assumption_mode,
+            // design-speedup item 4: the research policy + optional doc-drafting model override,
+            // surfaced so the Settings panel can read back what it last saved (10.2 round-trip).
+            "researchMode": p.config.research_mode,
+            "drafterModel": p.config.drafter_model,
         });
     }
 
