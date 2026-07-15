@@ -96,6 +96,7 @@ mod tests {
             audit_rounds: 1,
             last_audit_grade: Some(93),
             pending_assumptions: vec!["assumed Postgres, user never stated a DB".to_string()],
+            assumption_rounds: 1,
             office_transcript: vec![
                 ChatMsg {
                     who: ChatAuthor::User,
@@ -334,6 +335,7 @@ mod tests {
                 crd_pass_grade: 95,
                 assumption_check: false,
                 safeguard_role: "safeguard".to_string(),
+                assumption_mode: "ask".to_string(),
             },
             outbox: vec![
                 OutboundNotice {
@@ -380,6 +382,9 @@ mod tests {
         assert_eq!(deserialized.config.crd_pass_grade, 95);
         assert!(!deserialized.config.assumption_check);
         assert_eq!(deserialized.config.safeguard_role, "safeguard");
+        // Autonomous-safeguard fields round-trip too.
+        assert_eq!(deserialized.assumption_rounds, 1);
+        assert_eq!(deserialized.config.assumption_mode, "ask");
     }
 
     #[test]
@@ -426,6 +431,12 @@ mod tests {
         assert_eq!(p.config.crd_pass_grade, 98, "absent crd_pass_grade defaults to 98, not 0");
         assert!(p.config.assumption_check, "absent assumption_check defaults to true, not false");
         assert_eq!(p.config.safeguard_role, "safeguard");
+        // Autonomous-safeguard defaults: a legacy project loads FULLY AUTONOMOUS ("auto"), round 0.
+        assert_eq!(p.assumption_rounds, 0, "absent assumption_rounds defaults to 0");
+        assert_eq!(
+            p.config.assumption_mode, "auto",
+            "absent assumption_mode defaults to 'auto' (autonomous), not empty"
+        );
     }
 
     #[test]

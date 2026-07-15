@@ -200,6 +200,46 @@ describe('docCards — pendingAssumptions targets the newest non-empty doc', () 
   });
 });
 
+describe('docCards — resolving via autonomous resolution (autonomous-safeguard pivot)', () => {
+  it('marks the newest non-empty doc resolving when the office is resolving assumptions', () => {
+    // 'auto' mode leaves pendingAssumptions EMPTY; the 'resolving assumptions' activity label is
+    // the only signal. The gated (newest non-empty) doc shows a review/resolving card (info dot).
+    const cards = docCards(
+      project({ prdMarkdown: '# PRD', officeActivity: { label: 'resolving assumptions', sinceMs: 5 } }),
+    );
+    expect(find(cards, 'prd')).toMatchObject({ column: 'review', state: 'resolving', detail: 'resolving assumptions' });
+  });
+
+  it('targets the newest non-empty doc (trd over prd) while resolving', () => {
+    const cards = docCards(
+      project({
+        prdMarkdown: '# PRD',
+        trdMarkdown: '# TRD',
+        officeActivity: { label: 'resolving assumptions', sinceMs: 5 },
+      }),
+    );
+    expect(find(cards, 'trd')).toMatchObject({ column: 'review', state: 'resolving' });
+    expect(find(cards, 'prd')).toMatchObject({ state: 'done' });
+  });
+
+  it('a critical freeze (pendingAssumptions set) wins over the resolving label', () => {
+    // If both are somehow present, the critical-freeze 'assumptions' state takes priority.
+    const cards = docCards(
+      project({
+        prdMarkdown: '# PRD',
+        pendingAssumptions: ['critical thing'],
+        officeActivity: { label: 'resolving assumptions', sinceMs: 5 },
+      }),
+    );
+    expect(find(cards, 'prd')?.state).toBe('assumptions');
+  });
+
+  it('does not resolve anything when no doc is non-empty yet', () => {
+    const cards = docCards(project({ officeActivity: { label: 'resolving assumptions', sinceMs: 5 } }));
+    expect(cards.some((c) => c.state === 'resolving')).toBe(false);
+  });
+});
+
 describe('docCards — audit card', () => {
   it('renders active/review "auditing" while auditActive, running phase', () => {
     const cards = docCards(project({ phase: { kind: 'running' }, auditActive: true }));

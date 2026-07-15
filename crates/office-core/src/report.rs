@@ -257,6 +257,45 @@ pub fn parse_assume_check(text: &str) -> Option<AssumeCheck> {
     Some(AssumeCheck { verdict, items })
 }
 
+/// One flagged assumption after criticality classification (autonomous-safeguard pivot). `critical`
+/// items freeze the pipeline for the human; the rest are auto-resolved. `text` is the item with its
+/// `[critical]`/`[auto]` tag stripped, ready for display / prompts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassifiedAssumption {
+    pub critical: bool,
+    pub text: String,
+}
+
+/// Classify one `ASSUME-CHECK` item by its leading criticality tag (autonomous-safeguard pivot).
+/// Tolerant: a leading `[critical]` (case-insensitive, any surrounding whitespace) marks it
+/// critical; a leading `[auto]` marks it auto; ANYTHING ELSE — including an untagged item — is
+/// treated as `[auto]` (the safe default: the office decides it, no human freeze). The returned
+/// `text` has the tag and any immediately-following `:`/`-`/whitespace stripped. An empty result
+/// text (e.g. a bare `[critical]` with no item) is left empty for the caller to drop.
+pub fn classify_assumption(item: &str) -> ClassifiedAssumption {
+    let t = item.trim();
+    if let Some(rest) = strip_leading_tag(t, "[critical]") {
+        return ClassifiedAssumption { critical: true, text: rest };
+    }
+    if let Some(rest) = strip_leading_tag(t, "[auto]") {
+        return ClassifiedAssumption { critical: false, text: rest };
+    }
+    ClassifiedAssumption { critical: false, text: t.to_string() }
+}
+
+/// Strip a leading bracket tag (`"[critical]"` / `"[auto]"`) case-insensitively, then any
+/// immediately-following separator (`:`/`-`/whitespace). `None` when `s` does not start with `tag`.
+/// Uses `get(..len)` so a multibyte boundary right at the tag length can never panic.
+fn strip_leading_tag(s: &str, tag: &str) -> Option<String> {
+    let head = s.get(..tag.len())?;
+    if head.eq_ignore_ascii_case(tag) {
+        let rest = s[tag.len()..].trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
 /// Parse the LAST `OFFICE-REPORT` trailer out of `text`.
 pub fn parse_report(text: &str) -> ReportTrailer {
     let map = match scan_block(text, "OFFICE-REPORT", REPORT_KEYS) {

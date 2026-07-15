@@ -57,6 +57,7 @@ mod tests {
             audit_rounds: 0,
             last_audit_grade: None,
             pending_assumptions: vec![],
+            assumption_rounds: 0,
             office_transcript: vec![],
             office_summary: String::new(),
             delivery_path: None,

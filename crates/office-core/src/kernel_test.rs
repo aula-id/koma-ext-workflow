@@ -44,6 +44,7 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: Vec::new(),
+        assumption_rounds: 0,
         office_transcript: Vec::new(),
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -1071,6 +1072,7 @@ fn config_set_applies_only_the_provided_fields() {
             keep_desks: Some(true),
             crd_pass_grade: Some(90),
             assumption_check: Some(false),
+            assumption_mode: None,
         }),
         1000,
         4,
@@ -1100,6 +1102,7 @@ fn config_set_crd_pass_grade_is_clamped_to_100() {
             keep_desks: None,
             crd_pass_grade: Some(250),
             assumption_check: None,
+            assumption_mode: None,
         }),
         1000,
         4,
@@ -1120,6 +1123,7 @@ fn config_set_max_workers_is_clamped_within_1_to_4() {
             keep_desks: None,
             crd_pass_grade: None,
             assumption_check: None,
+            assumption_mode: None,
         }),
         1000,
         4,
@@ -1136,6 +1140,7 @@ fn config_set_max_workers_is_clamped_within_1_to_4() {
             keep_desks: None,
             crd_pass_grade: None,
             assumption_check: None,
+            assumption_mode: None,
         }),
         1000,
         4,
@@ -1157,6 +1162,7 @@ fn config_set_with_no_fields_is_a_no_op_and_does_not_mark_dirty() {
             keep_desks: None,
             crd_pass_grade: None,
             assumption_check: None,
+            assumption_mode: None,
         }),
         1000,
         4,
@@ -1527,7 +1533,11 @@ fn prd_fence_runs_assume_check_then_spawns_research_on_clean() {
 
 #[test]
 fn assume_check_assumptions_stops_the_pipeline() {
+    // FLAGGED (autonomous-safeguard pivot 2026-07-15): this asserts the freeze-and-ask behavior,
+    // which is now the 'ask' mode. The default is 'auto' (autonomous resolution), so the test pins
+    // 'ask' explicitly. The freeze contract itself is unchanged — this is the 'ask' path verbatim.
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_mode = "ask".to_string();
     p.prd_markdown = "# App".into();
     let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed Postgres\n- assumed React\n";
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
@@ -1642,7 +1652,11 @@ fn recheck_clean_clears_pending_and_resumes_deferred_stage() {
 
 #[test]
 fn recheck_still_dirty_updates_the_pending_list() {
+    // FLAGGED (autonomous-safeguard pivot): 'ask' mode, so a still-dirty re-check refreshes the
+    // pending list instead of auto-resolving. Under the default 'auto' mode these untagged (= auto)
+    // items would be resolved autonomously, not frozen (covered by the auto-mode tests below).
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_mode = "ask".to_string();
     p.prd_markdown = "# App".into();
     p.pending_assumptions = vec!["assumed Postgres".to_string(), "assumed React".to_string()];
     // Fenceless reply re-emits the gate; the verdict is still dirty but with a shorter list.
@@ -1690,6 +1704,180 @@ fn approve_with_nothing_pending_only_notices() {
     assert!(p.outbox.iter().any(|n| n.text.contains("nothing awaiting approval")));
     // The turn is still recorded (the user did act).
     assert!(p.office_transcript.last().map(|m| m.text.contains("Approved")).unwrap_or(false));
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous assumption resolution (autonomous-safeguard pivot 2026-07-15)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_mode_all_auto_assumptions_resolve_autonomously_without_freezing() {
+    // Default 'auto' mode: an assumptions verdict of only non-critical (untagged = auto) items does
+    // NOT freeze. Instead the kernel emits an AssumeResolve invoke, leaves pending EMPTY (no disk
+    // waiting-state), and bumps the round counter. The pipeline is never stalled on the human.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    assert_eq!(p.config.assumption_mode, "auto", "default is autonomous");
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [auto] uses Postgres\n- picked React\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
+
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeResolve, "auto items are resolved, not frozen");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage is not run yet");
+    assert!(p.pending_assumptions.is_empty(), "auto resolution leaves NO disk waiting-state");
+    assert_eq!(p.assumption_rounds, 1, "one resolution round has started");
+    assert!(p.outbox.iter().any(|n| n.text.contains("resolving") && n.text.contains("autonomously")));
+}
+
+#[test]
+fn auto_resolve_result_updates_the_doc_and_reruns_the_gate() {
+    // The resolution invoke returns a revised ```prd fence -> the PRD is updated in place and the
+    // SAME gate (AssumeCheckPrd) re-runs on the revised body. assumption_rounds is NOT reset (a
+    // resolution capture is not a fresh capture).
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App\nv1".into();
+    p.assumption_rounds = 1;
+    let revised = "Here is the revised doc:\n```prd\n# App\nv2 — Postgres chosen\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Ok(revised.into())), 1100, 0);
+
+    assert_eq!(p.prd_markdown, "# App\nv2 — Postgres chosen", "the doc is updated in place");
+    assert_eq!(p.assumption_rounds, 1, "a resolution capture does NOT reset the round budget");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "the gate re-runs on the revised doc");
+}
+
+#[test]
+fn auto_resolve_then_clean_check_resumes_the_deferred_stage() {
+    // Full loop: all-auto verdict -> resolve invoke -> revised doc -> clean re-check -> the deferred
+    // stage (research) finally runs. The pipeline advanced with zero human involvement.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: assumptions\n- picked React\n".into())), 1000, 0);
+    assert_eq!(p.assumption_rounds, 1);
+    step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Ok("```prd\n# App\nReact (delegated)\n```".into())), 1100, 0);
+    // The re-check comes back clean now that the assumption is baked in.
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1200, 0);
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage resumes autonomously");
+    assert!(p.pending_assumptions.is_empty());
+}
+
+#[test]
+fn auto_mode_round_cap_proceeds_with_undecided_disclosure() {
+    // After AUTO_ROUND_CAP (2) resolution rounds on one doc, another all-auto verdict PROCEEDS
+    // anyway with a disclosure notice — ultra-automatic mode never stalls on paperwork.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.assumption_rounds = 2; // cap already reached
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [auto] still ungrounded\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
+
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the pipeline proceeds past the cap");
+    assert!(!invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeResolve, .. })), "no further resolve invoke past the cap");
+    assert!(p.pending_assumptions.is_empty());
+    assert!(p.outbox.iter().any(|n| n.text.contains("proceeding with") && n.text.contains("undecided")));
+}
+
+#[test]
+fn auto_resolve_error_proceeds_anyway() {
+    // A resolution invoke Err never wedges: proceed with the deferred stage + a disclosure notice.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.assumption_rounds = 1;
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Err("model call timed out".into())), 1100, 0);
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "an Err resolve fails open");
+    assert!(p.outbox.iter().any(|n| n.text.contains("could not finish")));
+}
+
+#[test]
+fn auto_resolve_missing_fence_proceeds_anyway() {
+    // A resolution reply without the doc's fence also fails open (never wedges).
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.assumption_rounds = 1;
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Ok("I decided everything but forgot the fence.".into())), 1100, 0);
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "a fenceless resolve fails open");
+    assert!(p.outbox.iter().any(|n| n.text.contains("could not finish")));
+}
+
+#[test]
+fn auto_mode_critical_items_freeze_but_only_the_critical_ones() {
+    // A [critical] item stops for the human even in auto mode — but pending carries ONLY the
+    // critical items (the auto ones are dropped this round), and no resolve invoke fires.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [critical] spends money on a paid SMS gateway\n- [auto] uses Postgres\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
+
+    assert!(invoke_effects(&fx).is_empty(), "a critical freeze emits no invoke — the user must act");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "critical assumptions STOP the pipeline");
+    assert_eq!(
+        p.pending_assumptions,
+        vec!["spends money on a paid SMS gateway".to_string()],
+        "ONLY the critical item is pending (tag stripped); the auto item is dropped"
+    );
+    assert!(p.outbox.iter().any(|n| n.text.contains("critical assumption") && n.text.contains("PRD")));
+}
+
+#[test]
+fn auto_mode_critical_freeze_is_cleared_by_approve() {
+    // The workflow_approve path still clears a critical freeze and resumes, exactly like before.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: assumptions\n- [critical] deploys to production\n".into())), 1000, 0);
+    assert_eq!(p.pending_assumptions.len(), 1, "frozen on the critical item");
+    let fx = step(&mut p, Input::Command(Command::ApproveAssumptions), 1100, 4);
+    assert!(p.pending_assumptions.is_empty(), "approval clears the critical freeze");
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage resumes");
+}
+
+#[test]
+fn ask_mode_freezes_on_untagged_items_exactly_like_before() {
+    // Belt for the flagged pins: with assumption_mode = "ask", untagged items freeze the pipeline
+    // (the pre-pivot behavior), never auto-resolving.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_mode = "ask".to_string();
+    p.prd_markdown = "# App".into();
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [auto] uses Postgres\n- picked React\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
+
+    assert!(invoke_effects(&fx).is_empty(), "ask mode never emits a resolve invoke");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "ask mode freezes");
+    assert_eq!(
+        p.pending_assumptions,
+        vec!["uses Postgres".to_string(), "picked React".to_string()],
+        "ask mode freezes on EVERY material item (tags stripped, critical-first ordering)"
+    );
+}
+
+#[test]
+fn fresh_prd_capture_resets_the_auto_round_budget() {
+    // A fresh persona ```prd capture resets assumption_rounds so the resolution budget is per-doc.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.assumption_rounds = 2; // a prior doc exhausted its budget
+    let reply = "```prd\n# App v2\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert_eq!(p.assumption_rounds, 0, "a fresh capture resets the round budget");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "and re-runs the gate on the new doc");
+}
+
+#[test]
+fn config_set_assumption_mode_roundtrips_and_rejects_unknown_values() {
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    assert_eq!(p.config.assumption_mode, "auto", "default is auto");
+
+    // A valid mode applies.
+    step(&mut p, Input::Command(Command::ConfigSet {
+        max_workers: None, bounce_budget: None, worker_model: None, reviewer_model: None,
+        keep_desks: None, crd_pass_grade: None, assumption_check: None,
+        assumption_mode: Some("ask".to_string()),
+    }), 1000, 4);
+    assert_eq!(p.config.assumption_mode, "ask", "a valid mode is applied");
+
+    // An unknown value is ignored (treated like an absent field), leaving the current value.
+    step(&mut p, Input::Command(Command::ConfigSet {
+        max_workers: None, bounce_budget: None, worker_model: None, reviewer_model: None,
+        keep_desks: None, crd_pass_grade: None, assumption_check: None,
+        assumption_mode: Some("banana".to_string()),
+    }), 1000, 4);
+    assert_eq!(p.config.assumption_mode, "ask", "an unknown mode is ignored, not applied");
 }
 
 // ---------------------------------------------------------------------------

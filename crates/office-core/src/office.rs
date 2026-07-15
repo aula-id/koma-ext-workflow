@@ -80,6 +80,14 @@ pub enum InvokePurpose {
     AssumeCheckTrd,
     /// The safeguard no-assume gate over the CRD (6.2c). `clean` -> proceed to the breakdown.
     AssumeCheckCrd,
+    /// The autonomous assumption-RESOLUTION invoke (autonomous-safeguard pivot 2026-07-15). Emitted
+    /// in `assumption_mode == "auto"` when the checker flagged only `[auto]` (non-critical) items:
+    /// the office decides each one itself with best judgment + the research notes, revises the doc,
+    /// and re-emits the COMPLETE doc in its `<doc>` fence. The kernel then updates that doc and
+    /// re-runs the matching `AssumeCheck{Prd,Trd,Crd}` gate. Which doc it targets is recovered from
+    /// state (`newest_gated_doc`) exactly like the re-check-on-reply path, so a single Copy variant
+    /// suffices. An `Err` or a missing fence PROCEEDS anyway (never wedges).
+    AssumeResolve,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,11 +513,71 @@ NEVER flag anything the document discloses under a heading like 'Proposed defaul
 decisions', or 'Open questions' — those are already surfaced, not hidden assumptions.\n\
 If the user's statements contain ANY delegation ('you decide' / 'up to you' / 'your call' / \
 'approved' / 'proceed'), the verdict is clean — the user handed the office the pen.\n\
+\nTAG EACH flagged item with its criticality — the office will decide the rest ITSELF, so reserve \
+[critical] for the NARROW set of choices that genuinely need a human:\n\
+- [critical] ONLY IF the choice: spends real money; requires accounts, credentials, or secrets; \
+modifies or deletes EXISTING user data or systems; picks a deployment target going live; or \
+creates legal-exposure content. These need a human before anything happens.\n\
+- [auto] for EVERYTHING else — stack / library / framework / language / database choice, data \
+format, project structure, scope details, UX details, and every other reasonable design decision. \
+The office is trusted to decide these; do NOT mark them critical.\n\
+When unsure, tag [auto], not [critical].\n\
 Output ONLY this block, nothing else:\n\
 ASSUME-CHECK\n\
 verdict: clean | assumptions\n\
-- <one MATERIAL ungrounded assumption per line; omit these lines entirely when verdict is clean>\n",
+- [critical] <one MATERIAL ungrounded assumption per line>\n\
+- [auto] <one MATERIAL ungrounded assumption per line>\n\
+(omit the '- ' lines entirely when verdict is clean; an untagged item is treated as [auto])\n",
     );
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// Build the autonomous assumption-resolution `(system, prompt)` for `models.invoke`
+/// (autonomous-safeguard pivot 2026-07-15). In `assumption_mode == "auto"`, when the checker
+/// flagged only non-critical `[auto]` assumptions, the office decides each ITSELF — "research,
+/// decide, disclose" — rather than freezing on the human. The prompt hands it the doc, the list of
+/// auto assumptions to settle, and the research notes when present, and instructs it to REVISE the
+/// doc, record every decision under a 'Delegated decisions (auto)' heading with a one-line
+/// rationale, and re-emit the COMPLETE revised document inside its `<doc>` fence (the same fence the
+/// gate captures). `doc_label` is "PRD"/"TRD"/"CRD"; the fence tag is its lowercase form. Pure +
+/// byte-bounded like the other builders.
+pub fn build_assume_resolve_prompt(
+    p: &Project,
+    doc_label: &str,
+    doc_body: &str,
+    auto_items: &[String],
+) -> (String, String) {
+    let tag = doc_label.to_ascii_lowercase();
+    let system = format!(
+        "You are the Workflow front office resolving your own open assumptions. You are TRUSTED to \
+decide reasonable design choices yourself — stack, libraries, formats, structure, UX details. \
+Decide each assumption below with best judgment and the research notes, then revise the {label} to \
+reflect those decisions. Be decisive; do NOT punt back to the human on non-critical calls.",
+        label = doc_label
+    );
+
+    let mut prompt = String::new();
+    prompt.push_str(&format!("{} UNDER REVISION:\n", doc_label));
+    prompt.push_str(&truncate_bytes(doc_body, HARD_PROMPT_CAP / 3));
+    prompt.push_str("\n\nASSUMPTIONS TO DECIDE YOURSELF (each is non-critical — settle it):\n");
+    if auto_items.is_empty() {
+        prompt.push_str("(none listed — re-emit the document unchanged)\n");
+    } else {
+        let list: String = auto_items.iter().map(|a| format!("- {}\n", a)).collect();
+        prompt.push_str(&truncate_bytes(&list, HARD_PROMPT_CAP / 4));
+    }
+    if !p.research_notes.trim().is_empty() {
+        prompt.push_str("\nRESEARCH FINDINGS (lean on these where relevant):\n");
+        prompt.push_str(&truncate_bytes(&p.research_notes, HARD_PROMPT_CAP / 4));
+    }
+    prompt.push_str(&format!(
+        "\n\nDecide EVERY assumption above yourself using best judgment and the research notes. \
+REVISE the document so each decision is baked in, and add a 'Delegated decisions (auto)' section \
+where every decision appears with a one-line rationale. Then re-emit the COMPLETE revised document \
+as markdown inside a fenced block that starts with ```{tag} and ends with ``` — that exact fence is \
+how the system captures it. Output NOTHING outside that fence — no JSON, no preamble, no prose.\n",
+        tag = tag
+    ));
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 

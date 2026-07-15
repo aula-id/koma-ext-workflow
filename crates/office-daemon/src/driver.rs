@@ -474,6 +474,7 @@ impl<H: Host> Driver<H> {
                 keep_desks,
                 crd_pass_grade,
                 assumption_check,
+                assumption_mode,
             } => {
                 if let Some(i) = self.owned_project_by_id(&project) {
                     self.step(
@@ -486,6 +487,7 @@ impl<H: Host> Driver<H> {
                             keep_desks,
                             crd_pass_grade,
                             assumption_check,
+                            assumption_mode,
                         }),
                         now_ms,
                     );
@@ -1051,6 +1053,7 @@ impl<H: Host> Driver<H> {
             audit_rounds: 0,
             last_audit_grade: None,
             pending_assumptions: Vec::new(),
+            assumption_rounds: 0,
             office_transcript: Vec::new(),
             office_summary: String::new(),
             delivery_path: None,
@@ -1676,6 +1679,10 @@ fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Opti
             InvokePurpose::AssumeCheckPrd => "fact-checking the PRD",
             InvokePurpose::AssumeCheckTrd => "fact-checking the TRD",
             InvokePurpose::AssumeCheckCrd => "fact-checking the CRD",
+            // Autonomous assumption resolution (autonomous-safeguard pivot): surfaced as ACTIVITY,
+            // never attention — the office is deciding the non-critical assumptions itself. The
+            // docs tab keys the gated doc's 'resolving' card off this exact label.
+            InvokePurpose::AssumeResolve => "resolving assumptions",
             InvokePurpose::Trd => "drafting the TRD",
             InvokePurpose::Crd => "drafting the CRD",
             InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {

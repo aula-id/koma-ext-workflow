@@ -70,6 +70,7 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: vec![],
+        assumption_rounds: 0,
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -443,6 +444,7 @@ fn config_set_applies_partial_update_including_keep_desks() {
             keep_desks: Some(true),
             crd_pass_grade: None,
             assumption_check: None,
+            assumption_mode: None,
         }),
         2_000,
     );
@@ -474,6 +476,7 @@ fn config_set_max_workers_is_clamped_to_the_project_ceiling() {
             keep_desks: None,
             crd_pass_grade: None,
             assumption_check: None,
+            assumption_mode: None,
         }),
         2_000,
     );
@@ -498,6 +501,7 @@ fn config_set_on_a_non_owned_project_is_dropped_not_applied() {
             keep_desks: Some(true),
             crd_pass_grade: None,
             assumption_check: None,
+            assumption_mode: None,
         }),
         2_000,
     );
@@ -842,6 +846,7 @@ fn office_activity_labels_every_invoke_purpose() {
         (InvokePurpose::AssumeCheckPrd, "fact-checking the PRD"),
         (InvokePurpose::AssumeCheckTrd, "fact-checking the TRD"),
         (InvokePurpose::AssumeCheckCrd, "fact-checking the CRD"),
+        (InvokePurpose::AssumeResolve, "resolving assumptions"),
         (InvokePurpose::Trd, "drafting the TRD"),
         (InvokePurpose::Crd, "drafting the CRD"),
         (InvokePurpose::Breakdown, "breaking down the plan"),

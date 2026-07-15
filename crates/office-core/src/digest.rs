@@ -315,6 +315,7 @@ fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeAct
             "keepDesks": p.config.keep_desks,
             "crdPassGrade": p.config.crd_pass_grade,
             "assumptionCheck": p.config.assumption_check,
+            "assumptionMode": p.config.assumption_mode,
         });
     }
 

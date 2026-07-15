@@ -156,6 +156,43 @@ describe('Settings (real component, rendered)', () => {
     );
   });
 
+  it('reflects assumptionMode on the selector and submits the changed value (autonomous-safeguard pivot)', async () => {
+    seedProject({ assumptionCheck: true, assumptionMode: 'auto' });
+    renderSettings();
+
+    const select = container.querySelector('[data-testid="settings-assumption-mode"]') as HTMLSelectElement;
+    expect(select).toBeTruthy();
+    expect(select.value).toBe('auto');
+    expect(select.disabled).toBe(false);
+
+    // Change auto -> ask via the real select's change event.
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')!.set!;
+    act(() => {
+      setter.call(select, 'ask');
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    await submitForm();
+
+    expect(bridge.send).toHaveBeenCalledWith(
+      expect.objectContaining({ op: 'config_set', project: 'p1', assumptionMode: 'ask' }),
+    );
+  });
+
+  it('disables the assumptionMode selector when the safeguard checks are off', () => {
+    seedProject({ assumptionCheck: false, assumptionMode: 'auto' });
+    renderSettings();
+    const select = container.querySelector('[data-testid="settings-assumption-mode"]') as HTMLSelectElement;
+    expect(select.disabled).toBe(true);
+  });
+
+  it('defaults the assumptionMode selector to auto when the config omits it', () => {
+    seedProject({ assumptionCheck: true });
+    renderSettings();
+    const select = container.querySelector('[data-testid="settings-assumption-mode"]') as HTMLSelectElement;
+    expect(select.value).toBe('auto');
+  });
+
   it('submits crdPassGrade from the real numeric input (6.2c)', async () => {
     seedProject({ crdPassGrade: 98 });
     renderSettings();

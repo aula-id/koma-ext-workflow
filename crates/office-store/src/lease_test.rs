@@ -131,6 +131,7 @@ fn seed_project(store: &Store, slug: &str) {
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: Vec::new(),
+        assumption_rounds: 0,
         office_transcript: Vec::new(),
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),

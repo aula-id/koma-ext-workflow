@@ -45,6 +45,7 @@ mod tests {
             audit_rounds: 0,
             last_audit_grade: None,
             pending_assumptions: vec![],
+            assumption_rounds: 0,
             office_transcript: vec![ChatMsg { who: ChatAuthor::User, text: "hi".to_string() }],
             office_summary: String::new(),
             delivery_path: Some(format!("/work/{id}/deliver").into()),

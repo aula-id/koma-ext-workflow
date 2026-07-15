@@ -11,6 +11,9 @@ export interface ProjectConfig {
   crdPassGrade?: number;
   /** Whether the safeguard no-assume gate runs after each drafting doc capture (6.2c). */
   assumptionCheck?: boolean;
+  /** How the safeguard handles flagged assumptions (autonomous-safeguard pivot): `'auto'`
+   * (autonomous — only critical items stop for the human) | `'ask'` (freeze on every item). */
+  assumptionMode?: string;
 }
 
 /** Project lifecycle phase, per docs/PANEL_PROTOCOL.md 2.1 and office-core

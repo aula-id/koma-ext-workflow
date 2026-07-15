@@ -221,6 +221,15 @@ pub struct ProjectConfig {
     /// like `office_role` for the persona. Named-fn default `"safeguard"`; no panel affordance.
     #[serde(default = "default_safeguard_role")]
     pub safeguard_role: String,
+    /// How the safeguard handles flagged assumptions once the checker returns (autonomous-safeguard
+    /// pivot 2026-07-15). `"auto"` (default) = ULTRA-AUTOMATIC: only `[critical]` items freeze the
+    /// pipeline for the human; everything else is auto-resolved by the office ("research, decide,
+    /// disclose") over a bounded round loop and the pipeline never stalls on paperwork. `"ask"` =
+    /// the original freeze-and-ask behavior for EVERY material item. `assumption_check == false`
+    /// still disables the checker entirely regardless of mode. Named-fn default `"auto"` (not
+    /// `#[serde(default)]`, which would force an empty string) so legacy state files load autonomous.
+    #[serde(default = "default_assumption_mode")]
+    pub assumption_mode: String,
 }
 
 fn default_crd_pass_grade() -> u32 {
@@ -233,6 +242,10 @@ fn default_assumption_check() -> bool {
 
 fn default_safeguard_role() -> String {
     "safeguard".to_string()
+}
+
+fn default_assumption_mode() -> String {
+    "auto".to_string()
 }
 
 impl ProjectConfig {
@@ -248,6 +261,7 @@ impl ProjectConfig {
             crd_pass_grade: default_crd_pass_grade(),
             assumption_check: default_assumption_check(),
             safeguard_role: default_safeguard_role(),
+            assumption_mode: default_assumption_mode(),
         }
     }
 }
@@ -294,11 +308,22 @@ pub struct Project {
     /// status line when present (6.2c). `#[serde(default)]` (None) for back-compat.
     #[serde(default)]
     pub last_audit_grade: Option<u32>,
-    /// Ungrounded assumptions the safeguard flagged in the LAST doc gate (6.2c/safeguard). Non-
-    /// empty means the drafting pipeline is stopped waiting on the user to approve/answer/delegate;
-    /// a subsequent clean check on any doc clears it. `#[serde(default)]` for back-compat.
+    /// Ungrounded assumptions the safeguard flagged in the LAST doc gate that STOP the pipeline for
+    /// the human (6.2c/safeguard). In `assumption_mode == "ask"` this is every material item; in
+    /// `"auto"` it is ONLY the `[critical]` items (auto items are resolved autonomously and never
+    /// persisted here). Non-empty means the pipeline is stopped waiting on the user to
+    /// approve/answer/delegate; a subsequent clean check on any doc clears it. `#[serde(default)]`
+    /// for back-compat.
     #[serde(default)]
     pub pending_assumptions: Vec<String>,
+    /// How many autonomous auto-resolution rounds the safeguard has run on the CURRENT doc capture
+    /// (autonomous-safeguard pivot). Bumped each time an `InvokePurpose::AssumeResolve` invoke is
+    /// emitted, RESET to 0 on every fresh doc capture (a persona/TRD/CRD fence), and capped at
+    /// `AUTO_ROUND_CAP` (2) — after the cap the pipeline proceeds anyway with the undecided items
+    /// documented in the doc (ultra-automatic mode never stalls). Persisted so the round budget
+    /// survives a store reload. `#[serde(default)]` (0) for back-compat.
+    #[serde(default)]
+    pub assumption_rounds: u32,
     pub office_transcript: Vec<ChatMsg>,
     pub office_summary: String,
     pub delivery_path: Option<PathBuf>,

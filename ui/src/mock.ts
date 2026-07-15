@@ -40,6 +40,7 @@ function defaultConfig(overrides: Record<string, unknown> = {}): Record<string, 
     keepDesks: false,
     crdPassGrade: 98,
     assumptionCheck: true,
+    assumptionMode: 'auto',
     ...overrides,
   };
 }
@@ -346,8 +347,10 @@ function buildDraftingProject() {
 
 // ---------------------------------------------------------------------------
 // Project 2b — Drafting: "Bulk CSV Import Wizard". Doc-cards matrix continued:
-// PRD authored but the safeguard flagged an ungrounded assumption, so the panel
-// waits on the user (review/assumptions) with research/TRD/CRD still backlog.
+// PRD authored but the safeguard flagged a CRITICAL ungrounded assumption, so the
+// panel waits on the user (review/assumptions) with research/TRD/CRD still backlog.
+// Under the autonomous-safeguard pivot this is what a *critical* freeze looks like:
+// pendingAssumptions non-empty + a "waiting on you" activity label.
 // ---------------------------------------------------------------------------
 
 function buildDraftingAssumptionsProject() {
@@ -393,6 +396,60 @@ function buildDraftingAssumptionsProject() {
     ],
     officeSummary: 'Admin bulk CSV import with client-side validation and a per-row error report; partial-import commit behavior is an open/assumed question.',
     outbox: [],
+    config: defaultConfig(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Project 2c — Drafting: "Recipe Sharing App". The autonomous-safeguard pivot in
+// action: the safeguard flagged only NON-critical assumptions, so the office is
+// resolving them itself (activity, not attention). Doc-cards: prd review/resolving
+// (info dot), research/trd/crd backlog; pendingAssumptions is EMPTY on purpose —
+// auto-resolution leaves no disk waiting-state, the activity label is the signal.
+// ---------------------------------------------------------------------------
+
+function buildDraftingResolvingProject() {
+  const prdMarkdown = [
+    '# Recipe Sharing App',
+    '',
+    'A small web app where home cooks post recipes and browse others.',
+    '',
+    '## Goals',
+    '',
+    '- Post a recipe with ingredients, steps, and a photo',
+    '- Browse and search recipes by ingredient',
+    '',
+    '## Proposed defaults (applied unless you object)',
+    '',
+    '- Stack: Next.js + SQLite (single-tenant, easy to run locally)',
+    '- Image storage: local filesystem under the delivery path',
+  ].join('\n');
+
+  return {
+    id: 'recipes',
+    name: 'Recipe Sharing App',
+    phase: { kind: 'drafting' },
+    deliveryPath: null,
+    seq: 6,
+    tasks: [],
+    epics: [],
+    stories: [],
+    prdMarkdown,
+    trdMarkdown: '',
+    researchNotes: '',
+    crdMarkdown: '',
+    // Empty on purpose: in 'auto' mode the office resolves non-critical assumptions itself and
+    // never persists a waiting-state. The 'resolving assumptions' activity label is the signal.
+    pendingAssumptions: [],
+    officeActivity: { label: 'resolving assumptions', sinceMs: nowMs() - 8 * 1000 },
+    officeTranscript: [
+      { who: 'user', text: 'I want a simple app for sharing recipes.' },
+      { who: 'office', text: 'Drafted a PRD. A few reasonable defaults (stack, image storage) were unstated — none are critical (no money, accounts, or data at risk), so I am deciding them myself and will disclose each. Resolving now.' },
+    ],
+    officeSummary: 'Simple recipe-sharing web app; non-critical stack/storage defaults being auto-resolved.',
+    outbox: [
+      { id: 1, text: 'Recipe App PRD has 2 non-critical assumptions — resolving them autonomously (round 1/2).', sent: true, paused: false },
+    ],
     config: defaultConfig(),
   };
 }
@@ -474,7 +531,13 @@ function buildHaltedProject() {
 }
 
 function buildInitialProjects(): any[] {
-  return [buildRunningProject(), buildDraftingProject(), buildDraftingAssumptionsProject(), buildHaltedProject()];
+  return [
+    buildRunningProject(),
+    buildDraftingProject(),
+    buildDraftingAssumptionsProject(),
+    buildDraftingResolvingProject(),
+    buildHaltedProject(),
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +716,7 @@ function handleOp(payload: any): any {
       if (payload.keepDesks !== undefined) next.keepDesks = payload.keepDesks;
       if (payload.crdPassGrade !== undefined) next.crdPassGrade = clampInt(payload.crdPassGrade, 0, 100, next.crdPassGrade as number);
       if (payload.assumptionCheck !== undefined) next.assumptionCheck = payload.assumptionCheck;
+      if (payload.assumptionMode !== undefined) next.assumptionMode = payload.assumptionMode === 'ask' ? 'ask' : 'auto';
       p.config = next;
       schedulePush();
       return ok();

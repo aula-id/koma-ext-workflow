@@ -208,4 +208,47 @@ mod tests {
         assert_eq!(c.verdict, AssumeVerdict::Assumptions);
         assert_eq!(c.items, vec!["x".to_string()]);
     }
+
+    // --- criticality classification (autonomous-safeguard pivot) --------
+
+    use crate::report::classify_assumption;
+
+    #[test]
+    fn classify_tags_critical_and_strips_the_tag() {
+        let c = classify_assumption("[critical] spends real money on a paid API");
+        assert!(c.critical);
+        assert_eq!(c.text, "spends real money on a paid API");
+    }
+
+    #[test]
+    fn classify_tags_auto_and_strips_the_tag() {
+        let c = classify_assumption("[auto] uses Postgres for storage");
+        assert!(!c.critical);
+        assert_eq!(c.text, "uses Postgres for storage");
+    }
+
+    #[test]
+    fn classify_untagged_defaults_to_auto() {
+        // An untagged item is the safe default: the office decides it, no human freeze.
+        let c = classify_assumption("picked React, not stated");
+        assert!(!c.critical);
+        assert_eq!(c.text, "picked React, not stated");
+    }
+
+    #[test]
+    fn classify_is_case_insensitive_and_whitespace_tolerant() {
+        let c = classify_assumption("  [CRITICAL]  deploys to production");
+        assert!(c.critical);
+        assert_eq!(c.text, "deploys to production");
+        let a = classify_assumption("[Auto]: chooses a folder layout");
+        assert!(!a.critical);
+        assert_eq!(a.text, "chooses a folder layout");
+    }
+
+    #[test]
+    fn classify_bare_tag_yields_empty_text() {
+        // A bare tag with no item text -> empty text (the caller drops it).
+        assert_eq!(classify_assumption("[critical]").text, "");
+        assert_eq!(classify_assumption("[auto]").text, "");
+    }
 }

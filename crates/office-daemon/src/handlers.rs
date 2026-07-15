@@ -78,7 +78,7 @@ pub enum Command {
     /// `{ op: "edit_deps", task, ... }`.
     EditDeps { task: String, patch: Value },
     /// `{ op: "config_set", project, maxWorkers?, bounceBudget?, workerModel?,
-    /// reviewerModel?, keepDesks?, crdPassGrade?, assumptionCheck? }`.
+    /// reviewerModel?, keepDesks?, crdPassGrade?, assumptionCheck?, assumptionMode? }`.
     ConfigSet {
         project: String,
         max_workers: Option<u32>,
@@ -88,6 +88,7 @@ pub enum Command {
         keep_desks: Option<bool>,
         crd_pass_grade: Option<u32>,
         assumption_check: Option<bool>,
+        assumption_mode: Option<String>,
     },
     /// `{ op: "project_create", name }`.
     ProjectCreate { name: String },
@@ -410,6 +411,7 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
                     .and_then(Value::as_u64)
                     .map(|n| n as u32),
                 assumption_check: payload.get("assumptionCheck").and_then(Value::as_bool),
+                assumption_mode: opt_str_field(&payload, "assumptionMode"),
             }
         }
         "project_create" => {

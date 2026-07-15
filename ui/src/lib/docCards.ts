@@ -16,7 +16,7 @@
 
 export type DocKey = 'prd' | 'research' | 'trd' | 'crd' | 'audit';
 export type DocColumn = 'backlog' | 'onprogress' | 'review' | 'done';
-export type DocState = 'pending' | 'active' | 'checking' | 'assumptions' | 'done' | 'skipped';
+export type DocState = 'pending' | 'active' | 'checking' | 'assumptions' | 'resolving' | 'done' | 'skipped';
 
 export interface DocCard {
   key: DocKey;
@@ -66,6 +66,10 @@ const LABEL = {
   draftTrd: 'drafting the TRD',
   draftCrd: 'drafting the CRD',
   research: 'researching the stack',
+  // Autonomous-safeguard pivot: the office is deciding the non-critical assumptions itself. Since
+  // auto-resolution leaves NO disk waiting-state (pendingAssumptions stays empty), this label on
+  // `officeActivity` is the only signal — the gated (newest non-empty) doc shows a 'resolving' card.
+  resolving: 'resolving assumptions',
 } as const;
 
 function pluralAssumptions(n: number): string {
@@ -98,15 +102,20 @@ export function docCards(project: DocCardProject | null | undefined): DocCard[] 
 
     // The safeguard's no-assume gate flags the doc it just authored — the NEWEST
     // non-empty doc in the chain — while the drafting pipeline waits on the user.
-    const assumptionsTarget: 'prd' | 'research' | 'trd' | 'crd' | null = hasAssumptions
-      ? crdDone
-        ? 'crd'
-        : trdDone
-          ? 'trd'
-          : prdDone
-            ? 'prd'
-            : null
-      : null;
+    const newestNonEmpty: 'prd' | 'research' | 'trd' | 'crd' | null = crdDone
+      ? 'crd'
+      : trdDone
+        ? 'trd'
+        : prdDone
+          ? 'prd'
+          : null;
+    const assumptionsTarget = hasAssumptions ? newestNonEmpty : null;
+
+    // Autonomous resolution in flight (auto mode): the office is deciding the non-critical
+    // assumptions itself. pendingAssumptions is empty in this mode, so the ONLY signal is the
+    // activity label — the newest non-empty doc shows a 'resolving' card (info dot, activity, NOT
+    // attention). Ordered AFTER assumptionsTarget so a critical freeze (pending set) always wins.
+    const resolvingTarget = activityLabel === LABEL.resolving ? newestNonEmpty : null;
 
     // resolved = "no longer blocking a downstream doc" (authored, whether normally
     // finished or a legitimately skipped research step).
@@ -121,6 +130,10 @@ export function docCards(project: DocCardProject | null | undefined): DocCard[] 
         column = 'review';
         state = 'assumptions';
         detail = pluralAssumptions(assumptions.length);
+      } else if (resolvingTarget === key) {
+        column = 'review';
+        state = 'resolving';
+        detail = 'resolving assumptions';
       } else if (
         (key === 'prd' && activityLabel === LABEL.factCheckPrd) ||
         (key === 'trd' && activityLabel === LABEL.factCheckTrd) ||
