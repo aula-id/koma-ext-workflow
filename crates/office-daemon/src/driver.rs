@@ -719,6 +719,7 @@ impl<H: Host> Driver<H> {
                     }
                     SpawnOutcome::Local | SpawnOutcome::Failed => {}
                 },
+                Effect::SpawnResearch { prompt } => self.exec_spawn_research(idx, prompt, now_ms),
                 Effect::Kill { ext_agent_id } => {
                     self.host.call("agents.kill", json!({ "agentId": ext_agent_id }));
                 }
@@ -801,6 +802,51 @@ impl<H: Host> Driver<H> {
             now_ms,
         );
         SpawnOutcome::Failed
+    }
+
+    /// Execute a `SpawnResearch` (6.2b): spawn the `office-researcher` into the project's bound
+    /// session via the SAME `sessions.spawn_into` path as workers, then feed the real agent id
+    /// back as `ResearchSpawned`. Unlike a worker spawn there is no duplicate-worker hazard
+    /// (5.6) — the project is Drafting, not dispatching a ready set — so a cross-process
+    /// `{status:"sent"}` reply or a spawn error just degrades gracefully via `ResearchFailed`
+    /// (Drafting drops to a PRD-only TRD) and NEVER releases the lease.
+    fn exec_spawn_research(&mut self, idx: usize, prompt: String, now_ms: u64) {
+        let bound = self.projects[idx].project.bound_session.clone().unwrap_or_default();
+        let params = json!({
+            "session": bound,
+            "task": prompt,
+            "agent": "office-researcher",
+            "notify": true,
+        });
+        let reply = self.host.call("sessions.spawn_into", params);
+
+        if reply.get("status").and_then(Value::as_str) == Some("sent") {
+            self.step(
+                idx,
+                kernel::Input::Host(kernel::HostEvent::ResearchFailed {
+                    reason: "bound session moved off-daemon".to_string(),
+                }),
+                now_ms,
+            );
+            return;
+        }
+        if let Some(agent_id) = parse_agent_id(&reply) {
+            self.step(
+                idx,
+                kernel::Input::Host(kernel::HostEvent::ResearchSpawned {
+                    agent_id,
+                    spawned_at_ms: now_ms,
+                }),
+                now_ms,
+            );
+            return;
+        }
+        let reason = error_str(&reply).unwrap_or("spawn failed").to_string();
+        self.step(
+            idx,
+            kernel::Input::Host(kernel::HostEvent::ResearchFailed { reason }),
+            now_ms,
+        );
     }
 
     /// Roll a project back to its on-disk state and release its lease after a cross-process
@@ -887,6 +933,9 @@ impl<H: Host> Driver<H> {
             name,
             phase: ProjectPhase::Drafting,
             prd_markdown: String::new(),
+            trd_markdown: String::new(),
+            research_notes: String::new(),
+            research: None,
             office_transcript: Vec::new(),
             office_summary: String::new(),
             delivery_path: None,
@@ -1137,7 +1186,7 @@ impl<H: Host> Driver<H> {
         let tracked = self.tracked_agent_ids();
         for e in entries {
             let agent = e.get("agent").and_then(Value::as_str).unwrap_or("");
-            if agent != "office-worker" && agent != "office-reviewer" {
+            if agent != "office-worker" && agent != "office-reviewer" && agent != "office-researcher" {
                 continue;
             }
             if let Some(id) = parse_agent_id(&e) {
@@ -1307,17 +1356,19 @@ impl<H: Host> Driver<H> {
     }
 
     /// Owned projects the reconcile ceiling should scan: Running or Interrupted (a soft
-    /// drain still has live bindings that can age out, 9.1.3).
+    /// drain still has live bindings that can age out, 9.1.3), PLUS any project with a live
+    /// research binding (6.2b) — a Drafting project mid-research must have its researcher's
+    /// runtime ceiling enforced too, or a hung researcher would wedge Drafting.
     fn owned_dispatchable_indices(&self) -> Vec<usize> {
         self.projects
             .iter()
             .enumerate()
             .filter(|(_, o)| {
                 o.lease.is_some()
-                    && matches!(
+                    && (matches!(
                         o.project.phase,
                         ProjectPhase::Running | ProjectPhase::Interrupted
-                    )
+                    ) || o.project.research.is_some())
             })
             .map(|(i, _)| i)
             .collect()
@@ -1342,12 +1393,16 @@ impl<H: Host> Driver<H> {
     }
 
     fn owned_project_by_agent(&self, agent_id: u64) -> Option<usize> {
-        self.projects
-            .iter()
-            .position(|o| o.lease.is_some() && task_bound_to(&o.project, agent_id).is_some())
+        self.projects.iter().position(|o| {
+            o.lease.is_some()
+                && (task_bound_to(&o.project, agent_id).is_some()
+                    || research_bound_to(&o.project, agent_id))
+        })
     }
 
-    /// All (project idx, agent id) pairs for live real bindings across owned projects.
+    /// All (project idx, agent id) pairs for live real bindings across owned projects —
+    /// including the project-level research binding (6.2b) so a killed researcher is caught by
+    /// the `agents.status` poll exactly like a killed worker/reviewer.
     fn live_bindings(&self) -> Vec<(usize, u64)> {
         let mut out = Vec::new();
         for (i, o) in self.projects.iter().enumerate() {
@@ -1360,6 +1415,9 @@ impl<H: Host> Driver<H> {
                         out.push((i, id));
                     }
                 }
+            }
+            if let Some(id) = research_agent_id(&o.project) {
+                out.push((i, id));
             }
         }
         out
@@ -1374,6 +1432,9 @@ impl<H: Host> Driver<H> {
                         set.insert(id);
                     }
                 }
+            }
+            if let Some(id) = research_agent_id(&o.project) {
+                set.insert(id);
             }
         }
         set
@@ -1458,6 +1519,19 @@ fn binding_agent_id(state: &TaskState) -> Option<u64> {
         TaskState::Review { binding: Some(b), .. } => Some(b.ext_agent_id),
         _ => None,
     }
+}
+
+/// The real (non-provisional) research agent id for a project, if one is in flight (6.2b).
+fn research_agent_id(p: &Project) -> Option<u64> {
+    match &p.research {
+        Some(b) if b.ext_agent_id != 0 => Some(b.ext_agent_id),
+        _ => None,
+    }
+}
+
+/// Whether `agent_id` is a project's live (non-provisional) research binding (6.2b).
+fn research_bound_to(p: &Project, agent_id: u64) -> bool {
+    matches!(&p.research, Some(b) if b.ext_agent_id == agent_id && b.ext_agent_id != 0)
 }
 
 fn task_bound_to(p: &Project, agent_id: u64) -> Option<&office_core::Task> {

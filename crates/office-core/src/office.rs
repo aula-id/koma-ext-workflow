@@ -59,6 +59,11 @@ pub enum InvokePurpose {
     /// The summarize-and-fold call. Result replaces `office_summary`; then the pending
     /// persona invoke is re-issued.
     Fold,
+    /// The Technical Requirements Document authoring call (ARCHITECTURE.md 6.2b), issued after
+    /// web-research (or a research degrade) lands during Drafting. `Ok` with a ```trd fence ->
+    /// store `trd_markdown` and request the breakdown; a missing fence or any `Err` STILL
+    /// requests the breakdown (from the PRD alone) — Drafting never wedges on a TRD failure.
+    Trd,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,42 +125,66 @@ fenced block that starts with ```prd and ends with ``` — that exact fence is h
 system captures the PRD and starts the production line; a PRD outside that fence does \
 not count and nothing will happen.\n";
 
-/// Capture a PRD from a persona reply: the LAST ```prd fenced block, if any (6.2).
-/// The fence is the explicit capture contract given to the persona in
-/// [`PERSONA_CONTRACT`]; free-text 'here is the PRD' prose is deliberately ignored.
-pub fn extract_prd(reply: &str) -> Option<String> {
+/// Capture the LAST ` ```<tag> ` fenced block from a persona reply, if any — the generalized
+/// engine behind both PRD (6.2) and TRD (6.2b) capture. The fence is the explicit capture
+/// contract given to the persona (PRD: [`PERSONA_CONTRACT`]; TRD: [`build_trd_prompt`]);
+/// free-text 'here is the doc' prose is deliberately ignored. `tag` is the language hint
+/// after the opening backticks (`"prd"` / `"trd"`), matched exactly.
+pub fn extract_fenced(reply: &str, tag: &str) -> Option<String> {
+    let fence = format!("```{tag}");
+    let flen = fence.len();
     let mut result = None;
     let mut rest = reply;
-    while let Some(start) = rest.find("```prd") {
-        let after = &rest[start + 6..];
+    while let Some(start) = rest.find(&fence) {
+        let after = &rest[start + flen..];
         // fence marker must end its line
         let body_start = match after.find('\n') {
             Some(i) if after[..i].trim().is_empty() => i + 1,
             _ => {
-                rest = &rest[start + 6..];
+                rest = &rest[start + flen..];
                 continue;
             }
         };
         let body = &after[body_start..];
         match body.find("\n```") {
             Some(end) => {
-                let prd = body[..end].trim();
-                if !prd.is_empty() {
-                    result = Some(prd.to_string());
+                let doc = body[..end].trim();
+                if !doc.is_empty() {
+                    result = Some(doc.to_string());
                 }
                 rest = &body[end + 4..];
             }
             None => {
                 // unterminated fence: tolerate, take the remainder
-                let prd = body.trim();
-                if !prd.is_empty() {
-                    result = Some(prd.to_string());
+                let doc = body.trim();
+                if !doc.is_empty() {
+                    result = Some(doc.to_string());
                 }
                 break;
             }
         }
     }
     result
+}
+
+/// Capture a PRD from a persona reply: the LAST ```prd fenced block, if any (6.2). A thin
+/// wrapper over [`extract_fenced`] so the fence-capture contract stays in one place.
+pub fn extract_prd(reply: &str) -> Option<String> {
+    extract_fenced(reply, "prd")
+}
+
+/// Byte cap for stored `research_notes` (ARCHITECTURE.md 6.2b): the findings are folded into
+/// the TRD prompt (capped again there) and carried on the panel snapshot, so a runaway
+/// researcher can never balloon the state file. Truncated with a marker on write.
+pub const RESEARCH_NOTES_CAP: usize = 16 * 1024;
+
+/// Extract the researcher's findings from a spawn result (6.2b): the tolerant OFFICE-RESEARCH
+/// `findings:` block if present ([`crate::report::parse_research`]), else the whole reply text.
+/// Capped to [`RESEARCH_NOTES_CAP`] with a truncation marker — this IS the "truncate on write"
+/// enforcement for `Project.research_notes`.
+pub fn extract_research(text: &str) -> String {
+    let raw = crate::report::parse_research(text).unwrap_or_else(|| text.trim().to_string());
+    truncate_bytes(&raw, RESEARCH_NOTES_CAP)
 }
 
 fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
@@ -269,7 +298,13 @@ pub fn build_breakdown_prompt(p: &Project, reask_error: Option<&str>, compact: b
     let mut prompt = String::new();
     prompt.push_str("Break the PRD below into an epic/story/task plan for the production line.\n\n");
     prompt.push_str("PRD:\n");
-    prompt.push_str(&truncate_bytes(&p.prd_markdown, HARD_PROMPT_CAP / 2));
+    prompt.push_str(&truncate_bytes(&p.prd_markdown, HARD_PROMPT_CAP / 3));
+    // The TRD (when present, 6.2b) carries the concrete stack/versions/architecture the plan
+    // must honor; fold it in alongside the PRD (compact mode gets it too).
+    if !p.trd_markdown.trim().is_empty() {
+        prompt.push_str("\n\nTRD (technical requirements — honor these choices):\n");
+        prompt.push_str(&truncate_bytes(&p.trd_markdown, HARD_PROMPT_CAP / 3));
+    }
     prompt.push_str(
         "\n\nOutput ONLY JSON (no prose, no code fence) with this exact shape:\n\
 {\"epics\":[{\"slug\":\"kebab\",\"title\":\"..\",\"intent\":\"..\",\"stories\":[\
@@ -293,6 +328,30 @@ ONLY — no prose, no code fences, nothing outside the JSON object.\n",
         prompt.push_str(&truncate_bytes(err, 1000));
         prompt.push_str("\nReturn corrected JSON.\n");
     }
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// Build the TRD authoring `(system, prompt)` for `models.invoke` (ARCHITECTURE.md 6.2b). The
+/// prompt is the PRD (capped) plus the web-research findings when present (capped), then the
+/// output contract: a COMPLETE Technical Requirements Document inside a ```trd fenced block.
+/// Pure and byte-bounded exactly like [`build_breakdown_prompt`].
+pub fn build_trd_prompt(p: &Project) -> (String, String) {
+    let system = prompts::office_system(&board_digest(p));
+    let mut prompt = String::new();
+    prompt.push_str("Draft the Technical Requirements Document (TRD) for the PRD below.\n\n");
+    prompt.push_str("PRD:\n");
+    prompt.push_str(&truncate_bytes(&p.prd_markdown, HARD_PROMPT_CAP / 3));
+    if !p.research_notes.trim().is_empty() {
+        prompt.push_str("\n\nRESEARCH FINDINGS (web-researched stack notes — weigh these):\n");
+        prompt.push_str(&truncate_bytes(&p.research_notes, HARD_PROMPT_CAP / 4));
+    }
+    prompt.push_str(
+        "\n\nEmit the COMPLETE Technical Requirements Document as markdown inside a fenced block \
+that starts with ```trd and ends with ``` — that exact fence is how the system captures the \
+TRD. Cover, as sections: technology stack with SPECIFIC current stable versions, architecture, \
+data model, API surface, testing strategy, deployment, and constraints. Be concrete and \
+decisive; this document drives the epic/story/task breakdown.\n",
+    );
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 

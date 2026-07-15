@@ -137,6 +137,12 @@ pub enum HostEvent {
     Result { agent_id: u64, text: String },
     /// A `Spawn` effect failed before producing any report.
     SpawnFailed { task: TaskId, reason: String },
+    /// The driver executed a `SpawnResearch` and learned the real research agent id (6.2b).
+    ResearchSpawned { agent_id: u64, spawned_at_ms: u64 },
+    /// A `SpawnResearch` failed before producing any findings — grant denied, unknown agent,
+    /// capacity, or a cross-process `{status:"sent"}` reply (6.2b). Drafting degrades to a
+    /// PRD-only TRD; a dead/hung researcher (killed path, runtime ceiling) degrades the same way.
+    ResearchFailed { reason: String },
 }
 
 /// Side effects for the driver to execute. `InvokeModel`/`PublishContext` are part
@@ -149,6 +155,13 @@ pub enum Effect {
         prompt: String,
         agent: &'static str,
         model: Option<String>,
+    },
+    /// Spawn the project-level `office-researcher` (ARCHITECTURE.md 6.2b). Two-phase like
+    /// `Spawn`: the driver runs it via the SAME `sessions.spawn_into` path and feeds the real
+    /// agent id back as `HostEvent::ResearchSpawned` (or `ResearchFailed`). No task/model — it
+    /// is a one-shot analyst on the whole PRD, inheriting the office role's model.
+    SpawnResearch {
+        prompt: String,
     },
     Kill {
         ext_agent_id: u64,
@@ -346,6 +359,118 @@ fn request_breakdown(p: &mut Project, ctx: &mut Ctx) {
     emit_invoke(ctx, InvokePurpose::Breakdown, &p.config.office_role, system, prompt);
 }
 
+// ---------------------------------------------------------------------------
+// Research + TRD pipeline (6.2b) — Drafting-only, deterministic, graceful-degrade
+// ---------------------------------------------------------------------------
+
+/// Whether `agent_id` is this project's live research binding (6.2b). Provisional (id 0)
+/// bindings never match a real host event.
+fn research_bound_to(p: &Project, agent_id: u64) -> bool {
+    matches!(&p.research, Some(b) if b.ext_agent_id == agent_id && agent_id != PROVISIONAL)
+}
+
+/// Kick off the web-research spawn after a PRD is captured (6.2b). Two-phase like a worker
+/// spawn: emit `SpawnResearch` and record a PROVISIONAL project-level binding so the reconcile
+/// ceiling can see it; the driver runs the spawn and feeds back `ResearchSpawned` with the real
+/// id (or `ResearchFailed`, which degrades to a PRD-only TRD).
+fn start_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let prompt = prompts::research(p);
+    ctx.fx.push(Effect::SpawnResearch { prompt });
+    p.research = Some(AgentBinding {
+        ext_agent_id: PROVISIONAL,
+        session: p.bound_session.clone().unwrap_or_default(),
+        spawned_at_ms: now_ms,
+        kind: AgentKind::Researcher,
+    });
+}
+
+/// The driver recorded the real research agent id onto the provisional binding (6.2b).
+fn on_research_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: &mut Ctx) {
+    if let Some(b) = &mut p.research {
+        b.ext_agent_id = agent_id;
+        b.spawned_at_ms = spawned_at_ms;
+        ctx.dirty = true;
+    }
+}
+
+/// The researcher finished (6.2b): parse the OFFICE-RESEARCH findings (tolerant; a missing
+/// block falls back to the whole reply text), store the capped notes, clear the binding, and
+/// draft the TRD.
+fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
+    p.research_notes = office::extract_research(&text);
+    p.research = None;
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: research done — drafting the TRD.", p.id.0),
+        ctx,
+    );
+    start_trd_invoke(p, ctx);
+    ctx.dirty = true;
+}
+
+/// Research could not run or died — spawn failure, dead researcher, or runtime ceiling (6.2b).
+/// Degrade gracefully: clear the binding, tell the user, and draft the TRD from the PRD alone.
+/// Never wedges Drafting.
+fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
+    p.research = None;
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: research skipped: {}; drafting the TRD from the PRD alone.",
+            p.id.0, reason
+        ),
+        ctx,
+    );
+    start_trd_invoke(p, ctx);
+    ctx.dirty = true;
+}
+
+/// Issue the TRD authoring invoke (6.2b): PRD (+ research notes when present) -> a ```trd
+/// fenced markdown document. Off-loop like every other invoke.
+fn start_trd_invoke(p: &mut Project, ctx: &mut Ctx) {
+    let (system, prompt) = office::build_trd_prompt(p);
+    emit_invoke(ctx, InvokePurpose::Trd, &p.config.office_role, system, prompt);
+}
+
+/// The TRD invoke returned (6.2b). `Ok` with a ```trd fence -> store it and announce the
+/// breakdown. A missing fence, or any `Err` (e.g. a second timeout after the driver's one
+/// pool-level retry), STILL requests the breakdown — from whatever docs exist — so Drafting
+/// never wedges on a TRD failure.
+fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    match outcome {
+        Ok(text) => match office::extract_fenced(&text, "trd") {
+            Some(trd) => {
+                p.trd_markdown = trd;
+                queue_notice(
+                    p,
+                    now_ms,
+                    format!("office[{}]: TRD drafted (panel) — breaking the work down now.", p.id.0),
+                    ctx,
+                );
+            }
+            None => queue_notice(
+                p,
+                now_ms,
+                format!(
+                    "office[{}]: TRD draft arrived without a fenced block; breaking down from the PRD.",
+                    p.id.0
+                ),
+                ctx,
+            ),
+        },
+        Err(e) => queue_notice(
+            p,
+            now_ms,
+            format!("office[{}]: TRD call failed: {}; drafting continues from the PRD alone.", p.id.0, e),
+            ctx,
+        ),
+    }
+    request_breakdown(p, ctx);
+    ctx.dirty = true;
+}
+
 /// The hard authorization gate (6.3.3). The driver has already validated + created the
 /// path; `delivery_valid` is its verdict, and `office::authorize` re-checks the shape
 /// before transitioning `Ready -> Running`.
@@ -395,10 +520,10 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             // replies are clipped for the notice — the full text is always in the
             // panel transcript.
             //
-            // PRD capture (6.2): a ```prd fenced block in the reply IS the PRD. Land
-            // it and immediately drive the pipeline forward with the breakdown invoke
-            // (Drafting -> Ready once it validates) — without this the persona chats
-            // forever while the board stays empty (live-test 2026-07-15).
+            // PRD capture (6.2 / 6.2b): a ```prd fenced block in a Drafting reply IS the PRD.
+            // Land it and kick the pipeline's FIRST step — web-research — NOT the breakdown
+            // directly. The flow is PRD -> research -> TRD -> breakdown; without capture the
+            // persona chats forever while the board stays empty (live-test 2026-07-15).
             if matches!(p.phase, ProjectPhase::Drafting) {
                 if let Some(prd) = office::extract_prd(&reply) {
                     p.prd_markdown = prd;
@@ -406,16 +531,38 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                         p,
                         now_ms,
                         format!(
-                            "office[{}]: PRD drafted (full text in the Workflow panel). Breaking it down into epics/stories/tasks now — I will report when the board is ready; do not authorize yet.",
+                            "office[{}]: PRD drafted (full text in the Workflow panel) — researching the stack before the TRD. I will report as the board fills in; do not authorize yet.",
                             p.id.0
                         ),
                         ctx,
                     );
-                    request_breakdown(p, ctx);
+                    start_research(p, now_ms, ctx);
                     ctx.dirty = true;
                     return;
                 }
             }
+
+            // TRD capture from a chat reply (6.2b): the user asked the office to (re)draft the
+            // TRD in conversation. Capture it in Drafting or Ready. NEVER auto-run the breakdown
+            // here — that only follows the deterministic Trd invoke — so in Ready the notice
+            // points at workflow_breakdown to re-plan from the revised TRD.
+            if matches!(p.phase, ProjectPhase::Drafting | ProjectPhase::Ready) {
+                if let Some(trd) = office::extract_fenced(&reply, "trd") {
+                    p.trd_markdown = trd;
+                    let notice = if matches!(p.phase, ProjectPhase::Ready) {
+                        format!(
+                            "office[{}]: TRD updated (panel). Run workflow_breakdown to re-plan the board from the revised TRD.",
+                            p.id.0
+                        )
+                    } else {
+                        format!("office[{}]: TRD updated (panel).", p.id.0)
+                    };
+                    queue_notice(p, now_ms, notice, ctx);
+                    ctx.dirty = true;
+                    return;
+                }
+            }
+
             let clipped = clip_notice(&reply);
             queue_notice(p, now_ms, format!("office[{}]: {}", p.id.0, clipped), ctx);
             ctx.dirty = true;
@@ -433,6 +580,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
         InvokePurpose::Breakdown => handle_breakdown_result(p, outcome, now_ms, ctx),
         InvokePurpose::BreakdownReask => handle_breakdown_reask_result(p, outcome, now_ms, ctx),
         InvokePurpose::BreakdownCompact => handle_breakdown_compact_result(p, outcome, now_ms, ctx),
+        InvokePurpose::Trd => handle_trd_result(p, outcome, now_ms, ctx),
     }
 }
 
@@ -649,6 +797,10 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
         HostEvent::AgentsDone { agent_id, status } => on_agents_done(p, agent_id, &status, now_ms, ctx),
         HostEvent::Result { agent_id, text } => on_result(p, agent_id, text, now_ms, ctx),
         HostEvent::SpawnFailed { task, reason } => on_spawn_failed(p, &task, reason, now_ms, ctx),
+        HostEvent::ResearchSpawned { agent_id, spawned_at_ms } => {
+            on_research_spawned(p, agent_id, spawned_at_ms, ctx)
+        }
+        HostEvent::ResearchFailed { reason } => research_degrade(p, reason, now_ms, ctx),
     }
 }
 
@@ -675,6 +827,17 @@ fn on_spawned(p: &mut Project, task: &TaskId, agent_id: u64, spawned_at_ms: u64,
 /// `error`/`killed`/anything else -> re-queue the task (worker -> Todo attempt++,
 /// reviewer -> Review{None}).
 fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx: &mut Ctx) {
+    // Research binding (6.2b) is project-level, checked before the task bindings. `done` ->
+    // fetch the findings (existing FetchResult path); anything else is a dead researcher and
+    // degrades exactly like a spawn failure (never wedges Drafting).
+    if research_bound_to(p, agent_id) {
+        if status.eq_ignore_ascii_case("done") {
+            ctx.fx.push(Effect::FetchResult { ext_agent_id: agent_id });
+        } else {
+            research_degrade(p, format!("researcher {status}"), now_ms, ctx);
+        }
+        return;
+    }
     let idx = match find_by_agent(p, agent_id) {
         Some(i) => i,
         None => return,
@@ -690,6 +853,11 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx
 
 /// A fetched terminal report. Dispatch to the worker or reviewer path by binding kind.
 fn on_result(p: &mut Project, agent_id: u64, text: String, now_ms: u64, ctx: &mut Ctx) {
+    // Research findings (6.2b) route to the project-level handler, before the task lookup.
+    if research_bound_to(p, agent_id) {
+        on_research_result(p, text, now_ms, ctx);
+        return;
+    }
     let idx = match find_by_agent(p, agent_id) {
         Some(i) => i,
         None => return,
@@ -697,7 +865,9 @@ fn on_result(p: &mut Project, agent_id: u64, text: String, now_ms: u64, ctx: &mu
     match binding_kind(&p.tasks[idx].state) {
         Some(AgentKind::Worker) => on_worker_result(p, idx, text, now_ms, ctx),
         Some(AgentKind::Reviewer) => on_reviewer_result(p, idx, text, now_ms, ctx),
-        None => {}
+        // A task binding is only ever Worker/Reviewer; a Researcher is project-level and
+        // never reaches this task path (research routes above, in `on_result`).
+        Some(AgentKind::Researcher) | None => {}
     }
 }
 
@@ -845,6 +1015,17 @@ fn runtime_ceiling(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
             ext_agent_id: agent_id,
         });
         requeue_failed(p, i, now_ms, "runtime-ceiling", ctx);
+    }
+
+    // The project-level research binding (6.2b) shares the same ceiling. An over-age
+    // researcher is force-killed and Drafting degrades to a PRD-only TRD — a hung researcher
+    // never wedges the pipeline (reconcile killed-path coverage).
+    if let Some(b) = &p.research {
+        if b.ext_agent_id != PROVISIONAL && now_ms.saturating_sub(b.spawned_at_ms) > ceiling {
+            let agent_id = b.ext_agent_id;
+            ctx.fx.push(Effect::Kill { ext_agent_id: agent_id });
+            research_degrade(p, "runtime ceiling".to_string(), now_ms, ctx);
+        }
     }
 }
 

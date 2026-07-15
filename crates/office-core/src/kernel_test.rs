@@ -36,6 +36,9 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         name: "Proj".to_string(),
         phase,
         prd_markdown: "# PRD\nbuild it".to_string(),
+        trd_markdown: String::new(),
+        research_notes: String::new(),
+        research: None,
         office_transcript: Vec::new(),
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -65,6 +68,15 @@ fn reviewer_binding(id: u64, at: u64) -> AgentBinding {
         session: "sess-1".to_string(),
         spawned_at_ms: at,
         kind: AgentKind::Reviewer,
+    }
+}
+
+fn researcher_binding(id: u64, at: u64) -> AgentBinding {
+    AgentBinding {
+        ext_agent_id: id,
+        session: "sess-1".to_string(),
+        spawned_at_ms: at,
+        kind: AgentKind::Researcher,
     }
 }
 
@@ -939,6 +951,16 @@ fn invoke_effects(fx: &[Effect]) -> Vec<&Effect> {
     fx.iter().filter(|e| matches!(e, Effect::InvokeModel { .. })).collect()
 }
 
+/// Assert exactly one `InvokeModel` effect was emitted and return its purpose.
+fn sole_invoke_purpose(fx: &[Effect]) -> InvokePurpose {
+    let invokes = invoke_effects(fx);
+    assert_eq!(invokes.len(), 1, "expected exactly one InvokeModel effect");
+    match invokes[0] {
+        Effect::InvokeModel { purpose, .. } => *purpose,
+        other => panic!("expected InvokeModel, got {other:?}"),
+    }
+}
+
 #[test]
 fn breakdown_timeout_falls_back_to_one_compact_invoke() {
     // The kernel only ever sees this Err after the driver's own pool-level retry has
@@ -1078,6 +1100,139 @@ fn breakdown_reask_success_lands_tasks_unchanged() {
     assert!(invoke_effects(&fx).is_empty());
     assert_eq!(p.phase, ProjectPhase::Ready);
     assert_eq!(p.tasks.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// PRD -> research -> TRD -> breakdown pipeline (6.2b)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prd_capture_spawns_research_and_defers_breakdown() {
+    // A ```prd fence in a Drafting reply lands the PRD and kicks off web-research — NOT the
+    // breakdown. No models.invoke fires yet (research runs first).
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let reply = "Agreed.\n```prd\n# App\nBuild a CLI.\n```\nShall we?";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.to_string())), 1000, 4);
+
+    assert_eq!(p.prd_markdown, "# App\nBuild a CLI.");
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research spawn emitted");
+    assert!(invoke_effects(&fx).is_empty(), "no breakdown/TRD invoke until research finishes");
+    // A provisional (id 0) project-level research binding is recorded, two-phase.
+    match &p.research {
+        Some(b) => {
+            assert_eq!(b.kind, AgentKind::Researcher);
+            assert_eq!(b.ext_agent_id, 0, "provisional until the driver reports the real id");
+        }
+        None => panic!("a research binding must be recorded"),
+    }
+    assert!(p.outbox.iter().any(|n| n.text.contains("research")), "notice mentions researching");
+}
+
+#[test]
+fn research_done_status_fetches_the_findings() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.research = Some(researcher_binding(55, 1000));
+    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 55, status: "done".into() }), 2000, 4);
+    assert_eq!(fx, vec![Effect::FetchResult { ext_agent_id: 55 }]);
+}
+
+#[test]
+fn research_result_stores_capped_notes_and_starts_trd() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App\nBuild a Rust CLI.".into();
+    p.research = Some(researcher_binding(55, 1000));
+    let report = "preamble\nOFFICE-RESEARCH\nfindings: - use clap v4\n- ratatui for the TUI\n";
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 55, text: report.into() }), 2000, 4);
+
+    assert!(p.research_notes.contains("clap v4"));
+    assert!(p.research.is_none(), "binding cleared once the findings land");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Trd);
+    assert!(p.outbox.iter().any(|n| n.text.contains("research done")));
+}
+
+#[test]
+fn research_failed_degrades_to_a_prd_only_trd() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.research = Some(researcher_binding(0, 1000)); // provisional; spawn never confirmed
+    let fx = step(
+        &mut p,
+        Input::Host(HostEvent::ResearchFailed { reason: "grant denied".into() }),
+        1500,
+        4,
+    );
+
+    assert!(p.research.is_none());
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Trd, "degrade goes straight to the TRD invoke");
+    assert!(p
+        .outbox
+        .iter()
+        .any(|n| n.text.contains("research skipped") && n.text.contains("grant denied")));
+}
+
+#[test]
+fn research_runtime_ceiling_kills_and_degrades_to_trd() {
+    // A hung researcher is force-killed by the reconcile ceiling and Drafting degrades to a
+    // PRD-only TRD — the pipeline never wedges on a dead researcher.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.research = Some(researcher_binding(700, 0));
+    let now = p.config.worker_max_runtime_ms + 5_000;
+    let fx = step(&mut p, Input::Host(HostEvent::Reconcile), now, 0);
+
+    assert!(fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 700 })));
+    assert!(p.research.is_none(), "over-age researcher cleared");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Trd);
+    assert!(p.outbox.iter().any(|n| n.text.contains("research skipped")));
+}
+
+#[test]
+fn trd_result_lands_and_breakdown_prompt_carries_the_trd() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App\nPRD body".into();
+    let trd_reply = "Here:\n```trd\n# TRD\nUse axum 0.7 and sqlx.\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Trd, Ok(trd_reply.to_string())), 1000, 4);
+
+    assert_eq!(p.trd_markdown, "# TRD\nUse axum 0.7 and sqlx.");
+    let invokes = invoke_effects(&fx);
+    assert_eq!(invokes.len(), 1);
+    match invokes[0] {
+        Effect::InvokeModel { purpose, prompt, .. } => {
+            assert_eq!(*purpose, InvokePurpose::Breakdown);
+            assert!(prompt.contains("axum 0.7"), "the TRD is folded into the breakdown prompt: {prompt}");
+        }
+        other => panic!("expected a breakdown InvokeModel, got {other:?}"),
+    }
+    assert!(p.outbox.iter().any(|n| n.text.contains("TRD drafted")));
+}
+
+#[test]
+fn trd_error_still_requests_breakdown_from_the_prd() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Trd, Err("model call timed out".into())),
+        1000,
+        4,
+    );
+
+    assert!(p.trd_markdown.is_empty(), "a failed TRD leaves trd_markdown empty");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "breakdown still runs, from the PRD alone");
+    assert!(p.outbox.iter().any(|n| n.text.contains("TRD call failed")));
+}
+
+#[test]
+fn ready_phase_chat_trd_fence_updates_without_breakdown() {
+    // A ```trd fence in a normal chat reply (user revised the TRD in conversation) is captured
+    // in Ready, but must NOT re-run the breakdown automatically — it points at workflow_breakdown.
+    let mut p = project(ProjectPhase::Ready, vec![]);
+    let reply = "Revised the TRD:\n```trd\n# TRD v2\nSwitch to Postgres.\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.to_string())), 1000, 4);
+
+    assert_eq!(p.trd_markdown, "# TRD v2\nSwitch to Postgres.");
+    assert!(invoke_effects(&fx).is_empty(), "a chat-authored TRD never auto-runs the breakdown");
+    assert!(p.outbox.iter().any(|n| n.text.contains("workflow_breakdown")));
 }
 
 #[test]

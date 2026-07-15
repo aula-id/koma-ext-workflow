@@ -12,6 +12,9 @@ fn project(phase: ProjectPhase) -> Project {
         name: "Shop Crawler".to_string(),
         phase,
         prd_markdown: "# PRD\nBuild a crawler.\n".to_string(),
+        trd_markdown: String::new(),
+        research_notes: String::new(),
+        research: None,
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: None,
@@ -287,4 +290,71 @@ fn extract_prd_tolerates_an_unterminated_fence_and_rejects_empty() {
     );
     assert_eq!(office::extract_prd("```prd\n\n```"), None);
     assert_eq!(office::extract_prd(""), None);
+}
+
+// ---- extract_fenced generalization + TRD / research pipeline (6.2b) ----
+
+#[test]
+fn extract_fenced_generalizes_prd_and_trd_capture() {
+    assert_eq!(office::extract_fenced("```prd\n# P\nbody\n```", "prd").as_deref(), Some("# P\nbody"));
+    assert_eq!(office::extract_fenced("```trd\n# T\nstack\n```", "trd").as_deref(), Some("# T\nstack"));
+    // The wrong tag never matches the other's fence.
+    assert_eq!(office::extract_fenced("```prd\nx\n```", "trd"), None);
+    // Last fence wins, prose ignored — same contract as extract_prd.
+    assert_eq!(
+        office::extract_fenced("```trd\nold\n```\nrevised:\n```trd\nnew\n```", "trd").as_deref(),
+        Some("new")
+    );
+    // extract_prd is the thin wrapper over extract_fenced(_, "prd").
+    assert_eq!(office::extract_prd("```prd\nY\n```").as_deref(), Some("Y"));
+}
+
+#[test]
+fn build_trd_prompt_folds_prd_and_research_notes_with_the_trd_contract() {
+    let mut p = project(ProjectPhase::Drafting);
+    p.prd_markdown = "# PRD\nCrawler.".to_string();
+    p.research_notes = "use reqwest 0.12".to_string();
+    let (system, prompt) = office::build_trd_prompt(&p);
+    assert!(system.contains("front office"));
+    assert!(prompt.contains("Crawler"), "PRD is included");
+    assert!(prompt.contains("reqwest 0.12"), "research notes are included when present");
+    assert!(prompt.contains("```trd"), "the ```trd capture contract is stated");
+    assert!(prompt.len() <= office::HARD_PROMPT_CAP);
+}
+
+#[test]
+fn build_trd_prompt_omits_the_research_section_when_notes_are_empty() {
+    let mut p = project(ProjectPhase::Drafting);
+    p.prd_markdown = "# PRD".to_string();
+    let (_system, prompt) = office::build_trd_prompt(&p);
+    assert!(!prompt.contains("RESEARCH FINDINGS"), "no research section without notes");
+}
+
+#[test]
+fn extract_research_prefers_the_findings_block_else_the_whole_text() {
+    assert_eq!(
+        office::extract_research("intro\nOFFICE-RESEARCH\nfindings: - a\n- b\n"),
+        "- a\n- b"
+    );
+    // No block -> the whole reply text, trimmed.
+    assert_eq!(office::extract_research("  just prose  "), "just prose");
+}
+
+#[test]
+fn extract_research_caps_at_16kb_with_a_marker() {
+    let huge = format!("OFFICE-RESEARCH\nfindings: {}", "x".repeat(40_000));
+    let notes = office::extract_research(&huge);
+    assert!(notes.len() <= office::RESEARCH_NOTES_CAP, "notes were {} bytes", notes.len());
+    assert!(notes.ends_with("... [truncated]"));
+}
+
+#[test]
+fn build_breakdown_prompt_folds_the_trd_when_present() {
+    let mut p = project(ProjectPhase::Drafting);
+    p.trd_markdown = "# TRD\naxum 0.7".to_string();
+    let (_s, normal) = office::build_breakdown_prompt(&p, None, false);
+    assert!(normal.contains("axum 0.7"), "TRD folded into the normal breakdown prompt");
+    let (_s2, compact) = office::build_breakdown_prompt(&p, None, true);
+    assert!(compact.contains("axum 0.7"), "compact mode gets the TRD slice too");
+    assert!(compact.contains("COMPACT MODE"));
 }

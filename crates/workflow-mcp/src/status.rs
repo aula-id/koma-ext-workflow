@@ -95,7 +95,22 @@ fn project_block(p: &Project) -> String {
     s.push_str(&format!("  bounces: {bounces}\n"));
     let pending = p.outbox.iter().filter(|n| !n.sent).count();
     s.push_str(&format!("  outbox: {pending} pending\n"));
+    // Drafting-pipeline docs presence (ARCHITECTURE.md 6.2b): PRD -> research -> TRD.
+    s.push_str(&format!(
+        "  docs: prd {}, trd {}, research {}\n",
+        yn(!p.prd_markdown.trim().is_empty()),
+        yn(!p.trd_markdown.trim().is_empty()),
+        yn(!p.research_notes.trim().is_empty()),
+    ));
     s
+}
+
+fn yn(present: bool) -> &'static str {
+    if present {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 /// Single-project detail: the summary block plus the delivery path and a per-task listing.

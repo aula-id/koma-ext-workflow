@@ -687,6 +687,42 @@ budget (broker.rs:934-1038). Multi-turn is reconstructed by the extension:
   surface "office did not answer; try again" to the caller. Role = `config.office_role`, default
   "main"; "unknown role" is surfaced verbatim (host never silently falls back — broker.rs:934-1038).
 
+### 6.2b Research + TRD (PRD -> research -> TRD -> breakdown)
+
+Drafting is a deterministic four-step pipeline, not a straight PRD -> breakdown jump. When a
+persona reply lands a ```prd fence, the kernel captures the PRD and — instead of asking for the
+breakdown — kicks off the rest of the pipeline:
+
+1. **Research.** The kernel emits `Effect::SpawnResearch { prompt }`; the driver spawns the
+   `office-researcher` sub-agent (manifest.json) via the SAME `sessions.spawn_into` path as
+   workers (`notify: true`), and records a project-level `Project.research` binding (two-phase:
+   provisional id 0 until `HostEvent::ResearchSpawned` reports the real id). The researcher
+   web-researches the PRD's tech choices (current stable versions, best practices, pitfalls,
+   alternatives) with READ/WEB tools only and files an `OFFICE-RESEARCH\nfindings: ...` block
+   (tolerant-parsed like `report.rs`).
+2. **Findings.** On `agents.done` for the research binding the driver fetches the report
+   (`FetchResult`), the kernel parses the findings (missing block -> whole text), stores them in
+   `Project.research_notes` (16KB cap), clears the binding, and issues the TRD invoke.
+3. **TRD.** `InvokePurpose::Trd`: PRD + research notes -> a COMPLETE Technical Requirements
+   Document inside a ```trd fence (captured by the generalized `office::extract_fenced`). Stored
+   in `Project.trd_markdown`; then the breakdown runs, with the TRD folded into its prompt
+   alongside the PRD.
+
+**Graceful degradation is the invariant — Drafting never wedges.** A research spawn failure
+(grant denied, unknown agent, capacity, cross-process), a dead/killed researcher, or the
+reconcile runtime ceiling all degrade identically: clear the binding, notice "research skipped",
+and draft the TRD from the PRD alone. A TRD invoke `Err` (or a reply with no ```trd fence) still
+requests the breakdown from whatever docs exist. The research binding participates in reconcile
+(runtime ceiling + `agents.status` killed-path + orphan sweep) exactly like a worker/reviewer.
+
+A ```trd fence in a NORMAL persona reply (the user revised the TRD in chat) is also captured, in
+Drafting or Ready; in Ready it does NOT re-run the breakdown automatically — the notice points at
+`workflow_breakdown` to re-plan.
+
+> The `office-researcher` sub-agent declares no explicit `tools` field: per-sub-agent tool
+> restriction (web+read only) is pending host support, so read/web-only is enforced by the
+> spawn prompt for now.
+
 ### 6.3 PRD -> breakdown -> authorization flow
 
 1. **Drafting**: user talks to the office (panel chat / workflow_brief / inbox). Office

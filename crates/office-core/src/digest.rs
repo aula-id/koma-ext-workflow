@@ -242,6 +242,10 @@ fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
 
     if mode == SnapshotMode::Full {
         obj["prdMarkdown"] = json!(p.prd_markdown);
+        // The TRD + research notes (6.2b) ride full mode exactly like prdMarkdown; summary
+        // mode drops all three under the 900KB size guard.
+        obj["trdMarkdown"] = json!(p.trd_markdown);
+        obj["researchNotes"] = json!(p.research_notes);
         obj["officeTranscript"] = json!(p
             .office_transcript
             .iter()

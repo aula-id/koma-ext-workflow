@@ -30,6 +30,9 @@ pub struct AgentBinding {
 pub enum AgentKind {
     Worker,
     Reviewer,
+    /// The web-research analyst spawned once per project during Drafting (PRD -> research
+    /// -> TRD -> breakdown, ARCHITECTURE.md 6.2b). Project-level, not task-level.
+    Researcher,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -208,6 +211,21 @@ pub struct Project {
     pub name: String,
     pub phase: ProjectPhase,
     pub prd_markdown: String,
+    /// The Technical Requirements Document, authored after web-research in the Drafting
+    /// pipeline (PRD -> research -> TRD -> breakdown, ARCHITECTURE.md 6.2b). `#[serde(default)]`
+    /// so state files persisted before this field existed still deserialize (empty by default).
+    #[serde(default)]
+    pub trd_markdown: String,
+    /// Web-research findings gathered by the `office-researcher` sub-agent before the TRD is
+    /// drafted. Stored capped at 16KB (the writer truncates with a marker). `#[serde(default)]`
+    /// for the same back-compat reason as `trd_markdown`.
+    #[serde(default)]
+    pub research_notes: String,
+    /// The project-level research sub-agent binding, present only while the office-researcher
+    /// is in flight during Drafting. Two-phase like a worker binding (provisional id 0 until
+    /// the driver reports the real one). `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub research: Option<AgentBinding>,
     pub office_transcript: Vec<ChatMsg>,
     pub office_summary: String,
     pub delivery_path: Option<PathBuf>,

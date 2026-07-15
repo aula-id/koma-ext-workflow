@@ -185,11 +185,16 @@ The end-to-end smoke test requires a running koma daemon. Follow this sequence:
 
 5. **Author a PRD** (dialogue with the office):
    - The office persona asks clarifying questions
-   - On "write the PRD", the office drafts markdown sections
+   - On "write the PRD", the office drafts markdown sections (a ```prd fenced block)
 
-6. **Accept the breakdown**:
-   - Panel: see the auto-generated epics, stories, tasks
-   - You can edit structure before going live
+6. **Watch the research -> TRD -> breakdown pipeline** (ARCHITECTURE.md 6.2b):
+   - Capturing the PRD auto-spawns the `office-researcher` (web-researches the stack) — watch
+     the chat notice "researching the stack before the TRD"
+   - Research findings land, the office drafts the TRD (```trd), then the breakdown runs
+   - Panel `docs` tab: see the PRD, the Technical Requirements, and the collapsed research notes
+   - Panel board: see the auto-generated epics, stories, tasks; you can edit structure before go
+   - Degradation is graceful: if research or the TRD call fails, drafting continues from the PRD
+     alone and the board still fills (nothing wedges Drafting)
 
 7. **Authorize and run**:
    - Panel: set a delivery path inside the session workspace (e.g., `~/koma-workflow-test/delivery`)

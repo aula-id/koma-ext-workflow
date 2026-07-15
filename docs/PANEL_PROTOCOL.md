@@ -92,10 +92,16 @@ Envelope = {
   seq: <u64>,
   tasks: [ Task ],
   prdMarkdown, officeTranscript: [ { who: "user"|"office", text } ], officeSummary,
+  trdMarkdown, researchNotes,   // 6.2b Drafting pipeline docs; full mode only, drop in summary
   config: { maxWorkers, bounceBudget, workerModel: <string|null>,
             reviewerModel: <string|null>, keepDesks: <bool> }   // config_set round-trip
 }
 ```
+
+`trdMarkdown` (Technical Requirements Document) and `researchNotes` (web-research findings) are
+authored in the Drafting pipeline (PRD -> research -> TRD -> breakdown, ARCHITECTURE.md 6.2b).
+Both are full-mode only and are dropped in summary mode, exactly like `prdMarkdown`. Additive:
+older panels ignore the extra keys; the schema stays `workflow/1`.
 
 ### 2.2 `Task` (full mode; summary mode omits the body fields)
 

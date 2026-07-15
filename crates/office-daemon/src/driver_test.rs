@@ -60,6 +60,9 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         name: format!("Project {slug}"),
         phase,
         prd_markdown: "# PRD\n".to_string(),
+        trd_markdown: String::new(),
+        research_notes: String::new(),
+        research: None,
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -594,12 +597,14 @@ fn brief_runs_invoke_off_loop_and_result_lands_in_transcript_without_starving_di
 }
 
 #[test]
-fn persona_reply_with_prd_fence_lands_prd_and_kicks_breakdown() {
-    // Live-test 2026-07-15: the persona narrated "handoff complete" forever while
-    // prd_markdown stayed empty and the board never filled. A ```prd fence in the
-    // reply must land as the PRD and immediately trigger the breakdown invoke.
+fn persona_reply_with_prd_fence_lands_prd_and_kicks_research() {
+    // The PRD -> research -> TRD -> breakdown pipeline (ARCHITECTURE.md 6.2b): a ```prd fence
+    // in a Drafting reply must land as the PRD and kick off the office-researcher spawn — NOT
+    // the breakdown directly (that used to be the flow; it now waits for research + TRD).
     let (store, _dir) = temp_store();
-    let mut d = driver(store, FakeHost::new());
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 700, "status": "spawned" }));
+    let mut d = driver(store, host);
     let fake = FakeInvoker::default();
     d.set_invoker(Box::new(fake.clone()));
 
@@ -626,10 +631,99 @@ fn persona_reply_with_prd_fence_lands_prd_and_kicks_breakdown() {
         a.outbox.iter().any(|n| n.text.contains("PRD drafted")),
         "chat notice announces the captured PRD"
     );
+    // The ```prd fence kicks the office-researcher spawn (same host path as workers).
+    let spawn = last_call(&d.host, "sessions.spawn_into").expect("a research spawn");
+    assert_eq!(spawn.get("agent").and_then(Value::as_str), Some("office-researcher"));
+    assert_eq!(spawn.get("notify").and_then(Value::as_bool), Some(true));
+    match &a.research {
+        Some(b) => assert_eq!(b.ext_agent_id, 700, "the real research agent id is recorded on the project"),
+        None => panic!("a research binding must be recorded after the spawn"),
+    }
+    // No breakdown or TRD invoke yet — those wait until the researcher finishes.
     let jobs = fake.jobs.lock().unwrap();
     assert!(
-        jobs.iter().any(|j| j.purpose == InvokePurpose::Breakdown && j.proj_slug == "a"),
-        "breakdown invoke kicked off automatically after PRD capture"
+        jobs.iter().all(|j| j.purpose != InvokePurpose::Breakdown && j.purpose != InvokePurpose::Trd),
+        "breakdown/TRD do not run until after research completes"
+    );
+}
+
+#[test]
+fn research_agents_done_fetches_findings_and_drafts_the_trd() {
+    // Full research leg (6.2b): PRD fence -> research spawn (id recorded) -> agents.done ->
+    // agents.result -> findings stored -> TRD invoke submitted off-loop.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 700, "status": "spawned" }));
+    host.script("agents.result", json!({ "agentId": 700, "output": "OFFICE-RESEARCH\nfindings: - use axum 0.7\n" }));
+    let mut d = driver(store, host);
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    d.insert_for_test(drafting("a"), 1_000);
+    d.handle(
+        handlers::Input::Command(handlers::Command::Brief {
+            project: Some("a".to_string()),
+            message: "build a service".to_string(),
+        }),
+        1_000,
+    );
+    let req_id = fake.jobs.lock().unwrap()[0].req_id;
+    d.handle(invoke_done(req_id, Ok("```prd\n# Service\nBuild it.\n```".to_string())), 2_000);
+    match &d.project("a").unwrap().research {
+        Some(b) => assert_eq!(b.ext_agent_id, 700, "the real research agent id is recorded"),
+        None => panic!("a research binding must be recorded"),
+    }
+
+    // The private agents.done notify for the researcher correlates to project "a" via the
+    // research binding, fetches the findings, stores them, and drafts the TRD.
+    d.handle(
+        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 700, status: "done".to_string() }),
+        3_000,
+    );
+    let a = d.project("a").unwrap();
+    assert!(a.research_notes.contains("axum 0.7"), "findings parsed and stored");
+    assert!(a.research.is_none(), "binding cleared after findings land");
+    assert_eq!(call_count(&d.host, "agents.result"), 1, "findings fetched via agents.result");
+    assert!(
+        fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::Trd && j.proj_slug == "a"),
+        "the TRD invoke is submitted after research completes"
+    );
+}
+
+#[test]
+fn reconcile_runtime_ceiling_kills_over_age_researcher_and_degrades() {
+    // Reconcile must cover a Drafting project's research binding (6.2b): an over-age
+    // researcher is force-killed and Drafting degrades to a PRD-only TRD.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("agents.kill", json!({ "killed": true }));
+    host.script("agents.list", json!([]));
+    let mut d = driver(store, host);
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    let mut p = drafting("a");
+    p.research = Some(AgentBinding {
+        ext_agent_id: 700,
+        session: "sess-x".to_string(),
+        spawned_at_ms: 0,
+        kind: AgentKind::Researcher,
+    });
+    d.insert_for_test(p, 0);
+
+    let now = 21 * 60 * 1000; // past the 20-minute ceiling
+    d.reconcile(now);
+
+    assert_eq!(call_count(&d.host, "agents.kill"), 1, "the over-age researcher is force-killed");
+    assert_eq!(
+        last_call(&d.host, "agents.kill").unwrap().get("agentId").and_then(Value::as_u64),
+        Some(700)
+    );
+    let a = d.project("a").unwrap();
+    assert!(a.research.is_none(), "the researcher binding is cleared");
+    assert!(
+        fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::Trd),
+        "Drafting degrades to a PRD-only TRD invoke"
     );
 }
 

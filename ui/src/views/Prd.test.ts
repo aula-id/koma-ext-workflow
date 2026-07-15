@@ -1,5 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import React, { act } from 'react';
+import { createRoot, Root } from 'react-dom/client';
 import { escapeHtml, renderMarkdownSafe } from './Prd';
+import Prd from './Prd';
+import type { Project } from './Board';
 
 describe('escapeHtml', () => {
   it('escapes the five HTML-significant characters', () => {
@@ -78,5 +82,72 @@ describe('renderMarkdownSafe: tables, rules, ordered lists', () => {
     const html = renderMarkdownSafe('a | b | c');
     expect(html).toContain('<p>a | b | c</p>');
     expect(html).not.toContain('<table>');
+  });
+});
+
+// The 6.2b docs tab: PRD + TRD + collapsed research notes. Rendered via react-dom/client
+// (createRoot + act), matching the Dashboard/App component-test pattern in this repo.
+describe('Prd docs tab renders the TRD + research sections', () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  // A minimal Ready-phase project (so the Drafting-only office-chat pane is not rendered).
+  function project(overrides: Partial<Project>): Project {
+    return {
+      id: 'p1',
+      name: 'P1',
+      phase: { kind: 'ready' },
+      deliveryPath: null,
+      seq: 1,
+      tasks: [],
+      ...overrides,
+    } as Project;
+  }
+
+  it('renders the technical-requirements section when a TRD is present', () => {
+    act(() => {
+      root.render(
+        React.createElement(Prd, {
+          project: project({ prdMarkdown: '# PRD\nbody', trdMarkdown: '# TRD\nUse axum 0.7.' }),
+        }),
+      );
+    });
+    expect(container.textContent).toContain('technical requirements');
+    expect(container.innerHTML).toContain('Use axum 0.7.');
+  });
+
+  it('omits the TRD section and research notes when both are absent', () => {
+    act(() => {
+      root.render(React.createElement(Prd, { project: project({ prdMarkdown: '# PRD\nonly' }) }));
+    });
+    expect(container.textContent).not.toContain('technical requirements');
+    expect(container.textContent).not.toContain('research notes');
+  });
+
+  it('renders research notes inside a collapsed <details>', () => {
+    act(() => {
+      root.render(
+        React.createElement(Prd, {
+          project: project({ prdMarkdown: '# PRD', researchNotes: '- reqwest 0.12 for HTTP' }),
+        }),
+      );
+    });
+    const details = container.querySelector('details');
+    expect(details).not.toBeNull();
+    expect(details?.open).toBe(false);
+    expect(container.textContent).toContain('research notes');
+    expect(container.innerHTML).toContain('reqwest 0.12');
   });
 });

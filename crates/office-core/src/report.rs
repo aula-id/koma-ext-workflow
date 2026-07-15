@@ -143,6 +143,17 @@ fn parse_ack_comments(map: &HashMap<String, Vec<String>>) -> Vec<CommentId> {
 
 const REPORT_KEYS: &[&str] = &["status", "summary", "delivered", "ack-comments", "blocked-reason"];
 const REVIEW_KEYS: &[&str] = &["verdict", "reasons"];
+const RESEARCH_KEYS: &[&str] = &["findings"];
+
+/// Parse the LAST `OFFICE-RESEARCH` block's `findings` value out of `text` (ARCHITECTURE.md
+/// 6.2b), tolerant exactly like [`parse_report`]/[`parse_review`]: fence-tolerant marker
+/// match, case drift ignored, continuation lines folded into `findings`. `None` when no block
+/// is present — the caller then falls back to the whole reply text (a researcher that skipped
+/// the block still yields usable notes).
+pub fn parse_research(text: &str) -> Option<String> {
+    let map = scan_block(text, "OFFICE-RESEARCH", RESEARCH_KEYS)?;
+    joined(&map, "findings")
+}
 
 /// Parse the LAST `OFFICE-REPORT` trailer out of `text`.
 pub fn parse_report(text: &str) -> ReportTrailer {

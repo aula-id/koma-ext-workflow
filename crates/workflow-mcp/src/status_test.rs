@@ -42,6 +42,9 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         name: name.to_string(),
         phase,
         prd_markdown: String::new(),
+        trd_markdown: String::new(),
+        research_notes: String::new(),
+        research: None,
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -87,6 +90,9 @@ fn seed() -> (tempfile::TempDir, PathBuf) {
         OutboundNotice { id: 1, text: "done soon".to_string(), sent: false, paused: false },
         OutboundNotice { id: 2, text: "already sent".to_string(), sent: true, paused: false },
     ];
+    // PRD + TRD present, research not yet run -> digest docs line reads yes/yes/no.
+    shop.prd_markdown = "# Shop\nbuild the store".to_string();
+    shop.trd_markdown = "# TRD\nstack choices".to_string();
     store.save_project(&shop).unwrap();
 
     let blog = project(
@@ -115,6 +121,7 @@ fn all_projects_digest_reports_counts_parked_bounces_and_outbox() {
     assert!(out.contains("parked: shop/e/s/t3 (bounce budget exceeded)"), "{out}");
     assert!(out.contains("bounces: 5"), "{out}");
     assert!(out.contains("outbox: 1 pending"), "{out}");
+    assert!(out.contains("docs: prd yes, trd yes, research no"), "{out}");
 
     // Halted phase renders its reason; both projects appear, most-recent (higher seq) first.
     assert!(out.contains("blog (Company Blog) - halted: reviewer down"), "{out}");

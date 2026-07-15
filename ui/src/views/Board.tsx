@@ -54,6 +54,11 @@ export interface Project {
   epics?: Epic[];
   stories?: Story[];
   prdMarkdown?: string;
+  /** Technical Requirements Document (full snapshot only, 6.2b); authored after web-research
+   * in the Drafting pipeline. Rendered alongside the PRD in the 'docs' tab. */
+  trdMarkdown?: string;
+  /** Web-research findings (full snapshot only, 6.2b); shown collapsed under the docs. */
+  researchNotes?: string;
   officeTranscript?: ChatMsg[];
   officeSummary?: string;
   outbox?: OutboundNoticeView[];
@@ -369,7 +374,7 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
                 borderRadius: 0,
               }}
             >
-              {t === 'board' ? 'board' : t === 'drilldown' ? 'drilldown' : t === 'depmap' ? 'dependencies' : 'prd'}
+              {t === 'board' ? 'board' : t === 'drilldown' ? 'drilldown' : t === 'depmap' ? 'dependencies' : 'docs'}
             </button>
           ))}
         </div>

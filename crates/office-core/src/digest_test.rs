@@ -33,6 +33,9 @@ mod tests {
             name: format!("Project {id}"),
             phase,
             prd_markdown: "# PRD\nbody".to_string(),
+            trd_markdown: String::new(),
+            research_notes: String::new(),
+            research: None,
             office_transcript: vec![ChatMsg { who: ChatAuthor::User, text: "hi".to_string() }],
             office_summary: String::new(),
             delivery_path: Some(format!("/work/{id}/deliver").into()),
@@ -166,11 +169,24 @@ mod tests {
         assert!(t.get("comments").is_none());
         assert!(t.get("description").is_none());
         assert!(arr[0].get("prdMarkdown").is_none());
+        assert!(arr[0].get("trdMarkdown").is_none(), "summary mode omits the TRD body");
+        assert!(arr[0].get("researchNotes").is_none(), "summary mode omits research notes");
         assert!(arr[0].get("config").is_none(), "summary mode omits config too (size guard)");
 
         // Counts and state survive.
         assert_eq!(t["id"], "t1");
         assert_eq!(t["state"], "todo");
         assert_eq!(t["column"], "todo");
+    }
+
+    #[test]
+    fn panel_snapshot_full_mode_carries_trd_and_research_notes() {
+        let mut p = project("p1", 1, ProjectPhase::Running, vec![]);
+        p.trd_markdown = "# TRD\naxum 0.7".to_string();
+        p.research_notes = "- reqwest 0.12 for HTTP".to_string();
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let obj = &snap.as_array().expect("array")[0];
+        assert_eq!(obj["trdMarkdown"], "# TRD\naxum 0.7");
+        assert_eq!(obj["researchNotes"], "- reqwest 0.12 for HTTP");
     }
 }

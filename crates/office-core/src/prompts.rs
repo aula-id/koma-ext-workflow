@@ -24,6 +24,9 @@ const MAX_COMMENTS: usize = 10;
 const CAP_WORKER_SUMMARY: usize = 2000;
 const CAP_DELIVERED_ITEM: usize = 300;
 const MAX_DELIVERED_ITEMS: usize = 20;
+/// The PRD is folded whole (capped) into the research spawn prompt so the analyst can see
+/// every tech choice to investigate, while the assembled prompt stays well under the target.
+const CAP_RESEARCH_PRD: usize = 6000;
 
 /// Truncate `s` to at most `max` bytes at a char boundary, appending a marker when
 /// truncation actually happened. Used on every variable/LLM-authored field so a
@@ -215,6 +218,48 @@ pub fn reviewer(
          OFFICE-REVIEW\n\
          verdict: pass | fail\n\
          reasons: <numbered, tied to criteria; required on fail>\n",
+    );
+
+    out
+}
+
+/// Build the research spawn prompt for the `office-researcher` sub-agent (ARCHITECTURE.md
+/// 6.2b). Pure string assembly like [`worker`]/[`reviewer`]: it instructs the analyst to
+/// web-research the PRD's technology choices (current stable versions, best practices,
+/// pitfalls, alternatives) using ONLY read/web tools — never writing code or touching files —
+/// and to file an OFFICE-RESEARCH findings block the tolerant scanner ([`crate::report::
+/// parse_research`]) reads back.
+pub fn research(project: &Project) -> String {
+    let project_name = truncate_bytes(&project.name, CAP_TITLE);
+    let intent = project_intent(project);
+    let prd = truncate_bytes(&project.prd_markdown, CAP_RESEARCH_PRD);
+
+    let mut out = String::new();
+    out.push_str(
+        "You are the Workflow research analyst. A PRD has been drafted; before the technical\n\
+         design is written, web-research the technology choices it implies. Work autonomously;\n\
+         no human will answer questions mid-task.\n\n",
+    );
+    out.push_str(&format!("PROJECT: {} — {}\n\n", project_name, intent));
+    out.push_str("PRD:\n");
+    out.push_str(&prd);
+    out.push_str("\n\n");
+
+    out.push_str("YOUR JOB\n");
+    out.push_str(
+        "- Identify the concrete tech choices the PRD implies (languages, frameworks, libraries,\n\
+         data stores, infra) and web-research each: the CURRENT stable version, established best\n\
+         practices, common pitfalls, and viable alternatives with tradeoffs.\n\
+         - Use ONLY read and web tools. Do NOT write code, do NOT create or modify any files, do\n\
+         NOT touch VCS. You are gathering knowledge, not building anything.\n\
+         - Keep findings concrete and decision-useful — the TRD author will build directly on them.\n\n",
+    );
+
+    out.push_str(
+        "REPORT PROTOCOL — end your final message with exactly this block:\n\
+         OFFICE-RESEARCH\n\
+         findings: <markdown bullets — the concrete versions, practices, pitfalls, and\n\
+         alternatives the TRD author needs, grouped by tech area>\n",
     );
 
     out

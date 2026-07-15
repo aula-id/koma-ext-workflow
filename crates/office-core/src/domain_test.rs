@@ -75,6 +75,14 @@ mod tests {
             name: "Shop Crawler Project".to_string(),
             phase: ProjectPhase::Running,
             prd_markdown: "# Shop Crawler\nA project to crawl web shops.".to_string(),
+            trd_markdown: "# TRD\n| Layer | Choice |\n|---|---|\n| Language | Rust 1.80 |".to_string(),
+            research_notes: "- reqwest 0.12 for HTTP\n- scraper 0.20 for HTML parsing".to_string(),
+            research: Some(AgentBinding {
+                ext_agent_id: 88,
+                session: "session-123".to_string(),
+                spawned_at_ms: now + 50,
+                kind: AgentKind::Researcher,
+            }),
             office_transcript: vec![
                 ChatMsg {
                     who: ChatAuthor::User,
@@ -341,6 +349,47 @@ mod tests {
         assert_eq!(deserialized.config.max_workers, 2);
         assert_eq!(deserialized.config.bounce_budget, 3);
         assert_eq!(deserialized.seq, 42);
+        // The 6.2b additive fields round-trip too.
+        assert!(deserialized.trd_markdown.contains("Rust 1.80"));
+        assert!(deserialized.research_notes.contains("reqwest 0.12"));
+        assert_eq!(deserialized.research.as_ref().unwrap().kind, AgentKind::Researcher);
+    }
+
+    #[test]
+    fn test_project_loads_pre_6_2b_json_without_the_new_fields() {
+        // A state.json written before the PRD->research->TRD pipeline existed carries no
+        // `trd_markdown`/`research_notes`/`research`. `#[serde(default)]` must let it load
+        // clean, defaulting the three fields to empty/None (schema stays workflow/1).
+        let legacy = r##"{
+            "id": "legacy",
+            "name": "Legacy",
+            "phase": "Drafting",
+            "prd_markdown": "# PRD\nold",
+            "office_transcript": [],
+            "office_summary": "",
+            "delivery_path": null,
+            "bound_session": null,
+            "workspace": null,
+            "epics": [],
+            "stories": [],
+            "tasks": [],
+            "config": {
+                "max_workers": 2,
+                "bounce_budget": 3,
+                "worker_model": null,
+                "reviewer_model": null,
+                "office_role": "main",
+                "worker_max_runtime_ms": 1200000
+            },
+            "outbox": [],
+            "seq": 0
+        }"##;
+
+        let p: Project = serde_json::from_str(legacy).expect("legacy JSON must load clean");
+        assert_eq!(p.prd_markdown, "# PRD\nold");
+        assert_eq!(p.trd_markdown, "", "absent trd_markdown defaults to empty");
+        assert_eq!(p.research_notes, "", "absent research_notes defaults to empty");
+        assert!(p.research.is_none(), "absent research binding defaults to None");
     }
 
     #[test]
@@ -377,9 +426,10 @@ mod tests {
         // Check contributes.sub_agents
         let sub_agents = &value["contributes"]["sub_agents"];
         assert!(sub_agents.is_array());
-        assert_eq!(sub_agents.as_array().unwrap().len(), 2);
+        assert_eq!(sub_agents.as_array().unwrap().len(), 3);
         assert_eq!(sub_agents[0]["name"], "office-worker");
         assert_eq!(sub_agents[1]["name"], "office-reviewer");
+        assert_eq!(sub_agents[2]["name"], "office-researcher");
 
         // Check contributes.tools
         let tools = &value["contributes"]["tools"];

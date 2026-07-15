@@ -296,6 +296,37 @@ function buildDraftingProject() {
     '```',
   ].join('\n');
 
+  const trdMarkdown = [
+    '# Technical Requirements',
+    '',
+    '## Stack',
+    '',
+    '| Layer | Choice | Version |',
+    '|---|---|---|',
+    '| API | Node + Fastify | 4.x |',
+    '| DB | PostgreSQL | 16 |',
+    '| Cache | Redis | 7 |',
+    '| Jobs | BullMQ | 5.x |',
+    '',
+    '## Data model',
+    '',
+    'Reuse the existing `points_ledger` table as the source of truth; add a derived',
+    '`user_tier` materialized view refreshed nightly from trailing-12mo spend.',
+    '',
+    '## Constraints',
+    '',
+    '- No new ledger table (PRD non-negotiable).',
+    '- Tier recompute must be idempotent and driven from the ledger, never incremented in place.',
+  ].join('\n');
+
+  const researchNotes = [
+    '- **Fastify 4.x**: stable; prefer `@fastify/postgres` over a raw pool for connection lifecycle.',
+    '- **PostgreSQL 16**: materialized views suit the nightly tier recompute; index the',
+    '  `trailing_spend` column the tier function reads.',
+    '- **BullMQ 5.x**: the maintained successor to `bull`; run it against a dedicated Redis 7 instance.',
+    '- Pitfall: trailing-12-month windows drift — recompute from the ledger, do not mutate in place.',
+  ].join('\n');
+
   return {
     id: 'loyalty',
     name: 'Loyalty Program Redesign',
@@ -306,6 +337,8 @@ function buildDraftingProject() {
     epics: [],
     stories: [],
     prdMarkdown,
+    trdMarkdown,
+    researchNotes,
     officeTranscript: [
       { who: 'user', text: 'We want to redesign the loyalty program around tiers instead of a flat points balance.' },
       { who: 'office', text: 'Got it. Should tiers be based on trailing spend, lifetime spend, or something else?' },
@@ -597,6 +630,8 @@ function handleOp(payload: any): any {
           epics: [],
           stories: [],
           prdMarkdown: '',
+          trdMarkdown: '',
+          researchNotes: '',
           officeTranscript: [],
           officeSummary: '',
           outbox: [],
