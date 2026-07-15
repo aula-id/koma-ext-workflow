@@ -40,6 +40,10 @@ fn project(phase: ProjectPhase) -> Project {
         gate_invoke_live_hint: false,
         pending_breakdown: None,
         seq: 1,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     }
 }
 

@@ -148,6 +148,9 @@ mod tests {
                         at_ms: now,
                         event: "Created".to_string(),
                     }],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Todo state
                 Task {
@@ -170,6 +173,9 @@ mod tests {
                     last_report: None,
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in OnProgress state
                 Task {
@@ -195,6 +201,9 @@ mod tests {
                     last_report: None,
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Review state with binding
                 Task {
@@ -220,6 +229,9 @@ mod tests {
                     last_report: Some("Implemented basic retry".to_string()),
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Review state without binding
                 Task {
@@ -239,6 +251,9 @@ mod tests {
                     last_report: Some("Added redis cache".to_string()),
                     last_review: Some("Need persistent backend".to_string()),
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Parked (ReviewBounceBudget) state
                 Task {
@@ -258,6 +273,9 @@ mod tests {
                     last_report: Some("Attempted integration".to_string()),
                     last_review: Some("Schema mismatch".to_string()),
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Parked (WorkerBlocked) state
                 Task {
@@ -279,6 +297,9 @@ mod tests {
                     last_report: Some("Blocked waiting for credentials".to_string()),
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Parked (SpawnFailed) state
                 Task {
@@ -300,6 +321,9 @@ mod tests {
                     last_report: None,
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Done state
                 Task {
@@ -325,6 +349,9 @@ mod tests {
                         at_ms: now + 5000,
                         event: "Completed".to_string(),
                     }],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
             ],
             config: ProjectConfig {
@@ -366,6 +393,10 @@ mod tests {
             gate_invoke_live_hint: false,
             pending_breakdown: None,
             seq: 42,
+            worktree_desks: false,
+            workflow_home: None,
+            hygiene_sum: 0,
+            hygiene_count: 0,
         };
 
         // Serialize to JSON

@@ -43,6 +43,9 @@ fn task(id: &str, state: TaskState) -> Task {
         last_report: None,
         last_review: None,
         history: vec![],
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     }
 }
 
@@ -90,6 +93,10 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         gate_invoke_live_hint: false,
         pending_breakdown: None,
         seq: 1,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     }
 }
 
@@ -1466,4 +1473,195 @@ fn global_inbox_claims_unknown_project_brief_and_mints_locally() {
     let inbox = d.store.root_dir().join("inbox");
     assert!(inbox.join("processed").join("1-brief.json").exists());
     assert!(call_count(&d.host, "chat.prompt") >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// Worktree desks (item 1/2) — real git in a tempdir delivery repo
+// ---------------------------------------------------------------------------
+
+/// A Running worktree-desks project whose delivery is a REAL git repo and whose desks live under a
+/// separate `workflow_home` tempdir (never next to the product). Returns (project, ws-tempdir).
+fn worktree_setup(slug: &str, tasks: Vec<Task>) -> (Project, tempfile::TempDir) {
+    let ws = tempfile::tempdir().expect("ws tempdir");
+    let delivery = ws.path().join("product");
+    std::fs::create_dir_all(&delivery).unwrap();
+    crate::git::Git::new("git").init_repo(&delivery).expect("git init delivery");
+    let mut p = project(slug, ProjectPhase::Running, tasks);
+    p.delivery_path = Some(delivery);
+    p.workspace = Some(ws.path().to_path_buf());
+    p.workflow_home = Some(ws.path().join("wfh"));
+    p.worktree_desks = true;
+    (p, ws)
+}
+
+fn desk_of(ws: &tempfile::TempDir, slug: &str, task_slug: &str) -> std::path::PathBuf {
+    ws.path().join("wfh").join("desks").join(slug).join(task_slug)
+}
+
+#[test]
+fn authorize_git_inits_delivery_and_enables_worktree_desks() {
+    // item 1: authorize `git init`s a non-repo delivery, turns worktree desks ON, and the task
+    // worktree materializes UNDER the extension home — never next to the product.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" }));
+    let mut d = driver(store, host);
+
+    let ws = tempfile::tempdir().unwrap();
+    let delivery = ws.path().join("product");
+    let mut p = project("auth", ProjectPhase::Ready, vec![task("auth/t1", TaskState::Todo)]);
+    p.workspace = Some(ws.path().to_path_buf());
+    p.workflow_home = Some(ws.path().join("wfh"));
+    d.insert_for_test(p, 1_000);
+
+    d.authorize_project("auth", &delivery.display().to_string(), 2_000);
+
+    let proj = d.project("auth").unwrap();
+    assert!(proj.worktree_desks, "delivery became a git repo => worktree desks on");
+    assert!(matches!(proj.phase, ProjectPhase::Running));
+    assert!(delivery.join(".git").exists(), "git init ran on the delivery");
+    let desk = desk_of(&ws, "auth", "t1");
+    assert!(desk.join(".git").exists(), "task worktree lives under the extension home");
+    assert!(!delivery.join("desks").exists(), "no scratch beside the product");
+}
+
+#[test]
+fn authorize_falls_back_to_legacy_when_git_is_missing() {
+    // item 1: a missing `git` binary degrades gracefully to legacy copy-desks — the project still
+    // authorizes to Running.
+    let (store, _dir) = temp_store();
+    let mut d = driver(store, FakeHost::new());
+    d.set_git_bin("/nonexistent/definitely-not-git");
+
+    let ws = tempfile::tempdir().unwrap();
+    let delivery = ws.path().join("product");
+    let mut p = project("auth", ProjectPhase::Ready, vec![]); // no tasks: no dispatch noise
+    p.workspace = Some(ws.path().to_path_buf());
+    d.insert_for_test(p, 1_000);
+
+    d.authorize_project("auth", &delivery.display().to_string(), 2_000);
+
+    let proj = d.project("auth").unwrap();
+    assert!(!proj.worktree_desks, "git missing => legacy fallback");
+    assert!(matches!(proj.phase, ProjectPhase::Running), "fallback is graceful, still Running");
+}
+
+#[test]
+fn worktree_cycle_commits_reviews_and_merges_to_main() {
+    // item 1/2/3 end-to-end: dispatch -> worktree, worker done -> commit + diff-stat, reviewer pass
+    // -> merge into main + worktree reclaimed + hygiene accumulated.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker
+    host.script("agents.result", json!({ "agentId": 101, "output": "OFFICE-REPORT\nstatus: complete\nsummary: did it\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 202, "status": "spawned" })); // reviewer
+    host.script("agents.result", json!({ "agentId": 202, "output": "OFFICE-REVIEW\nverdict: pass\nreasons: ok\nhygiene: 95\n" }));
+    let mut d = driver(store, host);
+
+    let (p, ws) = worktree_setup("auth", vec![task("auth/t1", TaskState::Todo)]);
+    let delivery = p.delivery_path.clone().unwrap();
+    d.insert_for_test(p, 1_000);
+
+    // 1. dispatch -> worktree add + worker spawn.
+    d.on_tick(1_000);
+    let desk = desk_of(&ws, "auth", "t1");
+    assert!(desk.exists(), "worktree materialized");
+
+    // 2. the "worker" writes a deliverable into its worktree.
+    std::fs::write(desk.join("feature.rs"), "fn f() {}\n").unwrap();
+
+    // 3. worker done -> commit + diff-stat stashed -> Review -> reviewer spawn.
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }), 2_000);
+    let diff = d.project("auth").unwrap().tasks[0].diff_stat.clone();
+    assert!(diff.as_deref().unwrap_or("").contains("feature.rs"), "diff-stat stashed: {diff:?}");
+    assert!(matches!(d.project("auth").unwrap().tasks[0].state, TaskState::Review { .. }));
+
+    // 4. reviewer pass -> merge -> Done + file on main + worktree reclaimed.
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 202, status: "done".to_string(), error: None }), 3_000);
+    let proj = d.project("auth").unwrap();
+    assert!(matches!(proj.tasks[0].state, TaskState::Done { .. }), "merged + done");
+    assert_eq!(proj.hygiene_count, 1, "hygiene grade accumulated");
+    assert!(delivery.join("feature.rs").exists(), "deliverable is on main");
+    assert!(!desk.exists(), "worktree reclaimed after merge (keep_desks off)");
+}
+
+#[test]
+fn worktree_retry_gets_a_fresh_worktree_off_main() {
+    // item 1: a review FAIL bounces the task; the retry re-materializes a FRESH worktree off main,
+    // discarding the failed branch (the prior attempt's files are gone).
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker a1
+    host.script("agents.result", json!({ "agentId": 101, "output": "OFFICE-REPORT\nstatus: complete\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 202, "status": "spawned" })); // reviewer
+    host.script("agents.result", json!({ "agentId": 202, "output": "OFFICE-REVIEW\nverdict: fail\nreasons: nope\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 303, "status": "spawned" })); // worker a2
+    let mut d = driver(store, host);
+
+    let (mut p, ws) = worktree_setup("auth", vec![task("auth/t1", TaskState::Todo)]);
+    p.config.bounce_budget = 3;
+    d.insert_for_test(p, 1_000);
+    let desk = desk_of(&ws, "auth", "t1");
+
+    d.on_tick(1_000); // worker a1 -> worktree
+    std::fs::write(desk.join("attempt1.rs"), "// a1\n").unwrap();
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }), 2_000); // commit + reviewer
+    // reviewer FAIL -> bounce -> immediate retry (fresh worktree branched off main).
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 202, status: "done".to_string(), error: None }), 3_000);
+
+    let proj = d.project("auth").unwrap();
+    assert_eq!(proj.tasks[0].bounces, 1, "review fail counted a bounce");
+    assert!(matches!(proj.tasks[0].state, TaskState::OnProgress { .. }), "retried immediately");
+    assert!(desk.exists(), "fresh worktree present");
+    assert!(!desk.join("attempt1.rs").exists(), "retry starts clean from main, not the failed branch");
+}
+
+#[test]
+fn worktree_merge_conflict_bounces_the_task() {
+    // item 1: a real merge conflict (main diverged after the branch was taken) bounces the task with
+    // the conflict summary, end-to-end through exec_merge_desk -> DeskMergeConflict.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker a1
+    host.script("agents.result", json!({ "agentId": 101, "output": "OFFICE-REPORT\nstatus: complete\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 202, "status": "spawned" })); // reviewer
+    host.script("agents.result", json!({ "agentId": 202, "output": "OFFICE-REVIEW\nverdict: pass\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 303, "status": "spawned" })); // retry worker
+    let mut d = driver(store, host);
+
+    // Seed a shared file so a divergent main-side edit conflicts with the task branch.
+    let ws = tempfile::tempdir().unwrap();
+    let delivery = ws.path().join("product");
+    std::fs::create_dir_all(&delivery).unwrap();
+    std::fs::write(delivery.join("shared.txt"), "base\n").unwrap();
+    crate::git::Git::new("git").init_repo(&delivery).unwrap();
+    let mut p = project("auth", ProjectPhase::Running, vec![task("auth/t1", TaskState::Todo)]);
+    p.delivery_path = Some(delivery.clone());
+    p.workspace = Some(ws.path().to_path_buf());
+    p.workflow_home = Some(ws.path().join("wfh"));
+    p.worktree_desks = true;
+    p.config.bounce_budget = 3;
+    d.insert_for_test(p, 1_000);
+    let desk = desk_of(&ws, "auth", "t1");
+
+    d.on_tick(1_000);
+    std::fs::write(desk.join("shared.txt"), "task-side\n").unwrap(); // worker edits shared
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }), 2_000);
+
+    // Main diverges on the SAME file before the merge (a sibling landed first).
+    std::fs::write(delivery.join("shared.txt"), "main-side\n").unwrap();
+    crate::git::Git::new("git").commit_all(&delivery, "main advances").unwrap();
+
+    // reviewer pass -> merge -> CONFLICT -> bounce.
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 202, status: "done".to_string(), error: None }), 3_000);
+
+    let proj = d.project("auth").unwrap();
+    assert_eq!(proj.tasks[0].bounces, 1, "conflict bounced the task");
+    assert!(
+        proj.tasks[0].last_review.as_deref().unwrap_or("").contains("merge conflict"),
+        "conflict summary is the review note: {:?}",
+        proj.tasks[0].last_review
+    );
+    // Main is left clean (aborted merge): still the main-side content.
+    assert_eq!(std::fs::read_to_string(delivery.join("shared.txt")).unwrap(), "main-side\n");
 }

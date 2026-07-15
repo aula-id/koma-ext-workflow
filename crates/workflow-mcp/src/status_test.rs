@@ -24,6 +24,9 @@ fn task(id: &str, state: TaskState, bounces: u32) -> Task {
         last_report: None,
         last_review: None,
         history: vec![],
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     }
 }
 
@@ -71,6 +74,10 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         gate_invoke_live_hint: false,
         pending_breakdown: None,
         seq,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     }
 }
 

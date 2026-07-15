@@ -23,6 +23,7 @@
 //!   live `Koma`.
 
 mod driver;
+mod git;
 mod handlers;
 mod host;
 mod inbox;

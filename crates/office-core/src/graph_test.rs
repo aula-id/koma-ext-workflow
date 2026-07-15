@@ -18,6 +18,9 @@ mod tests {
             last_report: None,
             last_review: None,
             history: vec![],
+            diff_stat: None,
+            awaiting_merge: false,
+            dispatch_after_ms: 0,
         }
     }
 
@@ -77,6 +80,10 @@ mod tests {
             gate_invoke_live_hint: false,
             pending_breakdown: None,
             seq: 0,
+            worktree_desks: false,
+            workflow_home: None,
+            hygiene_sum: 0,
+            hygiene_count: 0,
         }
     }
 

@@ -960,6 +960,9 @@ fn slug_task(t: &VTask) -> Task {
         last_report: None,
         last_review: None,
         history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     }
 }
 
@@ -1013,6 +1016,9 @@ pub fn apply_breakdown(p: &mut Project, b: Breakdown) {
                     last_report: None,
                     last_review: None,
                     history: Vec::new(),
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 });
             }
             story_ids.push(story_id.clone());

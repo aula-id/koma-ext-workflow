@@ -156,6 +156,9 @@ fn seed_project(store: &Store, slug: &str) {
             last_report: None,
             last_review: None,
             history: Vec::new(),
+            diff_stat: None,
+            awaiting_merge: false,
+            dispatch_after_ms: 0,
         }],
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
@@ -165,6 +168,10 @@ fn seed_project(store: &Store, slug: &str) {
         gate_invoke_live_hint: false,
         pending_breakdown: None,
         seq: 0,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     };
     store.save_project(&p).unwrap();
 }

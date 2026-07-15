@@ -24,7 +24,7 @@ pub mod office;
 pub use office::{AuthError, BreakdownError, InvokePurpose};
 
 pub mod kernel;
-pub use kernel::{step, Command, Effect, HostEvent, Input};
+pub use kernel::{step, task_branch, Command, Effect, HostEvent, Input};
 
 pub mod inboxmsg;
 

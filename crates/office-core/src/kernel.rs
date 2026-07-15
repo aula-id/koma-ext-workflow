@@ -149,10 +149,14 @@ pub enum Command {
     RequestBreakdown,
     /// Authorize `Ready -> Running` with a delivery path the driver has already
     /// validated + `mkdir -p`'d (6.3.3). `delivery_valid` is the driver's containment
-    /// verdict; a false verdict never transitions (the hard gate).
+    /// verdict; a false verdict never transitions (the hard gate). `worktree` is the driver's
+    /// git-repo setup verdict (item 1): `Ok(())` = the delivery is a git repo and worktree desks
+    /// are on; `Err(reason)` = `git` was missing or `init` failed, so the project falls back to
+    /// legacy copy-desks (the kernel records the flag + traces the reason).
     Authorize {
         delivery_path: PathBuf,
         allow_outside_workspace: bool,
+        worktree: Result<(), String>,
     },
     /// An off-loop `models.invoke` returned (5.1). `purpose` says which flow it belongs
     /// to; `outcome` is the model text or the error string after the driver's one retry.
@@ -242,6 +246,13 @@ pub enum HostEvent {
     /// `Pending -> Delivered`. Only emitted on success; an `agents.send` error produces no
     /// event, leaving the comment `Pending` for the spawn-boundary fold to deliver later.
     CommentDelivered { task: TaskId, comment_id: CommentId },
+    /// Worktree desks (item 1): the driver merged a task's branch cleanly into main (in response
+    /// to `Effect::MergeDesk`). The task completes (Done) and its worktree is reclaimed.
+    DeskMerged { task: TaskId },
+    /// Worktree desks (item 1): the driver's merge of a task's branch hit a conflict (or failed).
+    /// `summary` is the conflict/error description; the task bounces with it as the review note and
+    /// a retry gets a fresh worktree branched off the now-advanced main.
+    DeskMergeConflict { task: TaskId, summary: String },
 }
 
 /// Side effects for the driver to execute. `InvokeModel`/`PublishContext` are part
@@ -324,6 +335,28 @@ pub enum Effect {
     EnsureDesk {
         task: TaskId,
         dir: PathBuf,
+    },
+    /// Worktree desks (item 1/2): merge a task's `task/<slug>` branch into the delivery repo's
+    /// main branch after review PASS. The driver runs the git merge (serialized per repo,
+    /// fast-forward preferred) and feeds back `HostEvent::DeskMerged` (clean) or
+    /// `HostEvent::DeskMergeConflict` (conflict -> the task bounces with the conflict summary).
+    MergeDesk {
+        task: TaskId,
+        /// The delivery path — the git repo whose main branch receives the merge.
+        repo: PathBuf,
+        /// The task's worktree path (removed after a clean merge).
+        desk: PathBuf,
+        /// The task branch `task/<slug>`.
+        branch: String,
+    },
+    /// Worktree desks (item 1): remove a task's worktree + delete its branch. Fire-and-forget
+    /// best-effort (no feedback event) — emitted on Done and on a terminal park when `keep_desks`
+    /// is off. A retry re-materializes a FRESH worktree regardless (the add tears down any stale
+    /// one first), so a bounce-within-budget relies on that rather than this.
+    RemoveDesk {
+        repo: PathBuf,
+        desk: PathBuf,
+        branch: String,
     },
     Persist,
 }
@@ -462,7 +495,8 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
         Command::Authorize {
             delivery_path,
             allow_outside_workspace,
-        } => authorize(p, delivery_path, allow_outside_workspace, now_ms, ctx),
+            worktree,
+        } => authorize(p, delivery_path, allow_outside_workspace, worktree, now_ms, ctx),
         Command::InvokeResult { purpose, outcome } => {
             invoke_result(p, purpose, outcome, now_ms, ctx)
         }
@@ -1573,11 +1607,36 @@ fn clip_assumptions(items: &[String]) -> String {
 
 /// The hard authorization gate (6.3.3). The driver has already validated + created the
 /// path; `delivery_valid` is its verdict, and `office::authorize` re-checks the shape
-/// before transitioning `Ready -> Running`.
-fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_ms: u64, ctx: &mut Ctx) {
+/// before transitioning `Ready -> Running`. `worktree` is the driver's git-repo setup verdict
+/// (item 1): `Ok` turns worktree desks on for the project; `Err(reason)` records the fallback to
+/// legacy copy-desks with the reason traced.
+fn authorize(
+    p: &mut Project,
+    delivery_path: PathBuf,
+    allow_outside: bool,
+    worktree: Result<(), String>,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
     let path_str = delivery_path.display().to_string();
     match office::authorize(p, delivery_path, allow_outside) {
         Ok(()) => {
+            match &worktree {
+                Ok(()) => {
+                    p.worktree_desks = true;
+                    trace(p, now_ms, "desk", "worktree desks enabled — delivery is a git repo", ctx);
+                }
+                Err(reason) => {
+                    p.worktree_desks = false;
+                    trace(
+                        p,
+                        now_ms,
+                        "desk",
+                        format!("worktree desks unavailable ({}) — legacy desks", trace_preview(reason, 80)),
+                        ctx,
+                    );
+                }
+            }
             trace(p, now_ms, "authorize", format!("granted — {}", trace_preview(&path_str, 80)), ctx);
             ctx.dirty = true;
         }
@@ -2120,6 +2179,10 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
         HostEvent::CommentDelivered { task, comment_id } => {
             on_comment_delivered(p, &task, comment_id, now_ms, ctx)
         }
+        HostEvent::DeskMerged { task } => on_desk_merged(p, &task, now_ms, ctx),
+        HostEvent::DeskMergeConflict { task, summary } => {
+            on_desk_merge_conflict(p, &task, summary, now_ms, ctx)
+        }
     }
 }
 
@@ -2187,8 +2250,140 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, error: Option<&s
             ext_agent_id: agent_id,
         });
     } else {
-        requeue_failed(p, idx, now_ms, "worker-error", ctx);
+        diagnose_and_requeue(p, idx, status, error, now_ms, ctx);
     }
+}
+
+/// Milliseconds below which a dead agent counts as an INSTANT death (item 4): it fell over almost
+/// immediately after spawn, so a blind same-millisecond re-dispatch would just replay the death.
+const INSTANT_DEATH_MS: u64 = 5_000;
+
+/// Diagnose a dead worker/reviewer (an `agents.done` with a non-`done` status, or a killed poll)
+/// and re-queue it (item 4). Three cases:
+///  - the death reason names a "daemon restart" -> PAUSE without burning an attempt or backoff; the
+///    existing reconcile/resume flow re-dispatches it (a restart is transient, not the task's fault).
+///  - it died < `INSTANT_DEATH_MS` after spawn -> INSTANT death: record the reason + trace
+///    "attempt N died at step 0", then set a dispatch backoff (10s then 60s) before the retry.
+///  - otherwise (it ran a while, then died) -> re-queue immediately as before, clearing any backoff.
+fn diagnose_and_requeue(p: &mut Project, idx: usize, status: &str, error: Option<&str>, now_ms: u64, ctx: &mut Ctx) {
+    let who = match binding_kind(&p.tasks[idx].state) {
+        Some(AgentKind::Reviewer) => "reviewer",
+        _ => "worker",
+    };
+    let reason = degrade_reason(who, status, error);
+
+    // Daemon-restart deaths are host lifecycle noise, not task failures: don't burn an attempt.
+    if is_daemon_restart(&reason) {
+        pause_for_daemon_restart(p, idx, now_ms, ctx);
+        return;
+    }
+
+    let alive = spawned_ago(&p.tasks[idx].state, now_ms);
+    let instant = matches!(alive, Some(ms) if ms < INSTANT_DEATH_MS);
+
+    if instant {
+        let attempt = current_attempt(&p.tasks[idx].state);
+        // `prior` counts instant deaths already recorded, so the FIRST instant death backs off 10s
+        // (going into the 2nd attempt) and the second 60s (going into the 3rd), matching the spec.
+        let prior = instant_death_count(&p.tasks[idx]);
+        record(&mut p.tasks[idx], now_ms, format!("died-at-step-0:{reason}"));
+        trace(
+            p,
+            now_ms,
+            "death",
+            format!("attempt {attempt} died at step 0: {}", trace_preview(&reason, 80)),
+            ctx,
+        );
+        let delay = instant_death_backoff_ms(prior);
+        // Re-queue FIRST (moves the task to Todo / Review{None}), then stamp the cooldown on it so
+        // the next dispatch scan defers the retry.
+        requeue_failed(p, idx, now_ms, "worker-error", ctx);
+        p.tasks[idx].dispatch_after_ms = now_ms.saturating_add(delay);
+        p.tasks[idx].diff_stat = None; // a fresh worktree recomputes it on the next commit
+        trace(
+            p,
+            now_ms,
+            "death",
+            format!("retry deferred {}s (instant-death backoff)", delay / 1000),
+            ctx,
+        );
+    } else {
+        requeue_failed(p, idx, now_ms, "worker-error", ctx);
+        p.tasks[idx].dispatch_after_ms = 0; // ran a while; retry immediately as before
+        p.tasks[idx].diff_stat = None;
+    }
+}
+
+/// The instant-death retry backoff for the NEXT attempt, given how many instant deaths already
+/// happened (item 4): first death -> 10s (attempt 2), second onward -> 60s (attempt 3+ cap). No
+/// backoff would be `0`.
+fn instant_death_backoff_ms(prior_instant_deaths: u32) -> u64 {
+    match prior_instant_deaths {
+        0 => 10_000,
+        _ => 60_000,
+    }
+}
+
+/// Count of `died-at-step-0` markers already in a task's history (item 4) — the instant-death
+/// tally that escalates the backoff. Distinct from `spawn_failure_streak`: a spawn succeeds each
+/// retry (recording `spawned:`), so this counts the deaths themselves, not a since-last-spawn run.
+fn instant_death_count(t: &Task) -> u32 {
+    t.history.iter().filter(|e| e.event.starts_with("died-at-step-0")).count() as u32
+}
+
+/// Whether a death reason names a daemon restart (item 4): the host tore the agent down because the
+/// daemon itself cycled, not because the task misbehaved — so we should not spend an attempt on it.
+fn is_daemon_restart(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("daemon restart")
+}
+
+/// Milliseconds a task's agent has been alive, from its binding's spawn time (item 4). `None` when
+/// the task carries no live binding (nothing to measure).
+fn spawned_ago(state: &TaskState, now_ms: u64) -> Option<u64> {
+    let at = match state {
+        TaskState::OnProgress { binding, .. } => binding.spawned_at_ms,
+        TaskState::Review { binding: Some(b), .. } => b.spawned_at_ms,
+        _ => return None,
+    };
+    Some(now_ms.saturating_sub(at))
+}
+
+/// The attempt number a task is currently running (item 4), for the death trace.
+fn current_attempt(state: &TaskState) -> u32 {
+    match state {
+        TaskState::OnProgress { attempt, .. } | TaskState::Review { attempt, .. } => *attempt,
+        _ => 0,
+    }
+}
+
+/// Pause a task after a daemon-restart death (item 4): re-queue WITHOUT incrementing the attempt or
+/// applying backoff, so the existing reconcile/resume flow re-dispatches it cleanly. A worker returns
+/// to Todo at the SAME attempt; a reviewer to Review{None}.
+fn pause_for_daemon_restart(p: &mut Project, idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    record(&mut p.tasks[idx], now_ms, "paused:daemon-restart");
+    trace(
+        p,
+        now_ms,
+        "death",
+        format!("{} paused (daemon restart) — awaiting redispatch", short_task(&p.tasks[idx].id)),
+        ctx,
+    );
+    match &p.tasks[idx].state {
+        TaskState::OnProgress { attempt, .. } => {
+            let attempt = *attempt;
+            // Preserve the attempt (re-stamp the SAME number, never +1).
+            set_next_attempt(&mut p.tasks[idx], now_ms, attempt);
+            p.tasks[idx].state = TaskState::Todo;
+        }
+        TaskState::Review { attempt, .. } => {
+            let attempt = *attempt;
+            p.tasks[idx].state = TaskState::Review { binding: None, attempt };
+        }
+        _ => {}
+    }
+    p.tasks[idx].dispatch_after_ms = 0;
+    p.tasks[idx].diff_stat = None;
+    ctx.dirty = true;
 }
 
 /// A fetched terminal report. Dispatch to the worker or reviewer path by binding kind.
@@ -2272,42 +2467,156 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
 
     match rev.verdict {
         Verdict::Pass => {
-            p.tasks[idx].last_review = rev.reasons.or(Some(text));
+            p.tasks[idx].last_review = rev.reasons.clone().or_else(|| Some(text.clone()));
             record(&mut p.tasks[idx], now_ms, "review:pass");
-            p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
-            let label = format!("{} → done (review pass)", short_task(&p.tasks[idx].id));
-            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
-            maybe_complete_project(p, now_ms, ctx);
-            check_halt(p, now_ms, ctx);
-        }
-        Verdict::Fail | Verdict::Unparseable => {
-            p.tasks[idx].bounces += 1;
-            p.tasks[idx].last_review = rev.reasons.or(Some(text));
-            record(&mut p.tasks[idx], now_ms, "review:fail");
-            ctx.dirty = true;
+            // Rolling score (item 3): fold this pass's hygiene grade into the running average; an
+            // absent `hygiene:` line counts as 100 (compat). Done BEFORE the merge so the sag trace
+            // lands with the pass.
+            accumulate_hygiene(p, rev.hygiene.unwrap_or(100), now_ms, ctx);
 
-            if p.tasks[idx].bounces > p.config.bounce_budget {
-                let notice = format!(
-                    "production line: task {} '{}' exceeded the review bounce budget; the office parked it. Advise or edit the board.",
-                    p.tasks[idx].id.0, p.tasks[idx].title
-                );
-                queue_notice(p, now_ms, notice, ctx);
-                p.tasks[idx].state = TaskState::Parked {
-                    reason: ParkReason::ReviewBounceBudget,
-                    attempt,
-                };
-                let label = format!("{} → parked (bounce budget)", short_task(&p.tasks[idx].id));
-                trace(p, now_ms, "task", label, ctx);
-                check_halt(p, now_ms, ctx);
+            if p.worktree_desks {
+                // Worktree desks (item 1): don't complete yet — merge the task branch into main.
+                // A clean merge -> Done (via `on_desk_merged`); a conflict -> bounce.
+                match desk_git_paths(p, idx) {
+                    Some((repo, desk, branch)) => {
+                        // The reviewer is finished; drop its binding and park in the merge wait so
+                        // the slot frees and no reviewer re-dispatches (gated by `awaiting_merge`).
+                        p.tasks[idx].state = TaskState::Review { binding: None, attempt };
+                        p.tasks[idx].awaiting_merge = true;
+                        ctx.fx.push(Effect::MergeDesk {
+                            task: p.tasks[idx].id.clone(),
+                            repo,
+                            desk,
+                            branch,
+                        });
+                        let label = format!("{} passed — merging task branch", short_task(&p.tasks[idx].id));
+                        trace(p, now_ms, "desk", label, ctx);
+                    }
+                    // Worktree mode but no desk path recorded (shouldn't happen): degrade to a plain
+                    // completion so the line never wedges.
+                    None => complete_passed_task(p, idx, now_ms, ctx),
+                }
             } else {
-                set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
-                p.tasks[idx].state = TaskState::Todo;
-                let label = format!("{} → todo (review bounce {})", short_task(&p.tasks[idx].id), p.tasks[idx].bounces);
-                trace(p, now_ms, "task", label, ctx);
+                complete_passed_task(p, idx, now_ms, ctx);
             }
         }
+        Verdict::Fail | Verdict::Unparseable => {
+            let note = rev.reasons.unwrap_or(text);
+            bounce_task(p, idx, attempt, note, now_ms, ctx);
+        }
     }
+}
+
+/// Complete a task whose work is on the main branch (a legacy review pass, or a clean worktree
+/// merge): move it Done, reclaim its worktree (worktree mode, unless `keep_desks`), and run the
+/// project-completion + halt checks. Shared so both paths behave identically.
+fn complete_passed_task(p: &mut Project, idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
+    let label = format!("{} → done (review pass)", short_task(&p.tasks[idx].id));
+    trace(p, now_ms, "task", label, ctx);
+    maybe_remove_worktree(p, idx, ctx);
+    ctx.dirty = true;
+    maybe_complete_project(p, now_ms, ctx);
+    check_halt(p, now_ms, ctx);
+}
+
+/// Bounce a task back for another attempt — shared by a review FAIL/unparseable and a worktree
+/// MERGE CONFLICT (item 1). `note` becomes the review note the next worker prompt carries. Within
+/// budget -> Todo (attempt++); over budget -> Parked(ReviewBounceBudget) + reclaim the worktree
+/// (unless `keep_desks`) + halt check. `diff_stat` is cleared so a retry recomputes it fresh.
+fn bounce_task(p: &mut Project, idx: usize, attempt: u32, note: String, now_ms: u64, ctx: &mut Ctx) {
+    p.tasks[idx].bounces += 1;
+    p.tasks[idx].last_review = Some(note);
+    p.tasks[idx].diff_stat = None;
+    record(&mut p.tasks[idx], now_ms, "review:fail");
+    ctx.dirty = true;
+
+    if p.tasks[idx].bounces > p.config.bounce_budget {
+        let notice = format!(
+            "production line: task {} '{}' exceeded the review bounce budget; the office parked it. Advise or edit the board.",
+            p.tasks[idx].id.0, p.tasks[idx].title
+        );
+        queue_notice(p, now_ms, notice, ctx);
+        maybe_remove_worktree(p, idx, ctx);
+        p.tasks[idx].state = TaskState::Parked {
+            reason: ParkReason::ReviewBounceBudget,
+            attempt,
+        };
+        let label = format!("{} → parked (bounce budget)", short_task(&p.tasks[idx].id));
+        trace(p, now_ms, "task", label, ctx);
+        check_halt(p, now_ms, ctx);
+    } else {
+        set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
+        p.tasks[idx].state = TaskState::Todo;
+        let label = format!("{} → todo (review bounce {})", short_task(&p.tasks[idx].id), p.tasks[idx].bounces);
+        trace(p, now_ms, "task", label, ctx);
+    }
+}
+
+/// Fold a per-task hygiene grade into the project's rolling clean-build score (item 3). The rolling
+/// score is the running AVERAGE of every pass's `hygiene:` grade; when it drops below
+/// `crd_pass_grade` a "rolling score sagging: NN" trace fires so the drift is visible before the
+/// final audit.
+fn accumulate_hygiene(p: &mut Project, grade: u32, now_ms: u64, ctx: &mut Ctx) {
+    p.hygiene_sum = p.hygiene_sum.saturating_add(grade as u64);
+    p.hygiene_count = p.hygiene_count.saturating_add(1);
+    let avg = (p.hygiene_sum / p.hygiene_count as u64) as u32;
+    trace(p, now_ms, "hygiene", format!("merge hygiene {grade} — rolling {avg}"), ctx);
+    if avg < p.config.crd_pass_grade {
+        trace(p, now_ms, "hygiene", format!("rolling score sagging: {avg}"), ctx);
+    }
+}
+
+/// The `(repo, desk, branch)` a task's worktree git ops need (item 1): the delivery path is the
+/// repo, `Task.desk` the worktree, `task/<slug>` the branch. `None` if either path is missing.
+fn desk_git_paths(p: &Project, idx: usize) -> Option<(PathBuf, PathBuf, String)> {
+    let repo = p.delivery_path.clone()?;
+    let desk = p.tasks[idx].desk.clone()?;
+    let branch = task_branch(&p.tasks[idx].id.0);
+    Some((repo, desk, branch))
+}
+
+/// Emit a `RemoveDesk` for a task's worktree when appropriate (item 1): worktree mode, `keep_desks`
+/// off, and a desk path is recorded. A no-op otherwise (legacy desks, or the user asked to keep
+/// them for inspection).
+fn maybe_remove_worktree(p: &mut Project, idx: usize, ctx: &mut Ctx) {
+    if !p.worktree_desks || p.config.keep_desks {
+        return;
+    }
+    if let Some((repo, desk, branch)) = desk_git_paths(p, idx) {
+        ctx.fx.push(Effect::RemoveDesk { repo, desk, branch });
+    }
+}
+
+/// A task's worktree merged cleanly into main (item 1): clear the merge gate and complete it.
+fn on_desk_merged(p: &mut Project, task: &TaskId, now_ms: u64, ctx: &mut Ctx) {
+    let idx = match find_task(p, task) {
+        Some(i) => i,
+        None => return,
+    };
+    p.tasks[idx].awaiting_merge = false;
+    trace(p, now_ms, "desk", format!("{} merged into main", short_task(task)), ctx);
+    complete_passed_task(p, idx, now_ms, ctx);
+    ctx.dirty = true;
+}
+
+/// A task's worktree hit a merge conflict (item 1): clear the gate and bounce it with the conflict
+/// summary as the review note; a retry rebranches off the now-advanced main.
+fn on_desk_merge_conflict(p: &mut Project, task: &TaskId, summary: String, now_ms: u64, ctx: &mut Ctx) {
+    let idx = match find_task(p, task) {
+        Some(i) => i,
+        None => return,
+    };
+    p.tasks[idx].awaiting_merge = false;
+    let attempt = match &p.tasks[idx].state {
+        TaskState::Review { attempt, .. } => *attempt,
+        // The task should still be in Review{None} (awaiting merge); if not, nothing to bounce.
+        _ => return,
+    };
+    trace(p, now_ms, "desk", format!("{} merge conflict — bouncing", short_task(task)), ctx);
+    bounce_task(p, idx, attempt, format!("merge conflict — resolve then re-deliver: {summary}"), now_ms, ctx);
+    ctx.dirty = true;
 }
 
 /// A spawn that failed before producing any report. Re-queue; the third consecutive
@@ -2329,6 +2638,7 @@ fn on_spawn_failed(p: &mut Project, task: &TaskId, reason: String, now_ms: u64, 
     ctx.dirty = true;
 
     if spawn_failure_streak(&p.tasks[idx]) >= 3 {
+        maybe_remove_worktree(p, idx, ctx);
         p.tasks[idx].state = TaskState::Parked {
             reason: ParkReason::SpawnFailed(reason),
             attempt,
@@ -2420,7 +2730,7 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
     let max = p.config.max_workers.clamp(1, MAX_PROJECT_WORKERS);
     let mut held = project_in_flight(p);
 
-    for tid in pending_reviews_sorted(p) {
+    for tid in pending_reviews_sorted(p, now_ms) {
         if budget == 0 || held >= max {
             break;
         }
@@ -2429,12 +2739,17 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
         budget -= 1;
     }
 
-    if p.workspace.is_none() {
-        return; // workers need a workspace for their desk
+    if p.workflow_home.is_none() && p.workspace.is_none() {
+        return; // workers need a desk root (the extension home, or the workspace as fallback)
     }
     for tid in ready_set(&p.tasks) {
         if budget == 0 || held >= max {
             break;
+        }
+        // Instant-death backoff (item 4): skip a task still inside its cooldown; a later Tick /
+        // Reconcile re-scans once `now_ms` passes `dispatch_after_ms` (no busy-wait, no thread).
+        if p.tasks.iter().any(|t| t.id == tid && t.dispatch_after_ms > now_ms) {
+            continue;
         }
         spawn_worker(p, &tid, &bound, &delivery, now_ms, ctx);
         held += 1;
@@ -2442,18 +2757,39 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
     }
 }
 
-/// Build the per-task desk directory (ARCHITECTURE.md 7.1): a single flat,
-/// human-readable, obviously-marked dir `desks/<project-slug>/<task-slug>--koma-workflow-desk/`.
-/// `TaskId.0` is the full hierarchical id `<project>/<epic-slug>/<story-slug>/<task-slug>`
-/// (see `office::apply_breakdown`); only the final `/`-delimited segment (the task slug)
-/// is used here, so nested epic/story path segments never leak into the desk tree.
-fn desk_dir(workspace: &Path, project_slug: &str, tid: &TaskId) -> PathBuf {
+/// Build the per-task desk directory (ARCHITECTURE.md 7.1, item 1). The desk lives under the
+/// EXTENSION's own workspace (`~/.koma-workflow`, `Project.workflow_home`), never next to the
+/// delivery product — the user rule is that the delivery folder receives ONLY the product. `TaskId.0`
+/// is the full hierarchical id `<project>/<epic-slug>/<story-slug>/<task-slug>` (see
+/// `office::apply_breakdown`); only the final `/`-delimited segment (the task slug) is used, so
+/// nested epic/story path segments never leak into the desk tree.
+///
+/// - `workflow_home` seeded (the norm): `<home>/desks/<project-slug>/<task-slug>/` — clean, and a
+///   git worktree in worktree-desks mode.
+/// - `workflow_home` absent (pre-feature state files, and unit tests that don't seed it): the
+///   HISTORICAL marker path under the user's workspace, preserving legacy behavior.
+///
+/// `None` only when neither a workflow home nor a workspace is known (a desk cannot be placed).
+fn desk_dir(p: &Project, tid: &TaskId) -> Option<PathBuf> {
     let task_slug = tid.0.rsplit('/').next().unwrap_or(&tid.0);
-    workspace
-        .join("koma-workflow")
-        .join("desks")
-        .join(project_slug)
-        .join(format!("{}--koma-workflow-desk", task_slug))
+    match &p.workflow_home {
+        Some(home) => Some(home.join("desks").join(&p.id.0).join(task_slug)),
+        None => p.workspace.as_ref().map(|ws| {
+            ws.join("koma-workflow")
+                .join("desks")
+                .join(&p.id.0)
+                .join(format!("{}--koma-workflow-desk", task_slug))
+        }),
+    }
+}
+
+/// The git branch a task's worktree lives on (item 1): `task/<task-slug>`. The slug is the final
+/// `/`-segment of the hierarchical task id (globally unique per `apply_breakdown`) and is
+/// `[a-z0-9-]`, so it is always a valid ref name. `pub` so the driver's `git worktree add` uses the
+/// exact same name the kernel stamps on its `MergeDesk`/`RemoveDesk` effects (one source of truth).
+pub fn task_branch(tid: &str) -> String {
+    let slug = tid.rsplit('/').next().unwrap_or(tid);
+    format!("task/{slug}")
 }
 
 fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now_ms: u64, ctx: &mut Ctx) {
@@ -2461,11 +2797,10 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
         Some(i) => i,
         None => return,
     };
-    let workspace = match &p.workspace {
-        Some(w) => w.clone(),
-        None => return,
+    let desk = match desk_dir(p, tid) {
+        Some(d) => d,
+        None => return, // no desk root known (no workflow home and no workspace)
     };
-    let desk = desk_dir(&workspace, &p.id.0, tid);
     let attempt = next_attempt(&p.tasks[idx]);
     let review_notes = p.tasks[idx].last_review.clone();
 
@@ -2498,10 +2833,14 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
     // and onto the binding so the office view can label the desk.
     let persona = crate::persona::worker_agent_id(&tid.0);
 
-    ctx.fx.push(Effect::EnsureDesk {
-        task: tid.clone(),
-        dir: desk.clone(),
-    });
+    // Legacy desks need the driver to `mkdir` the scratch dir; worktree desks are materialized by
+    // the driver's `git worktree add` inside `exec_spawn` (fresh each dispatch), so no EnsureDesk.
+    if !p.worktree_desks {
+        ctx.fx.push(Effect::EnsureDesk {
+            task: tid.clone(),
+            dir: desk.clone(),
+        });
+    }
     ctx.fx.push(Effect::Spawn {
         task: tid.clone(),
         prompt,
@@ -2836,6 +3175,9 @@ into full compliance with the Clean-build Requirement Document (docs tab)."
         last_report: None,
         last_review: None,
         history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     };
     record(&mut task, now_ms, format!("crd-remediation:round-{}", round));
     p.tasks.push(task);
@@ -3006,11 +3348,18 @@ fn project_in_flight(p: &Project) -> u32 {
         .count() as u32
 }
 
-fn pending_reviews_sorted(p: &Project) -> Vec<TaskId> {
+fn pending_reviews_sorted(p: &Project, now_ms: u64) -> Vec<TaskId> {
     let mut v: Vec<&Task> = p
         .tasks
         .iter()
         .filter(|t| matches!(t.state, TaskState::Review { binding: None, .. }))
+        // Not while a merge is in flight for this task (item 1: the reviewer already passed).
+        .filter(|t| !t.awaiting_merge)
+        // Instant-death backoff (item 4): honor a reviewer cooldown just like a worker one.
+        .filter(|t| t.dispatch_after_ms <= now_ms)
+        // Worktree desks (item 2): a review only starts once the worker's tree has been committed
+        // onto its branch (the diff-stat is stashed then). Legacy desks have no such gate.
+        .filter(|t| !p.worktree_desks || t.diff_stat.is_some())
         .collect();
     v.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
     v.into_iter().map(|t| t.id.clone()).collect()

@@ -137,6 +137,30 @@ mod tests {
         assert_eq!(r.reasons.as_deref(), Some("strict is strict"));
     }
 
+    // --- rolling-score hygiene grade (item 3) ----------------------------
+
+    #[test]
+    fn review_parses_optional_hygiene_grade() {
+        let text = "OFFICE-REVIEW\nverdict: pass\nreasons: clean\nhygiene: 85\n";
+        let r = parse_review(text);
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.hygiene, Some(85));
+    }
+
+    #[test]
+    fn review_hygiene_absent_is_none_for_compat() {
+        // An older reviewer that omits the line parses fine; the kernel treats None as 100.
+        let r = parse_review("OFFICE-REVIEW\nverdict: pass\n");
+        assert_eq!(r.hygiene, None);
+    }
+
+    #[test]
+    fn review_hygiene_tolerates_slash_and_clamps() {
+        // First digit run wins (`92/100` -> 92); values are clamped to 100.
+        assert_eq!(parse_review("OFFICE-REVIEW\nverdict: pass\nhygiene: 92/100\n").hygiene, Some(92));
+        assert_eq!(parse_review("OFFICE-REVIEW\nverdict: pass\nhygiene: 150\n").hygiene, Some(100));
+    }
+
     // --- OFFICE-AUDIT (6.2c) ---------------------------------------------
 
     use crate::report::{parse_assume_check, parse_audit, AssumeVerdict};

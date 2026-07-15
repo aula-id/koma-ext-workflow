@@ -48,6 +48,10 @@ mod tests {
             gate_invoke_live_hint: false,
             pending_breakdown: None,
             seq: 1,
+            worktree_desks: false,
+            workflow_home: None,
+            hygiene_sum: 0,
+            hygiene_count: 0,
         }
     }
 
@@ -66,6 +70,9 @@ mod tests {
             last_report: None,
             last_review: None,
             history: Vec::new(),
+            diff_stat: None,
+            awaiting_merge: false,
+            dispatch_after_ms: 0,
         }
     }
 
@@ -207,7 +214,90 @@ mod tests {
         assert!(prompt.contains("fetcher.rs"));
         assert!(prompt.contains("OFFICE-REVIEW"));
         assert!(prompt.contains("verdict: pass | fail"));
+        // item 2/3: the board digest, the hygiene gate, and the optional hygiene grade line are in
+        // EVERY reviewer prompt (legacy included) — tree hygiene is now per-task owned.
+        assert!(prompt.contains("BOARD DIGEST"));
+        assert!(prompt.contains("CLEAN-BUILD HYGIENE"));
+        assert!(prompt.contains("hygiene: <0-100"));
         assert!(prompt.len() < PROMPT_TARGET_CAP);
+    }
+
+    #[test]
+    fn reviewer_prompt_worktree_shows_diff_stat_and_board_digest() {
+        // item 2: in worktree mode the reviewer reviews the INTEGRATED task worktree + the branch
+        // diff-stat, and the board digest names merged + in-flight siblings (with owners).
+        let mut project = base_project();
+        project.worktree_desks = true;
+        project.workflow_home = Some("/home/.koma-workflow".into());
+        project.tasks[0].desk = Some("/home/.koma-workflow/desks/shop-crawler/t4-retry-logic".into());
+        project.tasks[0].diff_stat = Some(" fetcher.rs | 12 ++++++++----\n 1 file changed".to_string());
+
+        let mut merged = base_task();
+        merged.id = TaskId("shop-crawler/e1-ingest/s2-parser/t1-http".to_string());
+        merged.title = "HTTP client".to_string();
+        merged.state = TaskState::Done { at_ms: 10 };
+        let mut inflight = base_task();
+        inflight.id = TaskId("shop-crawler/e1-ingest/s2-parser/t9-cache".to_string());
+        inflight.title = "Cache layer".to_string();
+        inflight.state = TaskState::OnProgress {
+            binding: AgentBinding {
+                ext_agent_id: 5,
+                session: "s".to_string(),
+                spawned_at_ms: 0,
+                kind: AgentKind::Worker,
+                persona: "office-worker-nova".to_string(),
+            },
+            attempt: 1,
+        };
+        project.tasks.push(merged);
+        project.tasks.push(inflight);
+
+        let task = &project.tasks[0].clone();
+        let prompt = reviewer(&project, task, Path::new("/work/session/deliver"), "did it", &[]);
+
+        assert!(prompt.contains("git worktree at /home/.koma-workflow/desks/shop-crawler/t4-retry-logic"));
+        assert!(prompt.contains("TASK BRANCH DIFF vs main"));
+        assert!(prompt.contains("fetcher.rs | 12"));
+        assert!(prompt.contains("BOARD DIGEST"));
+        assert!(prompt.contains("t1-http")); // merged sibling
+        assert!(prompt.contains("t9-cache")); // in-flight sibling
+        assert!(prompt.contains("nova")); // owner persona
+        assert!(prompt.contains("CLEAN-BUILD HYGIENE"));
+        assert!(prompt.len() < PROMPT_TARGET_CAP);
+    }
+
+    #[test]
+    fn worker_prompt_worktree_bans_git_and_makes_the_tree_the_deliverable() {
+        // item 1/2: worktree wording — the desk IS the tree, no copy step, and git is off-limits.
+        let mut project = base_project();
+        project.worktree_desks = true;
+        let task = &project.tasks[0].clone();
+        let prompt = worker(
+            &project,
+            task,
+            Path::new("/home/.koma-workflow/desks/shop-crawler/t4"),
+            Path::new("/work/session/deliver"),
+            1,
+            None,
+            &[],
+        );
+        assert!(prompt.contains("full git worktree"));
+        assert!(prompt.contains("NEVER run git"));
+        assert!(prompt.contains("ARE the deliverables"));
+        assert!(prompt.contains("CLEAN-BUILD HYGIENE"));
+        // The legacy "deliver elsewhere" line is gone in worktree mode.
+        assert!(!prompt.contains("Deliverables go ONLY to"));
+    }
+
+    #[test]
+    fn worker_prompt_legacy_bans_git_but_keeps_delivery_path() {
+        // item 1: even the legacy copy-desk prompt now forbids git (the office owns VCS).
+        let project = base_project(); // worktree_desks = false
+        let task = &project.tasks[0].clone();
+        let prompt = worker(&project, task, Path::new("/desk"), Path::new("/deliver"), 1, None, &[]);
+        assert!(prompt.contains("NEVER run git"));
+        assert!(prompt.contains("Deliverables go ONLY to"));
+        assert!(prompt.contains("CLEAN-BUILD HYGIENE"));
     }
 
     #[test]

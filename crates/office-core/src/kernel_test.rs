@@ -27,6 +27,9 @@ fn task(id: &str, state: TaskState, priority: i32, blocked_by: &[&str]) -> Task 
         last_report: None,
         last_review: None,
         history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     }
 }
 
@@ -64,6 +67,10 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         gate_invoke_live_hint: false,
         pending_breakdown: None,
         seq: 0,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     }
 }
 
@@ -617,10 +624,12 @@ fn injected_comment_folds_at_next_spawn_when_delivery_never_confirmed() {
 
 #[test]
 fn dispatch_desk_dir_is_flat_project_slug_over_task_slug() {
-    // Real dispatch mints hierarchical TaskIds `<project>/<epic-slug>/<story-slug>/<task-slug>`
-    // (office::apply_breakdown). The desk dir must collapse that to the single flat,
-    // obviously-marked `desks/<project-slug>/<task-slug>--koma-workflow-desk` layout locked by
-    // ARCHITECTURE.md 7.1 -- never a nested epic/story nested directory tree.
+    // The LEGACY-FALLBACK desk path (item 1): when `workflow_home` is unset (a pre-feature state
+    // file, or a bare unit-test project), the desk falls back to the historical
+    // `<workspace>/koma-workflow/desks/<project-slug>/<task-slug>--koma-workflow-desk` layout so the
+    // old behavior is preserved. The hierarchical TaskId still collapses to the flat task slug
+    // (never a nested epic/story tree). The seeded-home path is covered by
+    // `dispatch_desk_dir_uses_workflow_home_when_seeded`.
     let mut p = project(
         ProjectPhase::Running,
         vec![task(
@@ -816,6 +825,9 @@ fn worker_blocked_report_parks_task() {
 
 #[test]
 fn worker_error_requeues_with_attempt_increment() {
+    // Adapted for item 4: a worker that ran a WHILE (spawned at 0, dies at 10_000 => ~10s alive,
+    // well past the 5s instant-death window) re-queues IMMEDIATELY with no backoff — the original
+    // behavior. (Instant deaths, which DO back off, are covered by the death-diagnosis tests below.)
     let mut p = project(
         ProjectPhase::Running,
         vec![task(
@@ -835,12 +847,13 @@ fn worker_error_requeues_with_attempt_increment() {
             status: "error".into(),
             error: None,
         }),
-        1000,
+        10_000,
         0, // cap 0: observe Todo before re-dispatch
     );
     let t = find_task(&p, "t1");
     assert!(matches!(t.state, TaskState::Todo));
     assert_eq!(next_attempt(t), 2);
+    assert_eq!(t.dispatch_after_ms, 0, "a non-instant death carries no backoff");
 }
 
 #[test]
@@ -2803,4 +2816,239 @@ fn config_set_research_mode_and_drafter_model_roundtrip() {
     step(&mut p, Input::Command(cfg(Some("banana"), Some(""))), 1000, 4);
     assert_eq!(p.config.research_mode, "always", "unknown research_mode ignored");
     assert_eq!(p.config.drafter_model, None, "empty string clears the drafter override");
+}
+
+// ---------------------------------------------------------------------------
+// Worktree desks (item 1/2) + rolling score (item 3) + retry backoff (item 4)
+// ---------------------------------------------------------------------------
+
+const REVIEW_PASS_HYG50: &str = "OFFICE-REVIEW\nverdict: pass\nreasons: ok\nhygiene: 50\n";
+const REVIEW_PASS_HYG100: &str = "OFFICE-REVIEW\nverdict: pass\nreasons: ok\nhygiene: 100\n";
+
+/// A Running project in worktree-desks mode with `workflow_home` seeded and the given tasks.
+fn worktree_project(tasks: Vec<Task>) -> Project {
+    let mut p = project(ProjectPhase::Running, tasks);
+    p.worktree_desks = true;
+    p.workflow_home = Some(PathBuf::from("/wfh"));
+    p
+}
+
+#[test]
+fn dispatch_desk_dir_uses_workflow_home_when_seeded() {
+    // item 1: with `workflow_home` seeded the desk lives under the extension's OWN root as a clean
+    // `<home>/desks/<project>/<task-slug>` (no koma-workflow marker dir, no --desk suffix), NOT next
+    // to the delivery product.
+    let mut p = project(ProjectPhase::Running, vec![task("shop/e1/s1/t4", TaskState::Todo, 0, &[])]);
+    p.id = ProjectId("shop".to_string());
+    p.workflow_home = Some(PathBuf::from("/home/.koma-workflow"));
+    // Legacy mode (worktree_desks stays false) still emits EnsureDesk, so we can read the dir.
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    let dir = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::EnsureDesk { dir, .. } => Some(dir.clone()),
+            _ => None,
+        })
+        .expect("EnsureDesk effect");
+    assert_eq!(dir, PathBuf::from("/home/.koma-workflow/desks/shop/t4"));
+}
+
+#[test]
+fn worktree_dispatch_omits_ensure_desk_and_records_desk() {
+    // item 1: in worktree mode the driver's `git worktree add` materializes the desk, so the kernel
+    // emits NO EnsureDesk; it still records the desk path + spawns the worker.
+    let mut p = worktree_project(vec![task("t1", TaskState::Todo, 0, &[])]);
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::EnsureDesk { .. })),
+        "no EnsureDesk in worktree mode"
+    );
+    assert_eq!(count_spawns(&fx), 1, "worker still spawns");
+    let t = find_task(&p, "t1");
+    assert_eq!(t.desk, Some(PathBuf::from("/wfh/desks/proj/t1")));
+    assert!(matches!(t.state, TaskState::OnProgress { .. }));
+}
+
+#[test]
+fn worktree_review_waits_for_the_commit_diff_before_dispatching() {
+    // item 2: a fresh Review{None} in worktree mode is NOT dispatched until the driver stashes the
+    // commit diff-stat (`diff_stat` set). Legacy mode has no such gate.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.diff_stat = None;
+    let mut p = worktree_project(vec![t]);
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(count_spawns(&fx), 0, "no reviewer until the diff-stat is stashed");
+
+    // Once the diff-stat is present the reviewer dispatches.
+    find_task_mut(&mut p, "t1").diff_stat = Some("stat".to_string());
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1100, 4);
+    assert_eq!(spawn_agents(&fx), vec!["office-reviewer"]);
+}
+
+#[test]
+fn worktree_review_pass_merges_and_accumulates_rolling_score() {
+    // item 1/3: a worktree review PASS does NOT complete directly — it emits MergeDesk and folds the
+    // hygiene grade into the rolling score, tracing a sag when it drops below crd_pass_grade.
+    let mut t = task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.diff_stat = Some("stat".to_string());
+    let mut p = worktree_project(vec![t]);
+
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS_HYG50.into() }), 1000, 4);
+
+    // MergeDesk emitted; the task is parked awaiting the merge (NOT Done yet).
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::MergeDesk { branch, .. } if branch == "task/t1")),
+        "MergeDesk emitted"
+    );
+    let after = find_task(&p, "t1");
+    assert!(after.awaiting_merge, "task awaits the merge");
+    assert!(matches!(after.state, TaskState::Review { binding: None, .. }));
+    // Rolling score accumulated; default crd_pass_grade is 98, so 50 sags.
+    assert_eq!(p.hygiene_sum, 50);
+    assert_eq!(p.hygiene_count, 1);
+    assert!(p.trace.iter().any(|e| e.summary.contains("rolling score sagging: 50")), "sag traced");
+}
+
+#[test]
+fn worktree_desk_merged_completes_the_task_and_removes_the_worktree() {
+    // item 1: a clean merge (DeskMerged) completes the task; with keep_desks off it also reclaims
+    // the worktree, and (last task) completes the project.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.awaiting_merge = true;
+    let mut p = worktree_project(vec![t]);
+
+    let fx = step(&mut p, Input::Host(HostEvent::DeskMerged { task: TaskId("t1".into()) }), 2000, 4);
+    let after = find_task(&p, "t1");
+    assert!(matches!(after.state, TaskState::Done { .. }));
+    assert!(!after.awaiting_merge);
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::RemoveDesk { branch, .. } if branch == "task/t1")),
+        "worktree reclaimed"
+    );
+    assert!(matches!(p.phase, ProjectPhase::Done { .. }), "sole task done => project done");
+}
+
+#[test]
+fn worktree_merge_conflict_bounces_with_the_conflict_summary() {
+    // item 1: a merge conflict (DeskMergeConflict) bounces the task with the conflict summary as the
+    // review note, so the retry re-delivers off the advanced main.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.awaiting_merge = true;
+    let mut p = worktree_project(vec![t]);
+    p.config.bounce_budget = 3;
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::DeskMergeConflict {
+            task: TaskId("t1".into()),
+            summary: "conflict in shared.rs".into(),
+        }),
+        2000,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert!(matches!(after.state, TaskState::Todo));
+    assert_eq!(after.bounces, 1);
+    assert!(!after.awaiting_merge);
+    assert!(after.last_review.as_deref().unwrap().contains("merge conflict"));
+    assert!(after.last_review.as_deref().unwrap().contains("shared.rs"));
+    assert_eq!(next_attempt(after), 2);
+}
+
+#[test]
+fn legacy_review_pass_still_accumulates_hygiene_and_completes() {
+    // item 3: even legacy (non-worktree) passes fold the hygiene grade into the rolling score, and
+    // complete the task directly (no merge round-trip).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS_HYG100.into() }), 1000, 4);
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Done { .. }));
+    assert_eq!(p.hygiene_sum, 100);
+    assert_eq!(p.hygiene_count, 1);
+    // 100 >= crd_pass_grade => no sag trace.
+    assert!(!p.trace.iter().any(|e| e.summary.contains("sagging")));
+}
+
+#[test]
+fn instant_death_records_reason_and_backs_off_10s_then_60s() {
+    // item 4: a worker that dies < 5s after spawn is an instant death — record the reason, trace
+    // "died at step 0", and defer the retry (first 10s, then 60s).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 }, 0, &[])],
+    );
+    // Alive 500ms (spawned at 0, dies at 500) => instant.
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 7, status: "error".into(), error: Some("segfault".into()) }),
+        500,
+        0,
+    );
+    let t = find_task(&p, "t1");
+    assert!(matches!(t.state, TaskState::Todo));
+    assert_eq!(t.dispatch_after_ms, 500 + 10_000, "first instant death backs off 10s");
+    assert!(t.history.iter().any(|e| e.event.starts_with("died-at-step-0")));
+    assert!(p.trace.iter().any(|e| e.summary.contains("died at step 0") && e.summary.contains("segfault")));
+
+    // Re-dispatch (attempt 2) then die instantly AGAIN -> 60s backoff.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(8, 20_000), attempt: 2 };
+    find_task_mut(&mut p, "t1").dispatch_after_ms = 0;
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 8, status: "killed".into(), error: None }),
+        20_500,
+        0,
+    );
+    let t = find_task(&p, "t1");
+    assert_eq!(t.dispatch_after_ms, 20_500 + 60_000, "second instant death backs off 60s");
+}
+
+#[test]
+fn backoff_defers_dispatch_until_the_cooldown_passes() {
+    // item 4: the dispatch scan skips a task inside its cooldown and picks it up once now_ms passes
+    // dispatch_after_ms — no busy-wait, just the next Tick.
+    let mut t = task("t1", TaskState::Todo, 0, &[]);
+    t.dispatch_after_ms = 5_000;
+    let mut p = project(ProjectPhase::Running, vec![t]);
+
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1_000, 4);
+    assert_eq!(count_spawns(&fx), 0, "still in cooldown -> not dispatched");
+
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 6_000, 4);
+    assert_eq!(count_spawns(&fx), 1, "cooldown elapsed -> dispatched");
+}
+
+#[test]
+fn daemon_restart_death_pauses_without_burning_the_attempt() {
+    // item 4: a "daemon restart" death is host lifecycle noise — re-queue at the SAME attempt with
+    // no backoff, letting the reconcile/resume flow re-dispatch.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(9, 0), attempt: 2 }, 0, &[])],
+    );
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone {
+            agent_id: 9,
+            status: "killed".into(),
+            error: Some("agent lost: daemon restart in progress".into()),
+        }),
+        500, // even though it's < 5s, daemon-restart takes precedence over instant-death backoff
+        0,
+    );
+    let t = find_task(&p, "t1");
+    assert!(matches!(t.state, TaskState::Todo));
+    assert_eq!(next_attempt(t), 2, "attempt preserved (not burned)");
+    assert_eq!(t.dispatch_after_ms, 0, "no backoff on a daemon-restart pause");
+    assert!(t.history.iter().any(|e| e.event == "paused:daemon-restart"));
+}
+
+/// Mutable task lookup for the worktree/backoff tests.
+fn find_task_mut<'a>(p: &'a mut Project, id: &str) -> &'a mut Task {
+    p.tasks.iter_mut().find(|t| t.id.0 == id).unwrap()
 }

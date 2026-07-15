@@ -116,6 +116,25 @@ pub struct Task {
     pub last_report: Option<String>,
     pub last_review: Option<String>,
     pub history: Vec<TaskEvent>,
+    /// Worktree desks (item 1/2): the capped `git diff <main>...task/<slug> --stat` output the
+    /// driver computes when it commits the worker's tree onto the task branch, folded into the
+    /// reviewer prompt (`prompts::reviewer`) so the reviewer judges the INTEGRATED diff, not a
+    /// scratch desk. `None` in legacy copy-desk mode, or before the first commit. In worktree
+    /// mode a pending review only dispatches once this is `Some` (the commit has landed).
+    /// `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub diff_stat: Option<String>,
+    /// Worktree desks (item 1): the task passed review and its branch is being merged into main.
+    /// Gates the reviewer from re-dispatching during the (synchronous) merge window; cleared when
+    /// the merge resolves — Done on a clean merge, bounce on a conflict. `#[serde(default)]`.
+    #[serde(default)]
+    pub awaiting_merge: bool,
+    /// Instant-death retry backoff (item 4): the earliest wall-clock ms this task may be
+    /// (re-)dispatched. `0` = dispatch immediately. Set when an agent dies < 5s after spawn so the
+    /// dispatch scan skips the task until `now_ms >= dispatch_after_ms`, re-armed on the next
+    /// Tick/Reconcile with no busy-wait and no spawned thread. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub dispatch_after_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -429,6 +448,29 @@ pub struct Project {
     /// `#[serde(default)]` (None) for back-compat.
     #[serde(default)]
     pub pending_breakdown: Option<String>,
+    /// Worktree desks active for this project (item 1). Set at authorize time: `true` when the
+    /// delivery path is (or was successfully `git init`-ed into) a git repo AND `git` is on PATH,
+    /// `false` on any failure (graceful fallback to legacy copy-desks). When `true`, each task desk
+    /// is a `git worktree` on branch `task/<slug>` under `workflow_home` and the office owns every
+    /// commit / merge / worktree-remove; when `false` the legacy scratch-desk flow runs.
+    /// `#[serde(default)]` (false) for back-compat.
+    #[serde(default)]
+    pub worktree_desks: bool,
+    /// The extension's OWN workspace root (`~/.koma-workflow`, the durable state root) — where task
+    /// desks live (item 1), NOT the user's session workspace / delivery parent (the old desk root,
+    /// which leaked scratch next to the product). Seeded by the driver from the store root at create
+    /// and on load. `None` falls back to `workspace` for the desk path (legacy). `#[serde(default)]`.
+    #[serde(default)]
+    pub workflow_home: Option<PathBuf>,
+    /// Rolling per-merge clean-build score (item 3): the running SUM and COUNT of the optional
+    /// `hygiene: <0-100>` grades reviewers emit on a PASS. The rolling score is the AVERAGE
+    /// (`hygiene_sum / hygiene_count`); a pass with no `hygiene:` line counts as 100 (compat). The
+    /// kernel traces "rolling score sagging: NN" whenever the average drops below `crd_pass_grade`.
+    /// `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub hygiene_sum: u64,
+    #[serde(default)]
+    pub hygiene_count: u32,
     /// Runtime-only hint (review finding, migration self-heal): "a PRD gate (`AssumeCheckPrd` /
     /// resolve / verify) invoke was fired by THIS process and may still be in flight". Set `true`
     /// at every PRD-stage invoke emission (`gate_doc`, `emit_resolve`, `emit_verify`, each gated on

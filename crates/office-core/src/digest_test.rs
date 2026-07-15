@@ -28,6 +28,9 @@ mod tests {
             last_report: Some("worker report body".to_string()),
             last_review: Some("reviewer verdict body".to_string()),
             history: vec![TaskEvent { at_ms: 1, event: "created".to_string() }],
+            diff_stat: None,
+            awaiting_merge: false,
+            dispatch_after_ms: 0,
         }
     }
 
@@ -65,6 +68,10 @@ mod tests {
             gate_invoke_live_hint: false,
             pending_breakdown: None,
             seq,
+            worktree_desks: false,
+            workflow_home: None,
+            hygiene_sum: 0,
+            hygiene_count: 0,
         }
     }
 

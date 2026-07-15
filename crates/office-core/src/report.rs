@@ -59,6 +59,11 @@ impl Default for Verdict {
 pub struct ReviewTrailer {
     pub verdict: Verdict,
     pub reasons: Option<String>,
+    /// Optional per-task clean-build hygiene grade (0-100) the reviewer may emit on a PASS
+    /// (item 3, rolling score). `None` when the reviewer omitted the `hygiene:` line — the
+    /// kernel treats an absent grade as 100 so older reviewers stay fully compatible. Clamped
+    /// to `..=100` (the first digit run on the line, so `hygiene: 92/100` also reads 92).
+    pub hygiene: Option<u32>,
 }
 
 /// Strip a run of backtick characters (markdown fence) from `line`, trimmed. A
@@ -142,7 +147,7 @@ fn parse_ack_comments(map: &HashMap<String, Vec<String>>) -> Vec<CommentId> {
 }
 
 const REPORT_KEYS: &[&str] = &["status", "summary", "delivered", "ack-comments", "blocked-reason"];
-const REVIEW_KEYS: &[&str] = &["verdict", "reasons"];
+const REVIEW_KEYS: &[&str] = &["verdict", "reasons", "hygiene"];
 const RESEARCH_KEYS: &[&str] = &["findings"];
 const AUDIT_KEYS: &[&str] = &["grade", "failures"];
 const ASSUME_KEYS: &[&str] = &["verdict"];
@@ -336,8 +341,17 @@ pub fn parse_review(text: &str) -> ReviewTrailer {
         _ => Verdict::Unparseable,
     };
 
+    // Optional per-task hygiene grade (item 3): first digit run on the `hygiene:` line, clamped
+    // 0..=100. Absent => None (the kernel treats that as 100 for the rolling average).
+    let hygiene = map
+        .get("hygiene")
+        .and_then(|v| v.first())
+        .and_then(|s| parse_first_u32(s))
+        .map(|n| n.min(100));
+
     ReviewTrailer {
         verdict,
         reasons: joined(&map, "reasons"),
+        hygiene,
     }
 }
