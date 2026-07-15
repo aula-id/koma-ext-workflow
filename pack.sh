@@ -26,6 +26,17 @@ case "${PACK_TARGET:-$(uname -s)}" in
   *) BIN_EXT="" ;;
 esac
 
+# CI (GitHub Actions release matrix) sets PACK_PLATFORM to a store-convention
+# label (e.g. "linux-x64", "darwin-arm64") so each target uploads its own zip
+# instead of clobbering a shared dist/workflow.zip.
+PACK_PLATFORM="${PACK_PLATFORM:-}"
+if [ -n "$PACK_PLATFORM" ]; then
+  zip_name="workflow-$PACK_PLATFORM.zip"
+else
+  zip_name="workflow.zip"
+fi
+zip_path="dist/$zip_name"
+
 # Build the Rust daemon + the MCP server (both shipped in the zip's bin/)
 echo "Building office-daemon + workflow-mcp (release${PACK_TARGET:+, $PACK_TARGET})..."
 cargo build --release -p office-daemon -p workflow-mcp $TARGET_FLAG
@@ -33,8 +44,12 @@ cargo build --release -p office-daemon -p workflow-mcp $TARGET_FLAG
 # Build the UI
 echo "Building UI..."
 cd ui
-source ~/.nvm/nvm.sh >/dev/null 2>&1
-nvm use 24 >/dev/null 2>&1 || true
+# nvm is a local dev convenience; on CI runners node is already provisioned
+# on PATH (actions/setup-node) and ~/.nvm may not exist at all.
+if [ -f ~/.nvm/nvm.sh ]; then
+  source ~/.nvm/nvm.sh >/dev/null 2>&1
+  nvm use 24 >/dev/null 2>&1 || true
+fi
 npm run build >/dev/null 2>&1
 cd ..
 
@@ -84,28 +99,61 @@ cp -r "ui/dist" "$stage_dir/ui"
 # ALWAYS build a fresh archive: `zip -r` against an existing file UPDATES it in
 # place, and a stale/corrupt leftover zip (e.g. from an older pack run) makes the
 # result unpredictable across machines.
-rm -f "$SCRIPT_DIR/dist/workflow.zip"
-(cd "$stage_dir" && zip -q -r "$SCRIPT_DIR/dist/workflow.zip" manifest.json bin/ ui/)
+rm -f "$SCRIPT_DIR/$zip_path"
+if command -v zip &> /dev/null; then
+  (cd "$stage_dir" && zip -q -r "$SCRIPT_DIR/$zip_path" manifest.json bin/ ui/)
+else
+  # git-bash on the Windows runner ships no `zip` binary — fall back to
+  # python3's zipfile module. Preserve the executable bit via external_attr
+  # so office-daemon.exe / workflow-mcp.exe stay runnable after unzip.
+  echo "'zip' not found, falling back to python3 zipfile module..."
+  python3 - "$stage_dir" "$SCRIPT_DIR/$zip_path" <<'PYEOF'
+import os
+import sys
+import zipfile
+
+stage_dir, out_path = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk(stage_dir):
+        dirs.sort()
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            arcname = os.path.relpath(full, stage_dir)
+            zi = zipfile.ZipInfo(arcname)
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            st = os.stat(full)
+            zi.external_attr = (st.st_mode & 0xFFFF) << 16
+            with open(full, "rb") as fh:
+                zf.writestr(zi, fh.read())
+PYEOF
+fi
 
 # Clean up temp directory
 rm -rf "$stage_dir"
 
-echo "Packaged: dist/workflow.zip"
-zip_path="dist/workflow.zip"
+echo "Packaged: $zip_path"
 if [ -f "$zip_path" ]; then
   size=$(du -h "$zip_path" | cut -f1)
 
+  # unzip may be absent alongside zip (same git-bash gap on Windows) — fall
+  # back to python3's zipfile listing for verification.
+  if command -v unzip &> /dev/null; then
+    list_zip() { unzip -l "$1"; }
+  else
+    list_zip() { python3 -m zipfile -l "$1"; }
+  fi
+
   # Verify both binaries made it into the zip before declaring success.
-  if ! unzip -l "$zip_path" | grep -q "bin/office-daemon"; then
+  if ! list_zip "$zip_path" | grep -q "bin/office-daemon$BIN_EXT"; then
     echo "Error: bin/office-daemon$BIN_EXT missing from $zip_path"
     echo "--- actual zip contents ---"
-    unzip -l "$zip_path" || true
+    list_zip "$zip_path" || true
     exit 1
   fi
-  if ! unzip -l "$zip_path" | grep -q "bin/workflow-mcp"; then
+  if ! list_zip "$zip_path" | grep -q "bin/workflow-mcp$BIN_EXT"; then
     echo "Error: bin/workflow-mcp$BIN_EXT missing from $zip_path"
     echo "--- actual zip contents ---"
-    unzip -l "$zip_path" || true
+    list_zip "$zip_path" || true
     exit 1
   fi
 
@@ -114,5 +162,5 @@ if [ -f "$zip_path" ]; then
   echo "Distributable package created:"
   echo "  $zip_path ($size)"
   echo "Zip contents (bin/):"
-  unzip -l "$zip_path" | grep "bin/" | sed 's/^/  /'
+  list_zip "$zip_path" | grep "bin/" | sed 's/^/  /'
 fi

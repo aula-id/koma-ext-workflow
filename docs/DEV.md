@@ -327,3 +327,20 @@ additive — an older host ignores unknown manifest keys / verbs / params and th
 - `BUILD_WAVES.md` — wave-by-wave implementation and test plan
 - `PANEL_PROTOCOL.md` — the frozen message protocol between daemon and panel UI
 - `/media/wangsa/project-x/simple-coders/docs/EXTENSIONS.md` — koma extension host API (READ-ONLY)
+
+## Release builds
+
+`.github/workflows/release.yml` is tag-triggered only (`push: tags: ['v*']` — repo policy is no
+push/PR builds). Pushing a `vX.Y.Z` tag builds and attaches 5 zips to the GitHub release, one per
+target, each running `pack.sh` with `PACK_TARGET`/`PACK_PLATFORM` set:
+
+- `workflow-windows-x64.zip` (`x86_64-pc-windows-msvc`, `windows-latest`)
+- `workflow-darwin-arm64.zip` (`aarch64-apple-darwin`, `macos-latest`)
+- `workflow-darwin-x64.zip` (`x86_64-apple-darwin`, `macos-latest`)
+- `workflow-linux-x64.zip` (`x86_64-unknown-linux-gnu`, `ubuntu-latest`)
+- `workflow-linux-arm64.zip` (`aarch64-unknown-linux-gnu`, `ubuntu-24.04-arm`, native runner)
+
+Requires a repo secret `KOMA_DEPLOY_KEY`: a read-only SSH deploy key for `aula-id/koma` (the
+private `koma-extension` crate dependency), loaded via `webfactory/ssh-agent`.
+
+All 5 zips are unsigned — store-side signing, if any, happens out-of-band, not in this workflow.

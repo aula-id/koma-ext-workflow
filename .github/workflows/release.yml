@@ -1,0 +1,100 @@
+name: Release
+
+# Tag-triggered only — repo policy is no push/PR builds, so this workflow
+# never runs on ordinary commits. Push a `vX.Y.Z` tag to cut a release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# git-bash on windows-latest provides `bash`, so run every step through it
+# uniformly instead of special-casing the windows job per step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            platform: windows-x64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            platform: darwin-arm64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            platform: darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            platform: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            platform: linux-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # koma-extension (crates/office-daemon/Cargo.toml) is fetched over
+      # ssh://git@github.com/aula-id/koma.git, a private repo; .cargo/config.toml
+      # already sets git-fetch-with-cli so cargo shells out to the real git CLI
+      # below, which needs this key loaded and github.com trusted.
+      - name: Load koma deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.KOMA_DEPLOY_KEY }}
+
+      - name: Trust github.com host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Add rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install UI dependencies
+        run: npm ci
+        working-directory: ui
+
+      # aarch64-unknown-linux-gnu runs on ubuntu-24.04-arm, a native ARM
+      # runner (public-repo Actions), so no cross linker is needed. macOS
+      # x64 on an arm64 macos-latest runner cross-compiles fine once the
+      # target is installed (`rustup target add` above) — Xcode's toolchain
+      # handles it, no extra linker config required.
+      - name: Build and package extension
+        env:
+          PACK_TARGET: ${{ matrix.target }}
+          PACK_PLATFORM: ${{ matrix.platform }}
+        run: bash pack.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-${{ matrix.platform }}
+          path: dist/workflow-*.zip
+
+      # Unsigned: store-side signing (if any) happens out-of-band, not here.
+      - name: Attach to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/workflow-*.zip
+          fail_on_unmatched_files: true
