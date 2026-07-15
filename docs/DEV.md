@@ -247,6 +247,22 @@ If you modify files in `ui/src/`:
 2. Manually test in koma GUI: install the extension and check the UI renders
 3. Use browser DevTools (F12) to debug; the panel is a standard React app
 
+**Standalone screenshots (no live koma)** — run `npm run dev` and open with `?mock=1` plus a
+`?view=` deep link for a deterministic initial view (see `App.tsx parseDeepLink`):
+
+- `?mock=1&view=office-map` — the pixel virtual office (default project view; picks the running
+  mock project, so the personas/desks render deterministically)
+- `?mock=1&view=board` / `&view=drilldown` / `&view=depmap` — board sub-views
+- `?mock=1&view=office` — the PRD/docs tab (office chat), on the drafting mock project
+- `?mock=1&view=task` — a project board with a rich task drawer pre-opened
+- `?mock=1&view=dashboard` / `&view=settings` — the multi-project dashboard / settings
+
+Add `&project=<id>` to pin a specific mock project (`notif`, `loyalty`, `legacy`).
+
+Sprites for the office view are generated (stdlib-only PNG encoder) by
+`python3 ui/sprites-gen/gen_sprites.py` into `ui/public/sprites/`; re-run it and commit the PNGs
+whenever a matrix or palette changes (Vite ships `public/` verbatim; `pack.sh` is unchanged).
+
 ### Updating the Manifest
 
 If you modify `manifest.json`:

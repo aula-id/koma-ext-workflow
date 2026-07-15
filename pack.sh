@@ -143,17 +143,22 @@ if [ -f "$zip_path" ]; then
     list_zip() { python3 -m zipfile -l "$1"; }
   fi
 
-  # Verify both binaries made it into the zip before declaring success.
-  if ! list_zip "$zip_path" | grep -q "bin/office-daemon$BIN_EXT"; then
+  # Verify both binaries made it into the zip before declaring success. List the zip ONCE into a
+  # variable and grep the string — NOT `list_zip | grep -q`: under `set -o pipefail`, `grep -q`
+  # exits on the first match and closes the pipe, so the lister (unzip / python -m zipfile) gets
+  # SIGPIPE (exit 141) while still writing the now sprite-heavy listing, and the pipeline falsely
+  # reports the binary "missing". A captured string has no pipe to break.
+  zip_listing="$(list_zip "$zip_path")"
+  if ! grep -q "bin/office-daemon$BIN_EXT" <<< "$zip_listing"; then
     echo "Error: bin/office-daemon$BIN_EXT missing from $zip_path"
     echo "--- actual zip contents ---"
-    list_zip "$zip_path" || true
+    echo "$zip_listing"
     exit 1
   fi
-  if ! list_zip "$zip_path" | grep -q "bin/workflow-mcp$BIN_EXT"; then
+  if ! grep -q "bin/workflow-mcp$BIN_EXT" <<< "$zip_listing"; then
     echo "Error: bin/workflow-mcp$BIN_EXT missing from $zip_path"
     echo "--- actual zip contents ---"
-    list_zip "$zip_path" || true
+    echo "$zip_listing"
     exit 1
   fi
 

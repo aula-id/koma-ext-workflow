@@ -93,6 +93,7 @@ Envelope = {
   tasks: [ Task ],
   prdMarkdown, officeTranscript: [ { who: "user"|"office", text } ], officeSummary,
   trdMarkdown, researchNotes,   // 6.2b Drafting pipeline docs; full mode only, drop in summary
+  researchActive: <bool>, auditActive: <bool>,   // fixed-staff liveness for the office view; ADDITIVE
   config: { maxWorkers, bounceBudget, workerModel: <string|null>,
             reviewerModel: <string|null>, keepDesks: <bool> }   // config_set round-trip
 }
@@ -115,9 +116,15 @@ older panels ignore the extra keys; the schema stays `workflow/1`.
   description, acceptance: [string],
   comments: [ { id, author: "user"|"office"|"system", text, createdMs,
                 receipt: { state: "pending"|"delivered"|"read", atMs? } } ],
-  lastReport, lastReview, history: [ { atMs, event } ]
+  lastReport, lastReview, history: [ { atMs, event } ],
+  persona?   // office-view desk label (short worker name, e.g. "nova"); ADDITIVE
 }
 ```
+
+`persona` (full mode) is the short worker persona at the task's desk — present while the task is
+`onprogress` / `review` / `parked` (the desk is occupied), omitted otherwise. It drives the pixel
+office view (ARCHITECTURE.md 5.2b / 10.3) and is additive: older panels ignore it, schema stays
+`workflow/1`.
 
 A comment still `pending` when its task reaches `done` is surfaced verbatim (state stays
 `pending`) so the panel can flag it "never delivered — reopen to send"; the daemon never

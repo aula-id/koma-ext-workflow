@@ -1,6 +1,9 @@
 pub mod domain;
 pub use domain::*;
 
+pub mod persona;
+pub use persona::{worker_agent_id, worker_persona, WORKER_PERSONAS};
+
 pub mod machine;
 pub use machine::*;
 
@@ -27,6 +30,9 @@ pub mod inboxmsg;
 
 #[cfg(test)]
 mod domain_test;
+
+#[cfg(test)]
+mod persona_test;
 
 #[cfg(test)]
 mod inboxmsg_test;

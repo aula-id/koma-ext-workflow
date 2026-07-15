@@ -532,11 +532,14 @@ phase is `Running`:
    not a private allowance. A `status: "queued"` spawn reply is accepted and tracked
    identically (the id is already minted, broker.rs:564-635) and still consumes a session slot.
 4. **Spawn**: `sessions.spawn_into { session: bound, task: <worker prompt>, agent:
-   "office-worker", model: config.worker_model (omitted when None), notify: true }`.
-   Local reply `{ agentId, status }` -> record `AgentBinding` (with `spawned_at_ms`), decrement
-   the session-capacity token, persist BEFORE moving on (crash between spawn and persist is
-   healed by reconcile: an unknown running office-worker in `agents.list` that no task
-   references is killed as an orphan). Reply `{ status: "sent" }` means the bound session moved
+   <persona id>, model: config.worker_model (omitted when None), notify: true }`, where the
+   persona id is the task's deterministically-assigned worker (`office-worker-<name>`, see 5.2b);
+   a reviewer spawn carries the fixed `office-reviewer`.
+   Local reply `{ agentId, status }` -> record `AgentBinding` (with `spawned_at_ms` and the
+   `persona` id), decrement the session-capacity token, persist BEFORE moving on (crash between
+   spawn and persist is healed by reconcile: an unknown running `office-worker*` in `agents.list`
+   that no task references is killed as an orphan — the sweep matches the `office-worker` prefix so
+   every persona is covered). Reply `{ status: "sent" }` means the bound session moved
    to another daemon — release the lease, stop dispatching (Limitations 13.9); the driver
    probes `sessions.list` for the bound session's liveness BEFORE firing the first spawn of a
    ready set and short-circuits the whole set if the first `spawn_into` would be cross-process,
@@ -563,6 +566,28 @@ stricter than, the liveness stall detector (5.5 / failure matrix): the stall det
 on BOTH a silent stall AND a runaway-but-active worker. It does not trust the model to terminate.
 The ceiling is per-spawn (reset on every re-dispatch), surfaced in the panel, and configurable per
 project; there is no way to disable it below a safety floor.
+
+### 5.2b Worker personas (deterministic pool)
+
+The manifest fields a POOL of 10 worker sub-agents — `office-worker-nova`, `-mika`, `-tetsuo`,
+`-bob`, `-yuki`, `-dax`, `-ines`, `-koji`, `-vera`, `-pip` — instead of one `office-worker`. All 10
+share a **byte-identical work-protocol prompt CORE** (same tools, same MCP recursion guard, same
+delivery/desk/VCS rules) plus a 2-3 sentence personality flavor and the line *"Your personality
+colors your notes and summaries only — never the work protocol."* Personality never touches
+correctness; it only colors the tone of notes/summaries.
+
+**Assignment is a pure function of the task id**, not a scheduler decision (`office-core/persona.rs`):
+`persona = WORKER_PERSONAS[ FNV-1a-64(task_id) % 10 ]`, and the full spawn id is
+`office-worker-<persona>`. FNV-1a is dependency-free and deterministic, so:
+
+- a **respawn or a review bounce of the same task always draws the same persona** (no reshuffle
+  mid-project), and the choice **survives a store reload** with no persisted assignment table;
+- the office view can label a desk from the task id alone.
+
+The chosen id is stamped on `AgentBinding.persona` at dispatch (`#[serde(default)]` empty, so
+pre-persona state loads clean). Reviewer bindings carry `office-reviewer`; the project-level
+researcher/auditor bindings carry no persona (they are keyed by presence, not label). Fixed staff
+(`office-reviewer`/`office-researcher`/`office-auditor`) are unchanged single agents.
 
 ### 5.3 Completion, review pipeline, bounce/park/halt
 
@@ -1063,9 +1088,26 @@ per 250ms, coalescing dirty flags.
 
 ### 10.3 Views
 
-- **Dashboard** (default): multi-project cards — phase badge, done/total ring, running
+- **Dashboard** (app default): multi-project cards — phase badge, done/total ring, running
   workers, parked count, token-burn proxy (spawn count), last notice; framer-motion
   layout animation; a global "ALL LINES" halt indicator.
+- **Office** (default PROJECT view, first board tab): a pixel virtual office
+  (`views/OfficeMap.tsx` + pure `lib/officeLayout.ts`, art in `ui/public/sprites`). It is a
+  PROJECTION of the snapshot onto the 10-persona pool, derived entirely from data the snapshot
+  already carries — no new control state:
+  - `tierFor(maxWorkers)` picks a room layout (1-2 cozy / 3-4 bullpen / 5-6 two-rows / 7-10
+    open-floor); the room grows to fit occupied desks so a busy desk is never dropped when the
+    tier shrinks.
+  - `presenceFor(project)` maps each persona's task to a desk state: `working` (a task
+    onprogress), `review-debate` (a task in review — the reviewer stands at the desk), `parked`
+    (a task parked mid-work), else idle. A task carries its short persona in `digest.rs` full mode
+    (`persona`) while it is in progress / in review / parked. Only `min(maxWorkers, 4)` monitors
+    blink; working personas beyond that are seated "waiting for a chair".
+  - Fixed staff animate off snapshot liveness flags (`researchActive`/`auditActive`): the PM
+    paces while drafting/ready and stands by a wall board while running, the researcher reads
+    while research is in flight, the auditor judges during the clean-build audit. All motion
+    respects `prefers-reduced-motion` (a single matchMedia check freezes to static frames).
+    Clicking any occupied desk opens the existing task drawer. Deep link `?view=office-map`.
 - **Board**: five columns (backlog/todo/onprogress/review/done); Parked cards render in
   Review with an amber "parked" badge; drag between legal columns only (kernel guards
   anyway); running cards show agent id + liveTextLen-based activity pulse; blocked-by

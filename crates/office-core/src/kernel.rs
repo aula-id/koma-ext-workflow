@@ -192,7 +192,11 @@ pub enum Effect {
     Spawn {
         task: TaskId,
         prompt: String,
-        agent: &'static str,
+        /// The sub-agent id to spawn. A worker dispatch carries the task's persona id
+        /// (`office-worker-<name>`, deterministically chosen by `persona::worker_agent_id`
+        /// over the task id); a reviewer dispatch carries the fixed `office-reviewer`.
+        /// Owned `String` (was `&'static str`) so it can carry the per-task persona.
+        agent: String,
         model: Option<String>,
     },
     /// Spawn the project-level `office-researcher` (ARCHITECTURE.md 6.2b). Two-phase like
@@ -475,6 +479,9 @@ fn start_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         session: p.bound_session.clone().unwrap_or_default(),
         spawned_at_ms: now_ms,
         kind: AgentKind::Researcher,
+        // Project-level fixed staff: the office view keys the researcher desk off this
+        // binding's PRESENCE, not a persona label, so no per-task persona applies.
+        persona: String::new(),
     });
 }
 
@@ -1495,6 +1502,11 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
         &folded,
     );
 
+    // A stable, id-hashed persona (one of 10) — the same task always draws the same
+    // worker across respawns/bounces (persona.rs). Carried both as the spawn's agent id
+    // and onto the binding so the office view can label the desk.
+    let persona = crate::persona::worker_agent_id(&tid.0);
+
     ctx.fx.push(Effect::EnsureDesk {
         task: tid.clone(),
         dir: desk.clone(),
@@ -1502,7 +1514,7 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
     ctx.fx.push(Effect::Spawn {
         task: tid.clone(),
         prompt,
-        agent: "office-worker",
+        agent: persona.clone(),
         model: p.config.worker_model.clone(),
     });
 
@@ -1513,6 +1525,7 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
             session: bound.to_string(),
             spawned_at_ms: now_ms,
             kind: AgentKind::Worker,
+            persona,
         },
         attempt,
     };
@@ -1540,7 +1553,7 @@ fn spawn_reviewer(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, n
     ctx.fx.push(Effect::Spawn {
         task: tid.clone(),
         prompt,
-        agent: "office-reviewer",
+        agent: "office-reviewer".to_string(),
         model: p.config.reviewer_model.clone(),
     });
 
@@ -1550,6 +1563,7 @@ fn spawn_reviewer(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, n
             session: bound.to_string(),
             spawned_at_ms: now_ms,
             kind: AgentKind::Reviewer,
+            persona: "office-reviewer".to_string(),
         }),
         attempt,
     };
@@ -1665,6 +1679,9 @@ fn start_audit(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         session: p.bound_session.clone().unwrap_or_default(),
         spawned_at_ms: now_ms,
         kind: AgentKind::Auditor,
+        // Project-level fixed staff: the office view keys the auditor corner off this
+        // binding's PRESENCE, not a persona label.
+        persona: String::new(),
     });
     queue_notice(
         p,

@@ -38,6 +38,9 @@ export interface Task {
   blockedBy: string[];
   bounces: number;
   agentId?: string | number;
+  /** Short worker persona at this task's desk (e.g. `nova`) — office view only (digest.rs
+   * full mode; present while the task is in progress / in review / parked). */
+  persona?: string;
   description?: string;
   acceptance?: string[];
   comments?: TaskComment[];

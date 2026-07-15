@@ -33,6 +33,7 @@ fn binding() -> AgentBinding {
         session: "sess".to_string(),
         spawned_at_ms: 1,
         kind: AgentKind::Worker,
+        persona: String::new(),
     }
 }
 

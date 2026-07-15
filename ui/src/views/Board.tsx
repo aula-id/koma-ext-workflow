@@ -7,6 +7,7 @@ import Drilldown from './Drilldown';
 import DepMap from '../components/DepMap';
 import TaskDetail from './TaskDetail';
 import Prd from './Prd';
+import OfficeMap from './OfficeMap';
 import ConfirmButton from '../components/ConfirmButton';
 
 /** Project shape, full mode, per docs/PANEL_PROTOCOL.md 2.1 (frozen W7 contract). */
@@ -69,6 +70,15 @@ export interface Project {
   officeTranscript?: ChatMsg[];
   officeSummary?: string;
   outbox?: OutboundNoticeView[];
+  /** Fixed-staff liveness for the office view (6.2b/6.2c): whether the project-level
+   * researcher / clean-build auditor sub-agent is currently in flight. Full mode only. */
+  researchActive?: boolean;
+  auditActive?: boolean;
+  /** Raw binding presence the mock harness carries; the office view treats either as "live". */
+  research?: unknown;
+  audit?: unknown;
+  /** Config subset the office view reads — `maxWorkers` chooses the office layout tier. */
+  config?: { maxWorkers?: number | null };
 }
 
 const COLUMNS: { key: ColumnKey; label: string }[] = [
@@ -130,20 +140,21 @@ export interface BoardProps {
   projectId: string;
   onBack?: () => void;
   onSettings?: () => void;
-  /** Deep-link support (`?view=board|drilldown|task|office`, see App.tsx): which tab
-   * to land on. Defaults to `'board'`, matching prior behavior. */
+  /** Deep-link support (`?view=board|drilldown|task|office|office-map`, see App.tsx): which
+   * tab to land on. Defaults to `'office'` — the pixel virtual office is the default project
+   * view. */
   initialTab?: Tab;
   /** Deep-link support: pre-select a task's detail panel (`?view=task`) on mount. */
   initialTaskId?: string;
 }
 
-type Tab = 'board' | 'drilldown' | 'depmap' | 'prd';
+type Tab = 'office' | 'board' | 'drilldown' | 'depmap' | 'prd';
 
 export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _onSettings, initialTab, initialTaskId }) => {
   const rawProject = useStore((s) => s.getProject(projectId));
   const project = rawProject as unknown as Project | undefined;
 
-  const [tab, setTab] = useState<Tab>(initialTab ?? 'board');
+  const [tab, setTab] = useState<Tab>(initialTab ?? 'office');
   const [dragTaskId, setDragTaskId] = useState<string | null>(null);
   const [dragOverColumn, setDragOverColumn] = useState<ColumnKey | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -368,7 +379,7 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
 
         {/* koma-flat tabs: text + active underline, no boxes */}
         <div style={{ display: 'flex', gap: '1.1rem', margin: '0.75rem 0 1rem', borderBottom: '1px solid var(--wf-border)' }}>
-          {(['board', 'drilldown', 'depmap', 'prd'] as Tab[]).map((t) => (
+          {(['office', 'board', 'drilldown', 'depmap', 'prd'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -381,10 +392,12 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
                 borderRadius: 0,
               }}
             >
-              {t === 'board' ? 'board' : t === 'drilldown' ? 'drilldown' : t === 'depmap' ? 'dependencies' : 'docs'}
+              {t === 'office' ? 'office' : t === 'board' ? 'board' : t === 'drilldown' ? 'drilldown' : t === 'depmap' ? 'dependencies' : 'docs'}
             </button>
           ))}
         </div>
+
+        {tab === 'office' && <OfficeMap project={project} onTaskClick={(id) => setSelectedTaskId(id)} />}
 
         {tab === 'board' && (
           <React.Fragment>

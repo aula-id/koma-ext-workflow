@@ -7,7 +7,7 @@ import { useStore } from './store';
 import { themeManager } from './theme';
 
 type ViewType = 'dashboard' | 'board' | 'settings';
-type BoardTab = 'board' | 'drilldown' | 'depmap' | 'prd';
+type BoardTab = 'office' | 'board' | 'drilldown' | 'depmap' | 'prd';
 
 interface DeepLink {
   view: ViewType;
@@ -16,14 +16,17 @@ interface DeepLink {
   wantsTask?: boolean;
 }
 
-/** `?view=dashboard|board|drilldown|task|settings|office` (deterministic initial view
- * for screenshots/deep links). `drilldown`/`task`/`office` are all board sub-views —
- * `office` lands on the PRD tab, where the office chat panel lives (Prd.tsx only shows
- * it once the project is Drafting). Anything unrecognized falls back to the dashboard. */
+/** `?view=dashboard|board|office-map|drilldown|task|settings|office` (deterministic initial
+ * view for screenshots/deep links). `office-map`/`drilldown`/`task`/`office` are all board
+ * sub-views — `office-map` lands on the pixel virtual office tab, while the legacy `office`
+ * alias lands on the PRD/docs tab where the office chat panel lives (kept for back-compat).
+ * Anything unrecognized falls back to the dashboard. */
 function parseDeepLink(raw: string | null): DeepLink {
   switch (raw) {
     case 'board':
       return { view: 'board', boardTab: 'board' };
+    case 'office-map':
+      return { view: 'board', boardTab: 'office' };
     case 'drilldown':
       return { view: 'board', boardTab: 'drilldown' };
     case 'depmap':
@@ -120,7 +123,8 @@ const App: React.FC = () => {
 
   const handleProjectClick = (projectId: string) => {
     setSelectedProject(projectId);
-    setBoardTab('board');
+    // The pixel virtual office is the default project view.
+    setBoardTab('office');
     setCurrentView('board');
   };
 

@@ -37,6 +37,7 @@ mod tests {
                 session: "s".to_string(),
                 spawned_at_ms: 0,
                 kind: AgentKind::Worker,
+                persona: String::new(),
             },
             attempt: 1,
         }

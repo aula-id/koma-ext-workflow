@@ -51,6 +51,7 @@ fn worker_binding(agent_id: u64, spawned_at_ms: u64) -> AgentBinding {
         session: "sess-x".to_string(),
         spawned_at_ms,
         kind: AgentKind::Worker,
+        persona: String::new(),
     }
 }
 
@@ -110,7 +111,10 @@ fn tick_dispatches_ready_task_and_persists_binding() {
     d.on_tick(1_000);
 
     let spawn = last_call(&d.host, "sessions.spawn_into").expect("a spawn_into call");
-    assert_eq!(spawn.get("agent").and_then(Value::as_str), Some("office-worker"));
+    // The worker spawns under its per-task persona id (office-worker-<name>), stably hashed
+    // from the task id "auth/t1".
+    let expected_agent = office_core::persona::worker_agent_id("auth/t1");
+    assert_eq!(spawn.get("agent").and_then(Value::as_str), Some(expected_agent.as_str()));
     assert_eq!(spawn.get("notify").and_then(Value::as_bool), Some(true));
     assert_eq!(spawn.get("session").and_then(Value::as_str), Some("sess-x"));
     // worker_model is None -> the model key is omitted entirely (inherit Main).
@@ -771,6 +775,7 @@ fn reconcile_runtime_ceiling_kills_over_age_researcher_and_degrades() {
         session: "sess-x".to_string(),
         spawned_at_ms: 0,
         kind: AgentKind::Researcher,
+        persona: String::new(),
     });
     d.insert_for_test(p, 0);
 
@@ -846,6 +851,7 @@ fn reviewer_binding(agent_id: u64, spawned_at_ms: u64) -> AgentBinding {
         session: "sess-x".to_string(),
         spawned_at_ms,
         kind: AgentKind::Reviewer,
+        persona: "office-reviewer".to_string(),
     }
 }
 

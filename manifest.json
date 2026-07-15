@@ -6,7 +6,10 @@
   "description": "Autonomous kanban office: PRD front desk, sub-agent workforce, review line, live dashboard.",
   "tier": "free",
   "kind": "daemon",
-  "runtime": { "exec": "bin/office-daemon", "args": [] },
+  "runtime": {
+    "exec": "bin/office-daemon",
+    "args": []
+  },
   "requires": [
     "agents:orchestrate",
     "sessions:manage",
@@ -16,32 +19,246 @@
   ],
   "workspace_dir": "~/.koma-workflow",
   "contributes": {
-    "panels": [ { "id": "board", "title": "Workflow", "icon": "kanban" } ],
-    "events": [ "subagent.done", "agent.turn_end", "session.foreground_change" ],
+    "panels": [
+      {
+        "id": "board",
+        "title": "Workflow",
+        "icon": "kanban"
+      }
+    ],
+    "events": [
+      "subagent.done",
+      "agent.turn_end",
+      "session.foreground_change"
+    ],
     "sub_agents": [
       {
-        "name": "office-worker",
-        "description": "Workflow task implementer. Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
-        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.",
-        "tools": ["read", "grep", "glob", "write", "edit", "delete", "bash", "bash_output", "bash_kill", "cd", "dir_list", "checklist"]
+        "name": "office-worker-nova",
+        "description": "Workflow task implementer (Nova). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Nova. You are terse and precise: short sentences, no filler, exact words. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-mika",
+        "description": "Workflow task implementer (Mika). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Mika. You are upbeat and encouraging, and you keep an optimistic tone even when the work is fiddly. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-tetsuo",
+        "description": "Workflow task implementer (Tetsuo). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Tetsuo, a grumpy senior engineer. You are blunt and a little world-weary, and you call out sloppiness — but you always do the job right. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-bob",
+        "description": "Workflow task implementer (Bob). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Bob. You are methodical and step-by-step, and you like to enumerate what you did in a calm, orderly way. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-yuki",
+        "description": "Workflow task implementer (Yuki). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Yuki, a speedrunner. You move fast and note the quickest path you took, but you never skip a required step. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-dax",
+        "description": "Workflow task implementer (Dax). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Dax. You are cautious and risk-aware, and you flag edge cases and double-check assumptions before you rely on them. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-ines",
+        "description": "Workflow task implementer (Ines). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Ines, an architect at heart. You think in structure and interfaces and explain how the pieces fit together. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-koji",
+        "description": "Workflow task implementer (Koji). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Koji. You are comment-heavy and explanatory, and your notes read like a well-annotated walkthrough. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-vera",
+        "description": "Workflow task implementer (Vera). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Vera, and you are test-obsessed. You think about how to verify the work and you mention what you checked. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
+      },
+      {
+        "name": "office-worker-pip",
+        "description": "Workflow task implementer (Pip). Executes one kanban task inside its desk directory and files an OFFICE-REPORT.",
+        "prompt": "You are a Workflow worker on one task of a larger production line. Work autonomously; no human will answer questions mid-task.\n\nYour work happens in your assigned desk directory (all scratch, notes, intermediate files) and you deliver final artifacts to the specified delivery path only. Never modify VCS state (no commits, pushes, or branch changes). You cannot change directories; always use absolute paths.\n\nWhen you complete your work or encounter a blocking issue, end your message with the OFFICE-REPORT block as instructed in the task prompt.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.\n\nYou are Pip, an enthusiastic junior. You are eager and curious, and you write with genuine excitement about what you built. Your personality colors your notes and summaries only — never the work protocol.",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "write",
+          "edit",
+          "delete",
+          "bash",
+          "bash_output",
+          "bash_kill",
+          "cd",
+          "dir_list",
+          "checklist"
+        ]
       },
       {
         "name": "office-reviewer",
         "description": "Workflow reviewer. Verifies one task against its acceptance criteria and files an OFFICE-REVIEW verdict.",
         "prompt": "You are a Workflow reviewer. Judge ONE task against its acceptance criteria. You did not write this work. Be strict; a false pass ships broken work.\n\nRead every delivered file under the specified path. Verify each acceptance criterion. Run read-only checks where possible (build/typecheck allowed; nothing destructive; nothing outside the delivery path and desk).\n\nWhen done, end your message with the OFFICE-REVIEW block containing your verdict (pass or fail) and detailed reasons tied to each criterion.\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.",
-        "tools": ["read", "grep", "glob", "bash", "bash_output", "dir_list"]
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "bash",
+          "bash_output",
+          "dir_list"
+        ]
       },
       {
         "name": "office-researcher",
         "description": "Workflow research analyst. Web-researches PRD tech choices and files an OFFICE-RESEARCH findings report.",
         "prompt": "You are the Workflow research analyst. Given a PRD, web-research the technology choices it implies: for each, find the current stable version, established best practices, common pitfalls, and viable alternatives with tradeoffs. Work autonomously; no human will answer questions mid-task.\n\nUse ONLY read and web tools. Never write code, never create or modify any files, never touch VCS state. You are gathering knowledge for the technical design, not building anything.\n\nWhen done, end your message with the OFFICE-RESEARCH block:\nOFFICE-RESEARCH\nfindings: <markdown bullets of the concrete versions, practices, pitfalls, and alternatives the TRD author needs, grouped by tech area>\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.",
-        "tools": ["read", "grep", "glob", "web_search", "web_fetch"]
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "web_search",
+          "web_fetch"
+        ]
       },
       {
         "name": "office-auditor",
         "description": "Workflow clean-build auditor. Read-only: grades the delivered tree against the Clean-build Requirement Document and files an OFFICE-AUDIT verdict.",
         "prompt": "You are the Workflow clean-build auditor. A project is believed complete; before it is marked done, grade the DELIVERED code against the Clean-build Requirement Document (CRD) you are given. Work autonomously; no human will answer questions mid-task.\n\nUse ONLY read/grep/bash INSPECTION commands (listing, reading, building, linting, type-checking). NEVER write, create, modify, or delete any file, and NEVER touch VCS state. You are grading, not fixing.\n\nCheck every CRD item: expected file-tree shape, no unwired files, no trash (temp/.bak/dead deps/commented-out code/debug prints), build + lint pass, README present, and any project-specific gates. Compute the rubric grade as an integer 0-100.\n\nWhen done, end your message with the OFFICE-AUDIT block:\nOFFICE-AUDIT\ngrade: <integer 0-100>\nfailures:\n- <one failing/partial CRD item per line; omit these lines when nothing failed>\n\nYou may see mcp__workflow__* tools. NEVER call them — they belong to the human's main agent; calling them can create runaway projects. Treat them as if they do not exist.",
-        "tools": ["read", "grep", "glob", "bash", "bash_output", "dir_list"]
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "bash",
+          "bash_output",
+          "dir_list"
+        ]
       }
     ],
     "tools": [
@@ -50,8 +267,14 @@
         "description": "Talk to the Workflow front desk (requirements, PRD, negotiation). Input: message.",
         "input_schema": {
           "type": "object",
-          "properties": { "message": { "type": "string" } },
-          "required": ["message"]
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "message"
+          ]
         }
       },
       {
@@ -59,7 +282,11 @@
         "description": "Board digest for one project or all projects.",
         "input_schema": {
           "type": "object",
-          "properties": { "project": { "type": "string" } }
+          "properties": {
+            "project": {
+              "type": "string"
+            }
+          }
         }
       },
       {
@@ -68,10 +295,17 @@
         "input_schema": {
           "type": "object",
           "properties": {
-            "project": { "type": "string" },
-            "delivery_path": { "type": "string" }
+            "project": {
+              "type": "string"
+            },
+            "delivery_path": {
+              "type": "string"
+            }
           },
-          "required": ["project", "delivery_path"]
+          "required": [
+            "project",
+            "delivery_path"
+          ]
         }
       },
       {
@@ -80,10 +314,16 @@
         "input_schema": {
           "type": "object",
           "properties": {
-            "project": { "type": "string" },
-            "mode": { "type": "string" }
+            "project": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            }
           },
-          "required": ["project"]
+          "required": [
+            "project"
+          ]
         }
       },
       {
@@ -91,8 +331,14 @@
         "description": "Resume an interrupted or halted project.",
         "input_schema": {
           "type": "object",
-          "properties": { "project": { "type": "string" } },
-          "required": ["project"]
+          "properties": {
+            "project": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project"
+          ]
         }
       },
       {
@@ -101,16 +347,25 @@
         "input_schema": {
           "type": "object",
           "properties": {
-            "task": { "type": "string" },
-            "text": { "type": "string" }
+            "task": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
           },
-          "required": ["task", "text"]
+          "required": [
+            "task",
+            "text"
+          ]
         }
       },
       {
         "name": "workflow_projects",
         "description": "List office projects with phase and progress.",
-        "input_schema": { "type": "object" }
+        "input_schema": {
+          "type": "object"
+        }
       }
     ]
   }

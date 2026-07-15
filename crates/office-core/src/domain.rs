@@ -24,6 +24,14 @@ pub struct AgentBinding {
     pub session: String,
     pub spawned_at_ms: u64,
     pub kind: AgentKind,
+    /// The sub-agent persona this binding was spawned as: a worker persona id
+    /// (`office-worker-<name>`, one of 10 — see `persona.rs`) on a worker dispatch, or
+    /// `office-reviewer` on a reviewer dispatch. `#[serde(default)]` (empty string) so
+    /// state persisted before personas existed still deserializes cleanly. The office
+    /// view (ARCHITECTURE.md 5.2 / digest.rs) strips the `office-worker-` prefix to the
+    /// short name; the value never overrides the state machine, it only labels the desk.
+    #[serde(default)]
+    pub persona: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

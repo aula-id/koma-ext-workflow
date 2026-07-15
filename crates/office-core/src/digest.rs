@@ -161,6 +161,22 @@ fn state_label(state: &TaskState) -> &'static str {
     }
 }
 
+/// The short worker persona (e.g. `nova`) at a task's desk, for the pixel office view
+/// (ARCHITECTURE.md 5.2, ui/src/views/OfficeMap.tsx). Present only while the task is
+/// occupying a worker's desk — in progress, in review, or parked mid-work — since those
+/// are the states the office map draws a seated persona for; Todo/Backlog/Done free the
+/// desk. The value is the stable id-hashed worker persona, identical to the task's
+/// `office-worker-` binding persona with its prefix stripped (a reviewer binding carries
+/// `office-reviewer`, so it is re-derived from the id rather than stripped). Full mode
+/// only; summary mode drops it under the 900KB size guard.
+fn task_persona(t: &Task) -> Option<&'static str> {
+    let occupied = matches!(
+        t.state,
+        TaskState::OnProgress { .. } | TaskState::Review { .. } | TaskState::Parked { .. }
+    );
+    occupied.then(|| crate::persona::worker_persona(&t.id.0))
+}
+
 fn chat_author_str(who: &ChatAuthor) -> &'static str {
     match who {
         ChatAuthor::User => "user",
@@ -218,6 +234,10 @@ fn task_to_value(t: &Task, mode: SnapshotMode) -> Value {
             .iter()
             .map(|e| json!({ "atMs": e.at_ms, "event": e.event }))
             .collect::<Vec<_>>());
+        // Office-view desk label (5.2); omitted entirely when the desk is free.
+        if let Some(name) = task_persona(t) {
+            obj["persona"] = json!(name);
+        }
     }
 
     obj
@@ -253,6 +273,12 @@ fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
         // The last clean-build audit grade (6.2c) — surfaced on the dashboard row + MCP status
         // line when present (null when the project was never audited).
         obj["lastAuditGrade"] = json!(p.last_audit_grade);
+        // Fixed-staff liveness for the office view (5.2): whether the project-level
+        // researcher / clean-build auditor sub-agent is currently in flight. The office map
+        // animates the researcher reading / the auditor judging off these; additive, full
+        // mode only.
+        obj["researchActive"] = json!(p.research.is_some());
+        obj["auditActive"] = json!(p.audit.is_some());
         // Ungrounded assumptions the safeguard flagged in the last doc gate (6.2c): the docs tab
         // renders these as an amber pending-assumptions strip while the pipeline waits.
         obj["pendingAssumptions"] = json!(p.pending_assumptions);

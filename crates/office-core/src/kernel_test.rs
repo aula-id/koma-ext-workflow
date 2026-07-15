@@ -64,6 +64,7 @@ fn worker_binding(id: u64, at: u64) -> AgentBinding {
         session: "sess-1".to_string(),
         spawned_at_ms: at,
         kind: AgentKind::Worker,
+        persona: String::new(),
     }
 }
 
@@ -73,6 +74,7 @@ fn reviewer_binding(id: u64, at: u64) -> AgentBinding {
         session: "sess-1".to_string(),
         spawned_at_ms: at,
         kind: AgentKind::Reviewer,
+        persona: "office-reviewer".to_string(),
     }
 }
 
@@ -82,6 +84,7 @@ fn researcher_binding(id: u64, at: u64) -> AgentBinding {
         session: "sess-1".to_string(),
         spawned_at_ms: at,
         kind: AgentKind::Researcher,
+        persona: String::new(),
     }
 }
 
@@ -91,6 +94,7 @@ fn auditor_binding(id: u64, at: u64) -> AgentBinding {
         session: "sess-1".to_string(),
         spawned_at_ms: at,
         kind: AgentKind::Auditor,
+        persona: String::new(),
     }
 }
 
@@ -101,7 +105,7 @@ fn count_spawns(fx: &[Effect]) -> usize {
 fn spawn_agents<'a>(fx: &'a [Effect]) -> Vec<&'a str> {
     fx.iter()
         .filter_map(|e| match e {
-            Effect::Spawn { agent, .. } => Some(*agent),
+            Effect::Spawn { agent, .. } => Some(agent.as_str()),
             _ => None,
         })
         .collect()
@@ -645,7 +649,9 @@ fn full_task_lifecycle_effect_sequence() {
     // 1. Tick -> EnsureDesk + Spawn(worker) + Persist + PanelPush.
     let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
     assert!(matches!(fx[0], Effect::EnsureDesk { .. }));
-    assert!(matches!(&fx[1], Effect::Spawn { agent: "office-worker", .. }));
+    // A worker spawn now carries the task's persona id (office-worker-<name>), stably
+    // hashed from the task id — deterministic, so it equals worker_agent_id("t1").
+    assert!(matches!(&fx[1], Effect::Spawn { agent, .. } if *agent == crate::persona::worker_agent_id("t1")));
     assert!(matches!(fx[2], Effect::Persist));
     assert!(matches!(fx[3], Effect::PanelPush { .. }));
     assert_eq!(fx.len(), 4);
@@ -1023,7 +1029,7 @@ fn resume_re_dispatches() {
     let mut p = project(ProjectPhase::Interrupted, vec![task("t1", TaskState::Todo, 0, &[])]);
     let fx = step(&mut p, Input::Command(Command::Resume), 1000, 4);
     assert!(matches!(p.phase, ProjectPhase::Running));
-    assert_eq!(spawn_agents(&fx), vec!["office-worker"]);
+    assert_eq!(spawn_agents(&fx), vec![crate::persona::worker_agent_id("t1").as_str()]);
 }
 
 #[test]

@@ -9,6 +9,7 @@ mod tests {
             session: "s1".to_string(),
             spawned_at_ms: 1000,
             kind: AgentKind::Worker,
+            persona: String::new(),
         }
     }
 

@@ -13,6 +13,7 @@ mod tests {
                     session: "session-1".to_string(),
                     spawned_at_ms: 1000,
                     kind: AgentKind::Worker,
+                    persona: String::new(),
                 },
                 attempt: 1,
             }),
@@ -82,6 +83,7 @@ mod tests {
                 session: "session-123".to_string(),
                 spawned_at_ms: now + 50,
                 kind: AgentKind::Researcher,
+                persona: String::new(),
             }),
             crd_markdown: "# CRD\n- README present (10 pts)\n- builds clean (20 pts)".to_string(),
             audit: Some(AgentBinding {
@@ -89,6 +91,7 @@ mod tests {
                 session: "session-123".to_string(),
                 spawned_at_ms: now + 900,
                 kind: AgentKind::Auditor,
+                persona: String::new(),
             }),
             audit_rounds: 1,
             last_audit_grade: Some(93),
@@ -178,6 +181,7 @@ mod tests {
                             session: "session-123".to_string(),
                             spawned_at_ms: now + 200,
                             kind: AgentKind::Worker,
+                            persona: "office-worker-nova".to_string(),
                         },
                         attempt: 1,
                     },
@@ -202,6 +206,7 @@ mod tests {
                             session: "session-123".to_string(),
                             spawned_at_ms: now + 300,
                             kind: AgentKind::Reviewer,
+                            persona: "office-reviewer".to_string(),
                         }),
                         attempt: 1,
                     },
@@ -454,14 +459,45 @@ mod tests {
         assert!(panels.is_array());
         assert!(panels[0]["id"].as_str().is_some());
 
-        // Check contributes.sub_agents
+        // Check contributes.sub_agents: a POOL of 10 worker personas (office-worker-<name>)
+        // in a stable order, then the three unchanged fixed staff.
         let sub_agents = &value["contributes"]["sub_agents"];
         assert!(sub_agents.is_array());
-        assert_eq!(sub_agents.as_array().unwrap().len(), 4);
-        assert_eq!(sub_agents[0]["name"], "office-worker");
-        assert_eq!(sub_agents[1]["name"], "office-reviewer");
-        assert_eq!(sub_agents[2]["name"], "office-researcher");
-        assert_eq!(sub_agents[3]["name"], "office-auditor");
+        let sub = sub_agents.as_array().unwrap();
+        assert_eq!(sub.len(), 13);
+
+        let pool = ["nova", "mika", "tetsuo", "bob", "yuki", "dax", "ines", "koji", "vera", "pip"];
+        for (i, name) in pool.iter().enumerate() {
+            assert_eq!(sub[i]["name"], format!("office-worker-{name}"));
+        }
+        assert_eq!(sub[10]["name"], "office-reviewer");
+        assert_eq!(sub[11]["name"], "office-researcher");
+        assert_eq!(sub[12]["name"], "office-auditor");
+        // The pool order MUST match office-core's WORKER_PERSONAS (persona assignment relies on it).
+        assert_eq!(pool, crate::persona::WORKER_PERSONAS);
+
+        // Every worker persona shares the SAME builder tools allow-list (write/edit/bash) and the
+        // SAME byte-identical protocol CORE; only a trailing personality flavor differs, and each
+        // carries the guard line so personality never overrides the protocol.
+        const GUARD_LINE: &str =
+            "Your personality colors your notes and summaries only — never the work protocol.";
+        // The shared CORE is everything before the LAST blank line (the flavor paragraph).
+        let core_of = |prompt: &str| -> String {
+            prompt.rsplit_once("\n\n").map(|(head, _)| head.to_string()).unwrap_or_default()
+        };
+        let base_tools = sub[0]["tools"].as_array().unwrap();
+        assert!(base_tools.iter().any(|t| t == "write"));
+        assert!(base_tools.iter().any(|t| t == "edit"));
+        assert!(base_tools.iter().any(|t| t == "bash"));
+        let base_core = core_of(sub[0]["prompt"].as_str().unwrap());
+        assert!(base_core.starts_with("You are a Workflow worker on one task"));
+        for i in 0..pool.len() {
+            let prompt = sub[i]["prompt"].as_str().unwrap();
+            assert_eq!(sub[i]["tools"].as_array().unwrap(), base_tools, "identical worker tools");
+            assert_eq!(core_of(prompt), base_core, "byte-identical protocol core across personas");
+            assert!(prompt.contains(GUARD_LINE), "persona {i} carries the guard line");
+            assert!(prompt.contains("mcp__workflow__*"), "persona {i} keeps the MCP loop guard");
+        }
 
         // Check contributes.tools
         let tools = &value["contributes"]["tools"];
@@ -538,6 +574,7 @@ mod tests {
             session: "s1".to_string(),
             spawned_at_ms: 1000,
             kind: AgentKind::Worker,
+            persona: "office-worker-nova".to_string(),
         };
 
         let reviewer_binding = AgentBinding {
@@ -545,6 +582,7 @@ mod tests {
             session: "s1".to_string(),
             spawned_at_ms: 1100,
             kind: AgentKind::Reviewer,
+            persona: "office-reviewer".to_string(),
         };
 
         let json_worker = serde_json::to_string(&worker_binding).unwrap();
@@ -555,6 +593,32 @@ mod tests {
 
         assert_eq!(back_worker.kind, AgentKind::Worker);
         assert_eq!(back_reviewer.kind, AgentKind::Reviewer);
+        // The persona label round-trips verbatim.
+        assert_eq!(back_worker.persona, "office-worker-nova");
+        assert_eq!(back_reviewer.persona, "office-reviewer");
+    }
+
+    #[test]
+    fn test_agent_binding_persona_serde_default() {
+        // A binding persisted before personas existed carries no `persona`; `#[serde(default)]`
+        // must load it clean as an empty string (old state loads without a migration).
+        let legacy = r#"{ "ext_agent_id": 5, "session": "s", "spawned_at_ms": 1, "kind": "Worker" }"#;
+        let b: AgentBinding = serde_json::from_str(legacy).expect("legacy binding must load clean");
+        assert_eq!(b.persona, "", "absent persona defaults to empty");
+        assert_eq!(b.kind, AgentKind::Worker);
+
+        // A fresh worker binding carries its `office-worker-<name>` persona and round-trips.
+        let fresh = AgentBinding {
+            ext_agent_id: 9,
+            session: "s".to_string(),
+            spawned_at_ms: 2,
+            kind: AgentKind::Worker,
+            persona: worker_agent_id("some/task/id"),
+        };
+        assert!(fresh.persona.starts_with("office-worker-"));
+        let back: AgentBinding =
+            serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(back, fresh);
     }
 
     #[test]

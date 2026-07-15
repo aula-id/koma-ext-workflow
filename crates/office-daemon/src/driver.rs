@@ -780,7 +780,9 @@ impl<H: Host> Driver<H> {
         idx: usize,
         task: &TaskId,
         prompt: String,
-        agent: &'static str,
+        // Owned now (was `&'static str`): a worker spawn carries a per-task persona id
+        // (`office-worker-<name>`), a reviewer spawn the fixed `office-reviewer`.
+        agent: String,
         model: Option<String>,
         now_ms: u64,
     ) -> SpawnOutcome {
@@ -1299,11 +1301,13 @@ impl<H: Host> Driver<H> {
         let tracked = self.tracked_agent_ids();
         for e in entries {
             let agent = e.get("agent").and_then(Value::as_str).unwrap_or("");
-            if agent != "office-worker"
-                && agent != "office-reviewer"
-                && agent != "office-researcher"
-                && agent != "office-auditor"
-            {
+            // Worker ids now carry a persona suffix (`office-worker-<name>`), so match the
+            // prefix; the fixed-staff ids stay exact.
+            let is_office_agent = agent.starts_with("office-worker")
+                || agent == "office-reviewer"
+                || agent == "office-researcher"
+                || agent == "office-auditor";
+            if !is_office_agent {
                 continue;
             }
             if let Some(id) = parse_agent_id(&e) {

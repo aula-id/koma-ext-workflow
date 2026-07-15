@@ -117,7 +117,7 @@ function buildRunningProject() {
     },
     {
       id: 'notif/core-notification-pipeline/fanout-channel-delivery/build-fanout-consumer-worker', title: 'Build fanout consumer worker', column: 'onprogress', state: 'onprogress',
-      priority: 7, blockedBy: [], bounces: 1, agentId: 4021,
+      priority: 7, blockedBy: [], bounces: 1, agentId: 4021, persona: 'nova',
       description: 'Consume the fanout bus and route events to the delivery queue per channel.',
       acceptance: ['at-least-once delivery', 'dead-letter queue for poison events'],
       comments: [
@@ -133,7 +133,7 @@ function buildRunningProject() {
     },
     {
       id: 'notif/t8', title: 'Wire push-notification channel adapter', column: 'onprogress', state: 'onprogress',
-      priority: 4, blockedBy: [], bounces: 0, agentId: 4022,
+      priority: 4, blockedBy: [], bounces: 0, agentId: 4022, persona: 'mika',
       description: 'Adapt the delivery queue output to the mobile push provider SDK.',
       acceptance: ['handles provider 429s with backoff'],
       comments: [], lastReport: null, lastReview: null,
@@ -141,7 +141,7 @@ function buildRunningProject() {
     },
     {
       id: 'notif/t9', title: 'Email channel adapter', column: 'review', state: 'review',
-      priority: 6, blockedBy: ['notif/core-notification-pipeline/fanout-channel-delivery/build-fanout-consumer-worker'], bounces: 2,
+      priority: 6, blockedBy: ['notif/core-notification-pipeline/fanout-channel-delivery/build-fanout-consumer-worker'], bounces: 2, persona: 'tetsuo',
       description: 'Adapt the delivery queue output to the transactional email provider.',
       acceptance: ['unsubscribe link injected', 'bounce webhook updates preference store'],
       comments: [
@@ -163,7 +163,7 @@ function buildRunningProject() {
     },
     {
       id: 'notif/t10', title: 'Digest email batching job', column: 'review', state: 'review',
-      priority: 3, blockedBy: [], bounces: 0,
+      priority: 3, blockedBy: [], bounces: 0, persona: 'yuki',
       description: 'Nightly job that batches low-priority notifications into a single digest email.',
       acceptance: ['idempotent re-run', 'respects the user\'s digest-frequency preference'],
       comments: [], lastReport: 'Batching job implemented and dry-run tested against staging data.', lastReview: null,
@@ -171,7 +171,7 @@ function buildRunningProject() {
     },
     {
       id: 'notif/t11', title: 'Rate-limit shared SMS gateway credentials', column: 'review', state: 'parked',
-      priority: 9, blockedBy: [], bounces: 3,
+      priority: 9, blockedBy: [], bounces: 3, persona: 'bob',
       description: 'The SMS gateway account needs a rate-limit bump before the adapter can go further — blocked on vendor support.',
       acceptance: ['vendor confirms new rate limit', 'adapter respects the new ceiling'],
       comments: [
@@ -252,7 +252,7 @@ function buildRunningProject() {
     officeTranscript: [],
     officeSummary: '',
     outbox: [],
-    config: defaultConfig({ maxWorkers: 3, bounceBudget: 3, workerModel: 'claude-sonnet', reviewerModel: 'claude-opus' }),
+    config: defaultConfig({ maxWorkers: 4, bounceBudget: 3, workerModel: 'claude-sonnet', reviewerModel: 'claude-opus' }),
   };
 }
 
@@ -366,6 +366,10 @@ function buildDraftingProject() {
     trdMarkdown,
     researchNotes,
     crdMarkdown,
+    // A live research binding sample so the office view animates the researcher reading
+    // (the drafting pipeline is mid web-research). Mirrors digest.rs `researchActive`.
+    researchActive: true,
+    research: { extAgentId: 501, kind: 'Researcher', spawnedAtMs: nowMs() },
     pendingAssumptions: [
       'Assumed tier downgrades happen at renewal, but the user left downgrade timing open.',
       'Assumed Redis 7 for BullMQ; the user never named a cache.',
