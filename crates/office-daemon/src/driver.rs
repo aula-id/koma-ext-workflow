@@ -1093,6 +1093,7 @@ impl<H: Host> Driver<H> {
             interrupted_from: None,
             gate_cleared: false,
             pending_breakdown: None,
+            gate_invoke_live_hint: false,
             seq: 0,
         };
         if self.store.create_project(&project).is_err() {

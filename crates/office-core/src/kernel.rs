@@ -705,6 +705,7 @@ fn on_research_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: 
 /// PRD gate, completion does not author the docs directly — it settles the research side of the
 /// join and lets [`maybe_author_trdcrd`] author only once the PRD gate has ALSO cleared.
 fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
+    let research_spawned_at_ms = p.research.as_ref().map(|b| b.spawned_at_ms);
     p.research_notes = office::extract_research(&text);
     p.research = None;
     trace(p, now_ms, "research", format!("done — {} bytes of notes", p.research_notes.len()), ctx);
@@ -714,7 +715,7 @@ fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx)
         format!("office[{}]: research done — drafting the TRD + clean-build requirements.", p.id.0),
         ctx,
     );
-    maybe_author_trdcrd(p, now_ms, ctx);
+    maybe_author_trdcrd(p, now_ms, research_spawned_at_ms, ctx);
     ctx.dirty = true;
 }
 
@@ -722,6 +723,7 @@ fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx)
 /// Degrade gracefully: clear the binding, tell the user, and settle the research side of the
 /// TRD+CRD join from the PRD alone. Never wedges Drafting.
 fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
+    let research_spawned_at_ms = p.research.as_ref().map(|b| b.spawned_at_ms);
     p.research = None;
     trace(p, now_ms, "research", format!("degraded: {}", trace_preview(&reason, 80)), ctx);
     queue_notice(
@@ -733,7 +735,7 @@ fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx)
         ),
         ctx,
     );
-    maybe_author_trdcrd(p, now_ms, ctx);
+    maybe_author_trdcrd(p, now_ms, research_spawned_at_ms, ctx);
     ctx.dirty = true;
 }
 
@@ -803,8 +805,13 @@ fn restart_research_if_running(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 /// ONLY once the PRD gate has cleared AND research has SETTLED (done / degraded / skipped =
 /// `research` is `None`). Called from both settle events (the PRD gate clearing, and research
 /// completing/degrading/being skipped), so whichever finishes LAST triggers the authoring. Guarded
-/// by "TRD+CRD not already captured" so it authors exactly once.
-fn maybe_author_trdcrd(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+/// by "TRD+CRD not already captured" so it authors exactly once. `research_spawned_at_ms` is the
+/// JUST-cleared research binding's spawn time (when the caller is a research settle event; `None`
+/// when the caller is the gate clearing itself, where it is unused) — see
+/// [`self_heal_stale_prd_gate`], which runs first and may presume the gate cleared for
+/// pre-migration state.
+fn maybe_author_trdcrd(p: &mut Project, now_ms: u64, research_spawned_at_ms: Option<u64>, ctx: &mut Ctx) {
+    self_heal_stale_prd_gate(p, now_ms, research_spawned_at_ms, ctx);
     if p.gate_cleared
         && p.research.is_none()
         && p.trd_markdown.trim().is_empty()
@@ -812,6 +819,59 @@ fn maybe_author_trdcrd(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     {
         start_trdcrd_invoke(p, now_ms, ctx);
     }
+}
+
+/// Self-heal a PRD gate wedged by pre-migration state (review finding, design-speedup
+/// `gate_cleared` field): a `state.json` persisted by a pre-6.2b-design-speedup build never had
+/// `gate_cleared` at all (serde-default `false` on load) even though, under the OLD flow, research
+/// only ever started AFTER the PRD gate had passed — so clearance was real but never persisted.
+/// Reloaded into THIS build, no `AssumeCheckPrd` invoke will ever be (re-)fired for that PRD: the
+/// stale researcher binding just settles via a dead-agent event or the reconcile runtime ceiling,
+/// [`research_degrade`]/[`on_research_result`]/[`skip_research`] call the JOIN here, and —
+/// unhealed — `gate_cleared` stays `false` forever, wedging Drafting silently while the degrade
+/// notice claims drafting is proceeding.
+///
+/// Presumes the gate cleared when ALL of: the PRD exists, nothing is waiting on the user
+/// (`pending_assumptions` empty — a live freeze could still resolve on its own, so never heal
+/// under it), and no PRD gate invoke can plausibly still be in flight. That last part is decided
+/// by TWO signals, either sufficient (an OR):
+///
+/// 1. **`Project.gate_invoke_live_hint`** (primary) — a `#[serde(skip)]` runtime-only flag: "a PRD
+///    gate invoke was fired by THIS process and has not yet reached a terminal outcome". An
+///    in-flight invoke can never survive a daemon restart or lease transfer (nothing persists it,
+///    by design — ARCHITECTURE.md 6.2c: "the in-flight invoke chain IS the live signal, no disk
+///    waiting-state"), so it deserializes to `false` unconditionally. A project reloaded from disk
+///    — whether pre-migration (never had `gate_cleared` at all) or simply restarted mid-gate on
+///    THIS schema — therefore has `false` here even if the in-memory state before the restart said
+///    otherwise, which is exactly the "process boundary, not age" signal: it heals on the FIRST
+///    settle after ANY reload, however young the respawned research binding is (fixes the
+///    fast-upgrade-kill and already-killed-pre-upgrade-then-respawned-on-resume cases, which both
+///    settle well under one `worker_max_runtime_ms`).
+/// 2. **Research-age staleness** (belt) — reuses the SAME staleness signal `runtime_ceiling`
+///    already applies to a hung sub-agent binding (`now_ms - spawned_at_ms > worker_max_runtime_ms`
+///    on the research binding that just settled). Covers the case where the hint is (incorrectly or
+///    not) `true` but so much time has passed that no single model call could still be outstanding —
+///    in a live session research and the gate are kicked off in the SAME kernel step
+///    (`start_research_at_capture` then `gate_doc`), and every `AssumeCheck*`/resolve/verify invoke
+///    resolves far inside one ceiling window.
+///
+/// The native in-process race (`research_result_before_the_gate_clears_waits_for_the_join`) has the
+/// hint `true` and a young binding, so NEITHER signal fires — the gate is correctly left to clear on
+/// its own invoke result, unhealed.
+fn self_heal_stale_prd_gate(p: &mut Project, now_ms: u64, research_spawned_at_ms: Option<u64>, ctx: &mut Ctx) {
+    if p.gate_cleared || p.prd_markdown.trim().is_empty() || !p.pending_assumptions.is_empty() {
+        return;
+    }
+    let age_proves_stale = matches!(
+        research_spawned_at_ms,
+        Some(spawned_at_ms) if now_ms.saturating_sub(spawned_at_ms) > p.config.worker_max_runtime_ms
+    );
+    if p.gate_invoke_live_hint && !age_proves_stale {
+        return; // fired by THIS process and not even runtime-ceiling-old — genuinely may still land
+    }
+    p.gate_cleared = true;
+    p.gate_invoke_live_hint = false;
+    trace(p, now_ms, "gate", "PRD gate presumed cleared (migrated state)", ctx);
 }
 
 /// Issue the COMBINED TRD+CRD authoring invoke (design-speedup item 3): one invoke authors BOTH
@@ -917,12 +977,22 @@ enum Deferred {
 /// A gate cleared: record it on the shared `gate_cleared` flag (one flag serves both stages because
 /// the PRD stage strictly precedes the TRD+CRD stage and each fresh capture resets it), drop any
 /// pending assumptions, and run the stage's JOIN — which fires the next pipeline step only once BOTH
-/// join conditions hold (the parallel research / early breakdown may still be in flight).
+/// join conditions hold (the parallel research / early breakdown may still be in flight). This is
+/// the single chokepoint every PRD-stage gate outcome funnels through (clean, fail-open on `Err`,
+/// approved self-resolve, no-usable-items, resolve-failed, verify errored/clean/disclosed,
+/// `workflow_approve`) — so it doubles as the terminal-arm clear site for
+/// `gate_invoke_live_hint` (the freeze arm, which does NOT reach here, clears it in
+/// `freeze_critical`).
 fn run_gate_cleared(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
+    if matches!(deferred, Deferred::PostPrd) {
+        p.gate_invoke_live_hint = false;
+    }
     p.gate_cleared = true;
     p.pending_assumptions.clear();
     match deferred {
-        Deferred::PostPrd => maybe_author_trdcrd(p, now_ms, ctx),
+        // `gate_cleared` was just set `true` above, so `maybe_author_trdcrd`'s self-heal check is
+        // already a no-op here — `research_spawned_at_ms` is unused.
+        Deferred::PostPrd => maybe_author_trdcrd(p, now_ms, None, ctx),
         Deferred::Breakdown => maybe_apply_breakdown(p, now_ms, ctx),
     }
 }
@@ -979,6 +1049,7 @@ fn finalize_trdcrd_if_needed(p: &mut Project, deferred: Deferred, now_ms: u64, c
 /// waiting on research, so there is nothing to skip).
 fn skip_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     if let Some(b) = p.research.take() {
+        let research_spawned_at_ms = b.spawned_at_ms;
         if b.ext_agent_id != PROVISIONAL {
             ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
         }
@@ -992,7 +1063,7 @@ fn skip_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
             ),
             ctx,
         );
-        maybe_author_trdcrd(p, now_ms, ctx);
+        maybe_author_trdcrd(p, now_ms, Some(research_spawned_at_ms), ctx);
         ctx.dirty = true;
     } else {
         queue_notice(
@@ -1046,6 +1117,9 @@ fn gate_doc(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
     let (system, prompt) =
         office::build_assume_check_prompt(p, label, &body, tags, resolve_inline, ask_wellknown);
     trace(p, now_ms, "gate", format!("checking {label} for assumptions"), ctx);
+    if matches!(deferred, Deferred::PostPrd) {
+        p.gate_invoke_live_hint = true;
+    }
     emit_invoke(ctx, purpose, &p.config.safeguard_role, system, prompt);
 }
 
@@ -1209,7 +1283,12 @@ fn handle_assume_check_result(
 
     if !critical.is_empty() {
         // BOTH modes stop on critical items (auto mode already resolved the [auto] ones inline; ask
-        // mode surfaces critical BEFORE any rewrite). No finalize — the pipeline is frozen.
+        // mode surfaces critical BEFORE any rewrite). No finalize — the pipeline is frozen. This is
+        // the OTHER PRD-stage terminal arm (besides `run_gate_cleared`): nothing is in flight while
+        // frozen on the user, so clear the hint here too.
+        if matches!(deferred, Deferred::PostPrd) {
+            p.gate_invoke_live_hint = false;
+        }
         freeze_critical(p, doc_label, critical, now_ms, ctx);
         return;
     }
@@ -1260,6 +1339,9 @@ fn emit_resolve(
     );
     let body = gate_body(p, deferred);
     let (system, prompt) = office::build_assume_resolve_prompt(p, doc_label, &body, &auto, tags);
+    if matches!(deferred, Deferred::PostPrd) {
+        p.gate_invoke_live_hint = true;
+    }
     emit_draft_invoke(p, ctx, InvokePurpose::AssumeResolve, system, prompt);
 }
 
@@ -1273,6 +1355,9 @@ fn emit_verify(p: &mut Project, deferred: Deferred, doc_label: &str, now_ms: u64
     let body = gate_body(p, deferred);
     let (system, prompt) = office::build_assume_verify_prompt(p, doc_label, &body);
     trace(p, now_ms, "gate", format!("verifying {doc_label}"), ctx);
+    if matches!(deferred, Deferred::PostPrd) {
+        p.gate_invoke_live_hint = true;
+    }
     emit_invoke(ctx, InvokePurpose::AssumeVerify, &p.config.safeguard_role, system, prompt);
 }
 
@@ -1735,12 +1820,21 @@ fn handle_breakdown_reask_result(p: &mut Project, outcome: Result<String, String
     match office::parse_breakdown(&text) {
         Ok(breakdown) => apply_or_stash_breakdown(p, breakdown, text, now_ms, ctx),
         Err(e) => {
-            queue_notice(
-                p,
-                now_ms,
-                format!("office breakdown rejected twice ({e:?}); edit the board manually"),
-                ctx,
-            );
+            // Review finding (MINOR): "edit the board manually" is misleading in Drafting — the
+            // board does not exist yet there (the breakdown is only STASHED early, applied at the
+            // TRD+CRD JOIN; a permanently rejected breakdown just leaves it un-stashed, and nothing
+            // auto-retries it — `authorize` only checks the phase transition, it does not re-run
+            // the breakdown). Drafting gets a phase-aware message naming the ACTUAL next step
+            // (`workflow_breakdown`); Ready+ (a manual `workflow_breakdown` re-plan, board already
+            // exists) keeps the original wording.
+            let msg = if matches!(p.phase, ProjectPhase::Drafting) {
+                format!(
+                    "office breakdown rejected twice ({e:?}); the board is not built yet — run workflow_breakdown to retry now"
+                )
+            } else {
+                format!("office breakdown rejected twice ({e:?}); edit the board manually")
+            };
+            queue_notice(p, now_ms, msg, ctx);
             ctx.dirty = true;
         }
     }
@@ -1911,6 +2005,14 @@ fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         p.phase = ph;
         trace(p, now_ms, "phase", format!("hard interrupt from {}", phase_label(&from)), ctx);
     }
+    // A gate invoke in flight at interrupt time never gets to clear `gate_invoke_live_hint`: its
+    // eventual `InvokeResult` is unconditionally dropped by the `Interrupted` guard in
+    // `invoke_result` (never reaches `run_gate_cleared`/`freeze_critical`). Left `true`, it would
+    // wrongly block `self_heal_stale_prd_gate` after resume respawns a FRESH (young) researcher —
+    // exactly the wedge this hint exists to prevent. Clear it here: nothing can still be in flight
+    // for THIS process once Interrupted, by the same "process boundary" reasoning as the on-load
+    // default.
+    p.gate_invoke_live_hint = false;
     // Cut off the project-level drafting/completion analysts (research 6.2b, audit 6.2c). They
     // are NOT task bindings, so the normalization loop below never touches them; a dangling
     // researcher/auditor would keep burning tokens against an interrupted project (feature:
@@ -1963,6 +2065,10 @@ fn soft_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         p.phase = ph;
         trace(p, now_ms, "phase", format!("soft drain from {}", phase_label(&from)), ctx);
     }
+    // Same reasoning as `hard_interrupt`: the `Interrupted` guard in `invoke_result` drops a gate
+    // invoke's result unconditionally (soft drain does not exempt kernel-level invokes, only
+    // sub-agent `HostEvent::Result`s), so a hint left `true` would never clear on its own.
+    p.gate_invoke_live_hint = false;
 }
 
 /// Kill the project-level analyst bindings (research 6.2b / audit 6.2c) on a hard interrupt

@@ -429,6 +429,19 @@ pub struct Project {
     /// `#[serde(default)]` (None) for back-compat.
     #[serde(default)]
     pub pending_breakdown: Option<String>,
+    /// Runtime-only hint (review finding, migration self-heal): "a PRD gate (`AssumeCheckPrd` /
+    /// resolve / verify) invoke was fired by THIS process and may still be in flight". Set `true`
+    /// at every PRD-stage invoke emission (`gate_doc`, `emit_resolve`, `emit_verify`, each gated on
+    /// `Deferred::PostPrd`) and `false` at every terminal PRD-stage outcome (`run_gate_cleared`'s
+    /// PostPrd arm covers clean/fail-open/approved/verified; `freeze_critical` covers the
+    /// critical-freeze arm). Deliberately `#[serde(skip)]` — an in-flight invoke can never survive
+    /// a daemon restart or lease transfer, so it is NOT persisted and always deserializes to
+    /// `false`. That is exactly what makes it the authoritative "no gate outcome can ever arrive"
+    /// signal for [`self_heal_stale_prd_gate`] in kernel.rs: a project freshly loaded from disk has
+    /// this `false` regardless of what a pre-migration build's in-memory state looked like, so a
+    /// settling research binding heals the gate on first settle instead of wedging forever.
+    #[serde(skip)]
+    pub gate_invoke_live_hint: bool,
     pub seq: u64,
 }
 

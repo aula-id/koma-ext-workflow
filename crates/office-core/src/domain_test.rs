@@ -363,6 +363,7 @@ mod tests {
             }],
             interrupted_from: Some(ProjectPhase::Running),
             gate_cleared: false,
+            gate_invoke_live_hint: false,
             pending_breakdown: None,
             seq: 42,
         };
@@ -457,6 +458,14 @@ mod tests {
             p.config.assumption_mode, "auto",
             "absent assumption_mode defaults to 'auto' (autonomous), not empty"
         );
+        // Design-speedup additive fields also default cleanly on a pre-6.2b-design-speedup state
+        // file: the one-shot gate has not (yet, on THIS load) been recorded as cleared, no early
+        // breakdown is stashed, and research runs in the default "auto" mode with no drafter model
+        // override (review finding: these defaults previously went unasserted here).
+        assert!(!p.gate_cleared, "absent gate_cleared defaults to false");
+        assert!(p.pending_breakdown.is_none(), "absent pending_breakdown defaults to None");
+        assert_eq!(p.config.research_mode, "auto", "absent research_mode defaults to 'auto'");
+        assert!(p.config.drafter_model.is_none(), "absent drafter_model defaults to None");
     }
 
     #[test]

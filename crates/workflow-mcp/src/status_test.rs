@@ -68,6 +68,7 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         trace: vec![],
         interrupted_from: None,
         gate_cleared: false,
+        gate_invoke_live_hint: false,
         pending_breakdown: None,
         seq,
     }

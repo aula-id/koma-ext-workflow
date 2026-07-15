@@ -61,6 +61,7 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         trace: Vec::new(),
         interrupted_from: None,
         gate_cleared: false,
+        gate_invoke_live_hint: false,
         pending_breakdown: None,
         seq: 0,
     }
@@ -1425,6 +1426,11 @@ fn research_result_before_the_gate_clears_waits_for_the_join() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.prd_markdown = "# App".into();
     p.gate_cleared = false;
+    // Mirrors the real emission: `gate_doc` sets this the instant the PRD-capture step fires the
+    // AssumeCheckPrd invoke (kernel.rs), so a genuinely in-process race has it `true` here. Without
+    // it, `self_heal_stale_prd_gate` would (correctly, per its OWN contract) treat this as a
+    // process-boundary reload and heal immediately, which is exactly what this test must NOT see.
+    p.gate_invoke_live_hint = true;
     p.research = Some(researcher_binding(55, 1000));
     let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 55, text: "OFFICE-RESEARCH\nfindings: - clap\n".into() }), 2000, 4);
     assert!(p.research.is_none(), "notes stashed, binding cleared");
@@ -1470,6 +1476,98 @@ fn research_runtime_ceiling_kills_and_degrades() {
     assert!(p.research.is_none(), "over-age researcher cleared");
     assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd);
     assert!(p.outbox.iter().any(|n| n.text.contains("research skipped")));
+}
+
+#[test]
+fn stale_pre_migration_gate_cleared_self_heals_on_research_degrade() {
+    // Review finding (CRITICAL, migration wedge): a `state.json` persisted before the
+    // `gate_cleared` field existed loads with it `false` even though the OLD flow (research only
+    // ever ran AFTER the PRD gate passed) had already cleared the gate — clearance was real but
+    // never persisted. No `AssumeCheckPrd` invoke will ever be (re-)fired for this PRD in the new
+    // build, so the stale researcher binding just settles via the reconcile runtime ceiling
+    // (dead-agent path) here. Unhealed, `maybe_author_trdcrd` would no-op forever (silent Drafting
+    // wedge) because `gate_cleared` stays `false`. The self-heal must presume the gate cleared and
+    // proceed with the TRD+CRD join.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = false; // never persisted by the pre-migration build
+    p.pending_assumptions.clear(); // nothing waiting on the user — no outcome can ever arrive
+    p.research = Some(researcher_binding(700, 0)); // live pre-migration binding, reloaded stale
+    let now = p.config.worker_max_runtime_ms + 5_000; // old enough that no gate invoke could still be in flight
+    let fx = step(&mut p, Input::Host(HostEvent::Reconcile), now, 0);
+
+    assert!(fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 700 })));
+    assert!(p.research.is_none(), "over-age researcher cleared");
+    assert!(p.gate_cleared, "gate presumed cleared by the self-heal");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "self-heal unwedges the TRD+CRD join");
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("presumed cleared")),
+        "self-heal trace recorded"
+    );
+}
+
+#[test]
+fn migrated_project_deserialized_fresh_heals_even_with_a_young_researcher() {
+    // Coordinator hardening: age alone misses two real wedges — (1) a fast daemon upgrade kills a
+    // research binding that is only minutes old (well under `worker_max_runtime_ms`), and (2) a
+    // migrated project whose researcher was ALREADY dead pre-upgrade respawns a FRESH researcher on
+    // resume (`resume_should_respawn_research`) that then completes normally at a young age. Both
+    // settle with `gate_cleared=false` and a YOUNG research binding — the age belt alone would never
+    // fire. The correct signal is the PROCESS BOUNDARY: `gate_invoke_live_hint` is `#[serde(skip)]`,
+    // so ANY project deserialized from disk has it `false` regardless of what the in-memory state
+    // looked like before the reload — proven here with an ACTUAL serde round-trip (not just a
+    // manually-set field), including starting from `true` to show the round-trip is what resets it.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = false;
+    p.gate_invoke_live_hint = true; // as if a gate invoke WAS in flight when this state was saved
+    p.research = Some(researcher_binding(900, 10_000));
+
+    let json = serde_json::to_string(&p).expect("serialize");
+    let mut reloaded: Project = serde_json::from_str(&json).expect("deserialize");
+    assert!(!reloaded.gate_invoke_live_hint, "the skip field never round-trips through disk");
+
+    // The researcher settles normally, well under `worker_max_runtime_ms` since spawn — the age
+    // belt alone would NOT fire here; only the hint (correctly `false` post-reload) heals it.
+    let now = 10_500;
+    assert!(now - 10_000 < reloaded.config.worker_max_runtime_ms, "settle is young, not ceiling-stale");
+    let fx = step(
+        &mut reloaded,
+        Input::Host(HostEvent::Result { agent_id: 900, text: "OFFICE-RESEARCH\nfindings: - clap\n".into() }),
+        now,
+        4,
+    );
+
+    assert!(reloaded.gate_cleared, "gate presumed cleared by the hint-based self-heal");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "self-heal unwedges the TRD+CRD join");
+    assert!(
+        reloaded.trace.iter().any(|e| e.summary.contains("presumed cleared")),
+        "self-heal trace recorded"
+    );
+}
+
+#[test]
+fn in_process_gate_invoke_hint_blocks_heal_even_when_young() {
+    // Companion to `research_result_before_the_gate_clears_waits_for_the_join`, added for explicit
+    // coverage of the hint as the PRIMARY self-heal signal (not just the age belt): a genuinely
+    // in-process PRD gate invoke (`gate_invoke_live_hint = true`, as `gate_doc` sets the instant it
+    // fires the AssumeCheckPrd invoke) must NOT be healed away just because research happens to
+    // settle first, no matter how young the binding is.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = false;
+    p.gate_invoke_live_hint = true; // the PRD gate invoke is genuinely in flight THIS process
+    p.research = Some(researcher_binding(55, 1000));
+
+    let fx = step(
+        &mut p,
+        Input::Host(HostEvent::Result { agent_id: 55, text: "OFFICE-RESEARCH\nfindings: - clap\n".into() }),
+        2000,
+        4,
+    );
+
+    assert!(!p.gate_cleared, "hint blocks the self-heal — the invoke may still land");
+    assert!(invoke_effects(&fx).is_empty(), "no authoring until the gate itself clears");
 }
 
 #[test]
@@ -2609,6 +2707,26 @@ fn workflow_skip_kills_research_and_advances_the_join() {
     assert!(p.research.is_none(), "research binding cleared (skipped)");
     assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "the pipeline advances to TRD+CRD authoring");
     assert!(p.trace.iter().any(|e| e.summary.contains("research skipped by user")));
+}
+
+#[test]
+fn workflow_skip_on_a_migrated_project_also_heals_the_stale_gate() {
+    // Coordinator hardening point 6: a user calling workflow_skip on a migrated project (deserialized
+    // -> `gate_invoke_live_hint = false`, `gate_cleared = false` never persisted by the pre-migration
+    // build) must ALSO unwedge it, exactly like a settle via research_degrade/on_research_result.
+    // `skip_research` funnels through the same `maybe_author_trdcrd` -> `self_heal_stale_prd_gate`
+    // join, so this locks that path in too.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = false; // never persisted by the pre-migration build
+    p.gate_invoke_live_hint = false; // deserialized fresh — no invoke can be in flight
+    p.research = Some(researcher_binding(88, 500)); // live pre-migration binding, reloaded stale
+    let fx = step(&mut p, Input::Command(Command::SkipResearch), 1000, 4); // young settle — age belt would NOT fire
+    assert!(fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 88 })), "the researcher is killed");
+    assert!(p.research.is_none(), "research binding cleared (skipped)");
+    assert!(p.gate_cleared, "gate presumed cleared by the hint-based self-heal");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "the pipeline advances to TRD+CRD authoring");
+    assert!(p.trace.iter().any(|e| e.summary.contains("presumed cleared")));
 }
 
 #[test]
