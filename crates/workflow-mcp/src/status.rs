@@ -81,6 +81,8 @@ fn render_all(projects: &[Project]) -> String {
 fn project_block(p: &Project) -> String {
     let c = column_counts(p);
     let mut s = format!("{} ({}) - {}\n", p.id.0, p.name, phase_label(&p.phase));
+    // SDLC intake track (feature: sdlc-triage): project | enhancement | patch.
+    s.push_str(&format!("  track: {}\n", p.track));
     s.push_str(&format!(
         "  columns: backlog {} todo {} onprogress {} review {} done {}\n",
         c[0], c[1], c[2], c[3], c[4]

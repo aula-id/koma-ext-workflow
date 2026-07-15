@@ -66,6 +66,8 @@ mod tests {
             interrupted_from: None,
             gate_cleared: false,
             gate_invoke_live_hint: false,
+            track: "project".to_string(),
+            triage_pending: false,
             pending_breakdown: None,
             seq,
             worktree_desks: false,
@@ -136,6 +138,8 @@ mod tests {
         let idx_old = blob.find("- old:").expect("old present");
         let idx_new = blob.find("- new:").expect("new present");
         assert!(idx_new < idx_old, "higher-seq project should render first");
+        // sdlc-triage: the board digest carries each project's intake track.
+        assert!(blob.contains("track=project"), "the SDLC track is in the board digest: {blob}");
     }
 
     #[test]
@@ -162,6 +166,8 @@ mod tests {
         assert_eq!(t["history"].as_array().unwrap().len(), 1);
         assert_eq!(t["comments"].as_array().unwrap().len(), 1);
         assert_eq!(arr[0]["prdMarkdown"], "# PRD\nbody");
+        // sdlc-triage: the intake track rides the panel snapshot too.
+        assert_eq!(arr[0]["track"], "project");
     }
 
     #[test]

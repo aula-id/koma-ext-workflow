@@ -78,6 +78,8 @@ mod tests {
             interrupted_from: None,
             gate_cleared: false,
             gate_invoke_live_hint: false,
+            track: "project".to_string(),
+            triage_pending: false,
             pending_breakdown: None,
             seq: 0,
             worktree_desks: false,

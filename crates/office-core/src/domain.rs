@@ -307,6 +307,13 @@ fn default_research_mode() -> String {
     "auto".to_string()
 }
 
+/// The SDLC intake track a pre-feature state file loads as (feature: sdlc-triage): `"project"`, the
+/// full-ceremony track. A named-fn default (not `#[serde(default)]`, which would force an empty
+/// string) so old state = the safe full process.
+fn default_track() -> String {
+    "project".to_string()
+}
+
 impl ProjectConfig {
     pub fn default_config() -> Self {
         Self {
@@ -488,6 +495,23 @@ pub struct Project {
     /// settling research binding heals the gate on first settle instead of wedging forever.
     #[serde(skip)]
     pub gate_invoke_live_hint: bool,
+    /// SDLC intake track (feature: sdlc-triage). At the FIRST message of a fresh brief a lightweight
+    /// classifier routes the work to exactly one of three tracks: `"project"` (the full ceremony —
+    /// PRD/TRD/CRD, the default and safe fallback), `"enhancement"` (one change-brief doc + a small
+    /// breakdown, the trio skipped), or `"patch"` (no documents — the brief becomes one task straight
+    /// to Ready). A named-fn serde default of `"project"` (NOT `#[serde(default)]`, which would force
+    /// an empty string) so every pre-feature state file loads as the full-ceremony track.
+    #[serde(default = "default_track")]
+    pub track: String,
+    /// Whether the intake Triage classification is still in flight (feature: sdlc-triage). Set the
+    /// instant the first-message Triage invoke is emitted; cleared when its result lands, on error,
+    /// or on interrupt. While `true` a Drafting persona reply does NOT capture a doc into the
+    /// pipeline — the track (which decides WHICH fence/contract applies) is not yet known — it only
+    /// flows to chat. `#[serde(skip)]` for the same reason as `gate_invoke_live_hint`: an in-flight
+    /// invoke can never survive a daemon restart, so it deserializes to `false` and the persona
+    /// proceeds under the resolved (or default `"project"`) track rather than wedging.
+    #[serde(skip)]
+    pub triage_pending: bool,
     pub seq: u64,
 }
 

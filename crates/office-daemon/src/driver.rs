@@ -1189,6 +1189,8 @@ impl<H: Host> Driver<H> {
             hygiene_sum: 0,
             hygiene_count: 0,
             gate_invoke_live_hint: false,
+            track: "project".to_string(),
+            triage_pending: false,
             seq: 0,
         };
         if self.store.create_project(&project).is_err() {
@@ -1929,6 +1931,9 @@ fn project_in_flight(p: &Project) -> u32 {
 fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Option<OfficeActivity> {
     if let Some(job) = pending.values().find(|j| j.proj_slug == project.id.0) {
         let label = match job.purpose {
+            // Intake triage (feature: sdlc-triage): the lightweight classifier that routes a fresh
+            // brief to a track, fired alongside the first persona reply.
+            InvokePurpose::Triage => "classifying the request",
             InvokePurpose::Persona => "office is replying",
             InvokePurpose::Fold => "summarizing the conversation",
             InvokePurpose::AssumeCheckPrd => "fact-checking the PRD",

@@ -41,6 +41,13 @@ pub const HARD_PROMPT_CAP: usize = 32 * 1024;
 /// (6.2 / 5.1) without any persistent per-request bookkeeping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvokePurpose {
+    /// The SDLC intake TRIAGE classifier (feature: sdlc-triage). Fired ONCE, additionally, at the
+    /// first message of a fresh brief, on the `safeguard_role` (a gate-family classification, NOT a
+    /// doc-drafting invoke — so never `drafter_model`). Returns a strictly-parseable `SDLC-TRIAGE`
+    /// block; the kernel parses it defensively ([`crate::report::parse_triage`]) and routes the
+    /// project to the `project` / `enhancement` / `patch` track, defaulting to `project` on any
+    /// error or unparseable result.
+    Triage,
     /// A front-office conversational reply. Result appended to the transcript.
     Persona,
     /// The JSON epic/story/task breakdown. Result parsed+validated; valid -> board. An Err
@@ -194,6 +201,30 @@ research-grounded, or explicitly delegated ('you decide' / 'up to you') belongs 
 'Open questions' section, never in the PRD body. Record delegated choices as 'Delegated \
 decision: ...'.\n";
 
+/// The ENHANCEMENT-track persona contract (feature: sdlc-triage): the intake classified this brief
+/// as a scoped change to an EXISTING deliverable, so the office drafts ONE change-brief (```change),
+/// NOT the full PRD/TRD/CRD trio. The change-brief takes the PRD doc-slot, so the gate/JOIN
+/// machinery reuses unchanged. Sections are fixed: Current behavior / Desired behavior / Acceptance
+/// criteria.
+const CHANGE_BRIEF_CONTRACT: &str = "\nRespond as the Workflow front office for a scoped ENHANCEMENT \
+to an EXISTING deliverable: negotiate the change, answer clearly, and drive toward ONE change-brief. \
+Be concise and decisive — this is a change, not a new build, so keep it tight.\n\
+When (and only when) the change is agreed, emit the COMPLETE change-brief as markdown inside a \
+fenced block that starts with ```change and ends with ``` — that exact fence is how the system \
+captures it and starts the line; a change-brief outside that fence does not count and nothing will \
+happen. Use EXACTLY these sections: 'Current behavior', 'Desired behavior', 'Acceptance criteria'.\n\
+Do NOT assume anything the user did not state. Every choice that is not user-stated, \
+research-grounded, or explicitly delegated ('you decide' / 'up to you') belongs under an \
+'Open questions' section, never in the change-brief body. Record delegated choices as 'Delegated \
+decision: ...'.\n";
+
+/// The PATCH-track persona contract (feature: sdlc-triage): a tiny, well-specified fix handled as a
+/// SINGLE task with NO documents — the system builds the task directly from the brief. The office
+/// only converses/confirms; it never drafts a doc, so this contract emits no fence.
+const PATCH_CONTRACT: &str = "\nRespond as the Workflow front office for a small PATCH: acknowledge \
+the fix, keep it to a sentence or two, and confirm scope. This is a tiny change handled as ONE task \
+built directly from the brief — you do NOT draft any document and there is no fence to emit.\n";
+
 /// Capture the LAST ` ```<tag> ` fenced block from a persona reply, if any — the generalized
 /// engine behind PRD (6.2), TRD (6.2b), and CRD (6.2c) capture. The fence is the explicit capture
 /// contract given to the persona (PRD: [`PERSONA_CONTRACT`]; TRD: [`build_trd_prompt`]; CRD:
@@ -330,7 +361,19 @@ fn open_fence_is(line: &str, tag: &str) -> bool {
     is_open_fence(line, tag)
 }
 
-fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
+/// Pick the persona's doc-authoring contract + fence tag(s) for the project's SDLC track
+/// (feature: sdlc-triage). `"enhancement"` drafts a ```change change-brief; `"patch"` drafts NO doc
+/// (the board is built programmatically at triage-resolve); every other value — including the
+/// `"project"` default — is the unchanged PRD contract, so the project golden path is byte-identical.
+fn track_contract(track: &str) -> (&'static str, &'static [&'static str]) {
+    match track {
+        "enhancement" => (CHANGE_BRIEF_CONTRACT, &["change"]),
+        "patch" => (PATCH_CONTRACT, &[]),
+        _ => (PERSONA_CONTRACT, &["prd"]),
+    }
+}
+
+fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str, track: &str) -> String {
     let mut prompt = String::new();
     if !summary.trim().is_empty() {
         prompt.push_str("SUMMARY OF EARLIER CONVERSATION:\n");
@@ -344,11 +387,15 @@ fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
         prompt.push_str(new_user_msg);
         prompt.push('\n');
     }
-    prompt.push_str(PERSONA_CONTRACT);
+    let (contract, tags) = track_contract(track);
+    prompt.push_str(contract);
     prompt.push_str(POWERLESSNESS_CLAUSE);
     prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
-    // Fence hardening (item 1): the LAST line the model reads is the exact ```prd wrapper.
-    prompt.push_str(&fence_reminder(&["prd"]));
+    // Fence hardening (item 1): the LAST line the model reads is the exact fence wrapper for this
+    // track's doc (```prd for project, ```change for enhancement). Patch drafts no doc — no reminder.
+    if !tags.is_empty() {
+        prompt.push_str(&fence_reminder(tags));
+    }
     prompt
 }
 
@@ -376,7 +423,7 @@ pub fn build_invoke(p: &Project, new_user_msg: &str) -> (String, String) {
     let mut turns: Vec<&ChatMsg> = p.office_transcript.iter().collect();
 
     loop {
-        let prompt = assemble(&p.office_summary, &turns, new_user_msg);
+        let prompt = assemble(&p.office_summary, &turns, new_user_msg, &p.track);
         if prompt.len() <= HARD_PROMPT_CAP {
             return (system, prompt);
         }
@@ -384,7 +431,7 @@ pub fn build_invoke(p: &Project, new_user_msg: &str) -> (String, String) {
             // Even with no turns the prompt overflows: the summary is pathological.
             // Truncate it hard and re-assemble; guard the final size unconditionally.
             let summary = truncate_bytes(&p.office_summary, HARD_PROMPT_CAP / 2);
-            let prompt = assemble(&summary, &[], new_user_msg);
+            let prompt = assemble(&summary, &[], new_user_msg, &p.track);
             return (system, truncate_bytes(&prompt, HARD_PROMPT_CAP));
         }
         turns.remove(0); // drop the oldest turn and retry
@@ -398,7 +445,7 @@ pub fn should_fold(p: &Project, new_user_msg: &str) -> bool {
         return false; // nothing meaningful to fold
     }
     let turns: Vec<&ChatMsg> = p.office_transcript.iter().collect();
-    assemble(&p.office_summary, &turns, new_user_msg).len() > FOLD_THRESHOLD
+    assemble(&p.office_summary, &turns, new_user_msg, &p.track).len() > FOLD_THRESHOLD
 }
 
 /// Build the summarize `(system, prompt)` that folds the oldest half of the transcript
@@ -427,6 +474,65 @@ pub fn apply_fold(p: &mut Project, summary: String) {
     let half = p.office_transcript.len() / 2;
     p.office_transcript.drain(0..half);
     p.office_summary = summary;
+}
+
+// ---------------------------------------------------------------------------
+// SDLC intake triage (feature: sdlc-triage)
+// ---------------------------------------------------------------------------
+
+/// Build the intake-TRIAGE classifier `(system, prompt)` for `models.invoke` (feature: sdlc-triage).
+/// Runs on the `safeguard_role` — a lightweight gate-family classification, NOT a doc-drafting
+/// invoke. It reads the user's `brief` and returns a strictly-parseable `SDLC-TRIAGE` block the
+/// kernel parses defensively ([`crate::report::parse_triage`]); an unparseable / errored result
+/// defaults to the full `project` ceremony. Pure + byte-bounded like every other prompt builder.
+pub fn build_triage_prompt(p: &Project, brief: &str) -> (String, String) {
+    let system = prompts::office_system(&board_digest(p));
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You are the Workflow intake TRIAGE classifier. Read the user's brief and classify the work \
+into EXACTLY ONE delivery track. Be decisive but CONSERVATIVE: when unsure, choose 'project' (the \
+full process). You do NOT design, plan, or draft anything — you ONLY classify.\n\n",
+    );
+    prompt.push_str("USER BRIEF:\n");
+    prompt.push_str(&truncate_bytes(brief, HARD_PROMPT_CAP / 2));
+    prompt.push_str(
+        "\n\nThe three tracks:\n\
+- project: a NEW system, feature, or non-trivial build that warrants the full PRD/TRD/CRD ceremony. \
+This is the DEFAULT — choose it whenever the scope is unclear or larger than a single change.\n\
+- enhancement: a SCOPED change or addition to an EXISTING deliverable — small enough for one \
+change-brief and a handful of tasks.\n\
+- patch: a TINY, well-specified fix or tweak that needs no documents and is one obvious task.\n\
+\n\
+Output ONLY this block, nothing else — no preamble, no code fence:\n\
+SDLC-TRIAGE\n\
+track: project | enhancement | patch\n\
+rationale: <one line explaining the choice>\n\
+existing: yes | no   (does the brief target an EXISTING delivery? only meaningful for enhancement/patch)\n",
+    );
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// A minimal, gradeable clean-build CRD for the ENHANCEMENT track (feature: sdlc-triage). An
+/// enhancement inherits the existing delivery's requirements, so only clean-build HYGIENE is graded
+/// here — the completion auditor still needs a checklist + a rubric summing to 100. Generated
+/// PROGRAMMATICALLY (no invoke round) when the enhancement has no prior CRD to inherit.
+pub fn minimal_hygiene_crd() -> String {
+    "# Clean-build Requirement Document (minimal — enhancement track)\n\n\
+This enhancement builds on an existing delivery; its functional requirements live in the \
+change-brief. Only clean-build HYGIENE of the integrated tree is graded here.\n\n\
+## Checklist\n\
+- No dependency or build artifacts committed (node_modules/, vendor/, target/, dist/, build/, \
+.vite/, .next/, __pycache__/, *.pyc, coverage/).\n\
+- No temp / editor / runtime droppings (*.tmp, *.bak, *.orig, *.swp, *.log, .DS_Store, SQLite \
+WAL/journal sidecars).\n\
+- No commented-out dead code, stray debug prints, or unwired/orphan files.\n\
+- The change builds and lints cleanly.\n\
+- A README is present at the delivery root.\n\n\
+## Grading rubric (points sum to 100)\n\
+- Clean tree, no build/dependency artifacts or trash: 40\n\
+- Builds and lints cleanly: 40\n\
+- No unwired/orphan files; README present: 20\n"
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +568,16 @@ Rules: every slug is unique and [a-z0-9-]; acceptance is non-empty; blocked_by l
 slugs only; the blocked_by graph is acyclic; add a blocked_by edge between tasks that write \
 the same file.\n",
     );
+    // SDLC enhancement track (feature: sdlc-triage): a scoped change is small by definition — cap the
+    // plan to 1-3 tasks in one epic. The kernel escalates to the full project track if the model
+    // returns more than 3 anyway (wider scope than a change).
+    if p.track == "enhancement" {
+        prompt.push_str(
+            "\nSMALL SCOPE (this is a scoped ENHANCEMENT, not a new build): produce AT MOST 3 tasks \
+total (ideally 1-3), in exactly one epic and one story. If the change genuinely needs more than 3 \
+tasks, it is wider than an enhancement — still cap at 3 here.\n",
+        );
+    }
     if compact {
         prompt.push_str(
             "\nCOMPACT MODE (the previous attempt timed out): keep this breakdown as small \
@@ -812,6 +928,19 @@ struct RawTask {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Breakdown {
     epics: Vec<VEpic>,
+}
+
+impl Breakdown {
+    /// Total task count across every epic/story (feature: sdlc-triage): the kernel uses this to
+    /// escalate an ENHANCEMENT whose breakdown returned more than 3 tasks up to the full project
+    /// track (wider scope than a change).
+    pub fn task_count(&self) -> usize {
+        self.epics
+            .iter()
+            .flat_map(|e| e.stories.iter())
+            .map(|s| s.tasks.len())
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

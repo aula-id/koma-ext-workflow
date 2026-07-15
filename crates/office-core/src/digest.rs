@@ -86,9 +86,10 @@ fn project_line(p: &Project) -> String {
         .unwrap_or_else(|| "none".to_string());
 
     let mut line = format!(
-        "- {}: phase={} done {}/{} running={} parked={} delivery={}\n",
+        "- {}: phase={} track={} done {}/{} running={} parked={} delivery={}\n",
         p.id.0,
         phase_str(&p.phase),
+        p.track,
         done,
         total,
         running,
@@ -271,6 +272,9 @@ fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeAct
         "id": p.id.0,
         "name": p.name,
         "phase": phase_value(&p.phase),
+        // SDLC intake track (feature: sdlc-triage): project | enhancement | patch. In the base
+        // object (both modes) so the panel can always badge the track.
+        "track": p.track,
         "deliveryPath": p.delivery_path.as_ref().map(|pb| pb.display().to_string()),
         "seq": p.seq,
         "tasks": tasks,

@@ -275,4 +275,48 @@ mod tests {
         assert_eq!(classify_assumption("[critical]").text, "");
         assert_eq!(classify_assumption("[auto]").text, "");
     }
+
+    // --- SDLC-TRIAGE (feature: sdlc-triage) ------------------------------
+
+    use crate::report::{parse_triage, TriageTrack};
+
+    #[test]
+    fn parses_triage_project() {
+        let v = parse_triage("SDLC-TRIAGE\ntrack: project\nrationale: a new build\nexisting: no\n");
+        assert_eq!(v.track, TriageTrack::Project);
+        assert_eq!(v.rationale, "a new build");
+        assert!(!v.existing);
+    }
+
+    #[test]
+    fn parses_triage_enhancement_targeting_existing() {
+        let v = parse_triage(
+            "SDLC-TRIAGE\ntrack: enhancement\nrationale: add a filter to the existing list\nexisting: yes\n",
+        );
+        assert_eq!(v.track, TriageTrack::Enhancement);
+        assert_eq!(v.rationale, "add a filter to the existing list");
+        assert!(v.existing, "targets an existing delivery");
+    }
+
+    #[test]
+    fn parses_triage_patch() {
+        // No `existing:` line -> defaults false; a leading-prose reply is tolerated.
+        let v = parse_triage("Here is my call.\nSDLC-TRIAGE\ntrack: patch\nrationale: fix a typo\n");
+        assert_eq!(v.track, TriageTrack::Patch);
+        assert!(!v.existing, "absent existing line defaults to false");
+    }
+
+    #[test]
+    fn triage_garbage_defaults_to_project() {
+        // Missing block, unknown track word, and empty input ALL default to the safe project track.
+        assert_eq!(parse_triage("the classifier forgot the block").track, TriageTrack::Project);
+        assert_eq!(parse_triage("SDLC-TRIAGE\ntrack: banana\nrationale: ?\n").track, TriageTrack::Project);
+        assert_eq!(parse_triage("").track, TriageTrack::Project);
+    }
+
+    #[test]
+    fn triage_case_and_fence_tolerant() {
+        let v = parse_triage("```\nsdlc-triage\nTRACK: Enhancement\nrationale: scoped change\n```\n");
+        assert_eq!(v.track, TriageTrack::Enhancement);
+    }
 }

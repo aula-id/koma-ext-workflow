@@ -65,6 +65,8 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         interrupted_from: None,
         gate_cleared: false,
         gate_invoke_live_hint: false,
+        track: "project".to_string(),
+        triage_pending: false,
         pending_breakdown: None,
         seq: 0,
         worktree_desks: false,
@@ -3260,4 +3262,304 @@ fn instant_death_streak_resets_after_a_long_lived_attempt() {
 /// Mutable task lookup for the worktree/backoff tests.
 fn find_task_mut<'a>(p: &'a mut Project, id: &str) -> &'a mut Task {
     p.tasks.iter_mut().find(|t| t.id.0 == id).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// SDLC intake triage (feature: sdlc-triage)
+// ---------------------------------------------------------------------------
+
+/// A genuinely fresh intake project: Drafting, NO PRD and NO transcript yet, so the first office
+/// message fires the intake triage. (The shared `project()` builder seeds a non-empty PRD, which
+/// deliberately keeps the pre-triage golden-path tests undisturbed.)
+fn drafting_intake() -> Project {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = String::new();
+    p.office_transcript.clear();
+    p
+}
+
+/// A 2-task enhancement-sized breakdown (<= 3, so it lands without escalating).
+const TWO_TASK_JSON: &str = r#"{"epics":[{"slug":"e1","title":"E","intent":"i","stories":[{"slug":"s1","title":"S","intent":"i","tasks":[{"slug":"t1","title":"T1","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t2","title":"T2","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]}]}]}]}"#;
+
+/// A 4-task breakdown (> 3, so an enhancement escalates to project on it).
+const FOUR_TASK_JSON: &str = r#"{"epics":[{"slug":"e1","title":"E","intent":"i","stories":[{"slug":"s1","title":"S","intent":"i","tasks":[{"slug":"t1","title":"T1","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t2","title":"T2","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t3","title":"T3","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t4","title":"T4","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]}]}]}]}"#;
+
+#[test]
+fn first_brief_fires_triage_alongside_persona() {
+    // The FIRST message of a fresh brief fires BOTH the persona reply and ONE additional lightweight
+    // triage classifier — on the safeguard role, never the drafter model.
+    let mut p = drafting_intake();
+    p.config.drafter_model = Some("strong-drafter".to_string());
+    let fx = step(
+        &mut p,
+        Input::Command(Command::OfficeMessage { text: "add a dark-mode toggle to settings".into() }),
+        1000,
+        4,
+    );
+    let invokes = invoke_effects(&fx);
+    assert_eq!(invokes.len(), 2, "first brief fires the persona reply + the triage classifier");
+    assert!(p.triage_pending, "triage is marked in flight");
+
+    let persona = invokes
+        .iter()
+        .find(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Persona, .. }))
+        .expect("a persona invoke");
+    match persona {
+        Effect::InvokeModel { model, .. } => assert_eq!(model.as_deref(), Some("strong-drafter"), "persona takes the drafter model"),
+        _ => unreachable!(),
+    }
+    let triage = invokes
+        .iter()
+        .find(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. }))
+        .expect("a triage invoke");
+    match triage {
+        Effect::InvokeModel { role, model, .. } => {
+            assert_eq!(role, "safeguard", "triage runs on the safeguard role (a gate-family job)");
+            assert!(model.is_none(), "triage NEVER takes the drafter model");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn triage_does_not_re_fire_on_later_messages() {
+    let mut p = drafting_intake();
+    step(&mut p, Input::Command(Command::OfficeMessage { text: "first brief".into() }), 1000, 4);
+    step(&mut p, invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: project\nrationale: new build\n".into())), 1100, 4);
+    let fx = step(&mut p, Input::Command(Command::OfficeMessage { text: "a follow-up".into() }), 1200, 4);
+    assert!(
+        !invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })),
+        "triage fires only on the first message of a fresh project"
+    );
+}
+
+#[test]
+fn triage_garbage_result_defaults_track_to_project() {
+    let mut p = drafting_intake();
+    p.triage_pending = true;
+    let fx = step(&mut p, invoke_result(InvokePurpose::Triage, Ok("no triage block here".into())), 1000, 4);
+    assert_eq!(p.track, "project", "an unparseable verdict defaults to the full ceremony");
+    assert!(!p.triage_pending, "triage_pending cleared");
+    assert!(invoke_effects(&fx).is_empty(), "no board built, no doc invoke on a project default");
+    assert!(p.tasks.is_empty());
+}
+
+#[test]
+fn triage_error_result_defaults_track_to_project() {
+    let mut p = drafting_intake();
+    p.triage_pending = true;
+    step(&mut p, invoke_result(InvokePurpose::Triage, Err("model call timed out".into())), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert!(!p.triage_pending);
+}
+
+#[test]
+fn persona_capture_suppressed_while_triage_pending() {
+    // A ```prd fence that arrives while triage is still in flight is NOT captured (the track — which
+    // decides the contract — is not yet known); it only flows to chat.
+    let mut p = drafting_intake();
+    p.triage_pending = true;
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# App\n```".into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty(), "no PRD captured while triage pending");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "no pipeline kicked off");
+    assert!(!invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeCheckPrd, .. })));
+}
+
+// ---- PATCH track ----------------------------------------------------------
+
+#[test]
+fn triage_patch_builds_one_task_board_with_zero_doc_invokes() {
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "fix the typo in the footer copyright year".into() });
+    p.triage_pending = true;
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: patch\nrationale: tiny fix\n".into())),
+        1000,
+        4,
+    );
+    assert_eq!(p.track, "patch");
+    assert_eq!(p.phase, ProjectPhase::Ready, "patch goes straight to Ready");
+    assert_eq!(p.tasks.len(), 1, "one task built programmatically");
+    assert!(matches!(p.tasks[0].state, TaskState::Todo));
+    assert!(p.tasks[0].description.contains("footer copyright"), "the brief text IS the task description");
+    assert_eq!(p.epics.len(), 1);
+    assert_eq!(p.stories.len(), 1);
+    // The whole point: ZERO model invokes for a patch — no persona/PRD/TRD/CRD/breakdown round.
+    assert!(invoke_effects(&fx).is_empty(), "patch builds the board with NO model invokes");
+    assert!(p.outbox.iter().any(|n| n.text.contains("board is ready")));
+}
+
+#[test]
+fn patch_completion_skips_the_final_audit() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("proj/patch/change/apply", TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 1 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    p.crd_markdown = String::new();
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: pass\n".into() }), 1000, 4);
+    assert!(matches!(p.phase, ProjectPhase::Done { .. }), "a patch completes directly on the review pass");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "no clean-build audit for a patch — merge review is the gate");
+    assert!(p.trace.iter().any(|e| e.summary == "audit skipped (patch track)"));
+}
+
+#[test]
+fn patch_second_bounce_escalates_to_enhancement_and_redispatches() {
+    // capacity 0 so the dispatch scan does not immediately re-dispatch the escalated task.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("proj/patch/change/apply", TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 2 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    p.tasks[0].bounces = 1; // already bounced once
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: fail\nreasons: still broken\n".into() }), 1000, 0);
+    assert_eq!(p.tasks[0].bounces, 2, "the second bounce");
+    assert_eq!(p.track, "enhancement", "a patch that bounces twice escalates to enhancement");
+    assert!(p.trace.iter().any(|e| e.summary == "escalating patch → enhancement"));
+    assert!(matches!(p.tasks[0].state, TaskState::Todo), "re-dispatched, not parked");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Spawn { .. })), "capacity 0 -> not re-spawned this tick");
+}
+
+// ---- ENHANCEMENT track ----------------------------------------------------
+
+#[test]
+fn enhancement_change_brief_gate_then_small_breakdown() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    // The persona emits a ```change change-brief -> captured into the PRD slot, ONE gate, no TRD/CRD.
+    let reply = "Sure.\n```change\nCurrent behavior: none.\nDesired behavior: dark mode.\nAcceptance criteria: it persists.\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.prd_markdown.contains("Desired behavior"), "the change-brief takes the PRD doc-slot");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "exactly ONE gate over the change-brief");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::TrdCrd, .. })), "the TRD/CRD trio is SKIPPED");
+
+    // Gate clean + well-known -> skip research -> small breakdown starts + minimal CRD generated.
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\nwell-known: yes\n".into())), 1100, 4);
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::Breakdown, "enhancement goes straight to a small breakdown");
+    assert!(!p.crd_markdown.trim().is_empty(), "a minimal hygiene CRD was generated (no separate invoke)");
+    match invoke_effects(&fx2)[0] {
+        Effect::InvokeModel { prompt, .. } => assert!(prompt.contains("SMALL SCOPE"), "the breakdown prompt caps at 1-3 tasks"),
+        _ => unreachable!(),
+    }
+
+    // A small breakdown lands the board -> Ready.
+    let fx3 = step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(TWO_TASK_JSON.into())), 1200, 4);
+    assert_eq!(p.phase, ProjectPhase::Ready);
+    assert_eq!(p.tasks.len(), 2);
+    assert!(invoke_effects(&fx3).is_empty());
+}
+
+#[test]
+fn enhancement_escalates_to_project_on_too_many_assumptions() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# Change\nadd stuff".into();
+    // Enumerate surfaces 5 material assumptions (> N=4) -> escalate to project; the gate continues.
+    let enumerate = "ASSUME-CHECK\nverdict: assumptions\nwell-known: yes\n- [auto] a\n- [auto] b\n- [auto] c\n- [auto] d\n- [auto] e\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(enumerate.into())), 1000, 4);
+    assert_eq!(p.track, "project", "> 4 assumptions is wider than a change -> full project");
+    assert!(p.trace.iter().any(|e| e.summary == "escalating enhancement → project"));
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeVerify, "the gate finishes normally");
+
+    // Verify clean -> the escalated project authors the full TRD+CRD (which enhancement would skip).
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::AssumeVerify, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1100, 4);
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::TrdCrd, "escalated project authors TRD+CRD");
+}
+
+#[test]
+fn enhancement_escalates_to_project_on_oversized_breakdown() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# Change".into();
+    p.gate_cleared = true;
+    p.crd_markdown = crate::office::minimal_hygiene_crd(); // the placeholder enhancement CRD
+    let fx = step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(FOUR_TASK_JSON.into())), 1000, 4);
+    assert_eq!(p.track, "project", "a > 3-task breakdown is wider than a change");
+    assert!(p.trace.iter().any(|e| e.summary == "escalating enhancement → project"));
+    assert!(p.crd_markdown.is_empty(), "the placeholder CRD is cleared for the real ceremony");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "authors the full TRD+CRD");
+    assert!(p.tasks.is_empty(), "the oversized plan was discarded, board not built");
+    assert_eq!(p.phase, ProjectPhase::Drafting, "stays Drafting for the full ceremony");
+}
+
+// ---- override + door guards ----------------------------------------------
+
+#[test]
+fn override_retriages_enhancement_to_project_in_drafting() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# change-brief\nstuff".into(); // carried context (kept)
+    p.crd_markdown = crate::office::minimal_hygiene_crd();
+    p.gate_cleared = true;
+    let fx = step(&mut p, Input::Command(Command::OfficeMessage { text: "actually, make it a full project".into() }), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert!(p.crd_markdown.is_empty(), "the light-track CRD placeholder is cleared");
+    assert!(!p.gate_cleared, "the gate is reset for the full ceremony");
+    assert!(p.prd_markdown.contains("change-brief"), "the change-brief is KEPT as carried context");
+    assert!(p.trace.iter().any(|e| e.summary == "re-triaged to project (user override)"));
+    assert!(fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Persona, .. })), "the message still drives a persona reply");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })), "no re-triage (a PRD-slot doc already exists)");
+}
+
+#[test]
+fn override_from_ready_regresses_a_patch_to_drafting() {
+    let mut p = project(ProjectPhase::Ready, vec![task("proj/patch/change/apply", TaskState::Todo, 0, &[])]);
+    p.track = "patch".to_string();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "fix a thing".into() });
+    step(&mut p, Input::Command(Command::OfficeMessage { text: "make it a project".into() }), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert_eq!(p.phase, ProjectPhase::Drafting, "a Ready light track regresses to Drafting");
+    assert!(p.tasks.is_empty(), "the patch board is cleared for re-drafting");
+}
+
+#[test]
+fn override_never_touches_a_running_project() {
+    // Pre-authorize only: a Running project ignores the override intent (track locked in).
+    let mut p = project(ProjectPhase::Running, vec![task("proj/e/s/t", TaskState::Todo, 0, &[])]);
+    p.track = "enhancement".to_string();
+    step(&mut p, Input::Command(Command::OfficeMessage { text: "make it a project".into() }), 1000, 0);
+    assert_eq!(p.track, "enhancement", "the track is locked once Running");
+    assert!(matches!(p.phase, ProjectPhase::Running));
+}
+
+#[test]
+fn workflow_approve_advances_the_enhancement_gate() {
+    // The change-brief is the only doc the user approves; approval advances the PostPrd join to the
+    // enhancement small breakdown (NOT the TRD/CRD trio).
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# change-brief".into();
+    p.pending_assumptions = vec!["assumed a datastore".into()];
+    let fx = step(&mut p, Input::Command(Command::ApproveAssumptions), 1000, 4);
+    assert!(p.pending_assumptions.is_empty(), "approval clears the change-brief assumptions");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "enhancement approval -> small breakdown");
+    assert!(!p.crd_markdown.trim().is_empty(), "the minimal CRD is generated on advance");
+}
+
+#[test]
+fn workflow_breakdown_works_on_enhancement_and_stays_small() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# change".into();
+    p.gate_cleared = true;
+    let fx = step(&mut p, Input::Command(Command::RequestBreakdown), 1000, 4);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown);
+    match invoke_effects(&fx)[0] {
+        Effect::InvokeModel { prompt, .. } => assert!(prompt.contains("SMALL SCOPE"), "workflow_breakdown honors the enhancement cap"),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn project_golden_path_unchanged_by_triage() {
+    // The project track (default) is byte-for-byte the pre-feature flow: a ```prd fence captures,
+    // spawns research (always mode), and runs the PRD gate — NO extra invokes from the triage plumbing.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "always".to_string();
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# App\nBuild it.\n```".into())), 1000, 4);
+    assert_eq!(p.prd_markdown, "# App\nBuild it.");
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research spawns");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "the PRD gate fires — unchanged");
+    assert_eq!(p.track, "project", "the default track is project");
 }

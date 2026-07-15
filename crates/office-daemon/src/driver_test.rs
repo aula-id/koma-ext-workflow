@@ -91,6 +91,8 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         interrupted_from: None,
         gate_cleared: false,
         gate_invoke_live_hint: false,
+        track: "project".to_string(),
+        triage_pending: false,
         pending_breakdown: None,
         seq: 1,
         worktree_desks: false,
@@ -1144,7 +1146,12 @@ fn brief_with_unknown_project_id_mints_a_drafting_project_instead_of_dropping() 
     assert!(matches!(p.phase, ProjectPhase::Drafting));
     assert_eq!(p.office_transcript.len(), 1, "the brief message landed in the transcript");
     assert_eq!(p.office_transcript[0].text, "Build a very simple todo app using Vite and React.");
-    assert_eq!(fake.jobs.lock().unwrap().len(), 1, "persona invoke kicked off for the new project");
+    // ADAPTED (feature: sdlc-triage): a fresh brief now fires the intake triage classifier ALONGSIDE
+    // the persona reply, so TWO invokes queue (both fit under INVOKE_POOL_CAP = 2).
+    let jobs = fake.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 2, "persona reply + intake triage kicked off for the new project");
+    assert!(jobs.iter().any(|j| j.purpose == InvokePurpose::Persona), "a persona invoke queued");
+    assert!(jobs.iter().any(|j| j.purpose == InvokePurpose::Triage), "an intake triage invoke queued");
 }
 
 #[test]
@@ -1171,7 +1178,9 @@ fn brief_with_no_project_and_empty_board_mints_a_named_drafting_project() {
         .expect("a drafting project was minted");
     assert_eq!(minted.name, derive_project_name("we want to make todo apps, very simple, using vite and react"));
     assert_eq!(minted.office_transcript.len(), 1);
-    assert_eq!(fake.jobs.lock().unwrap().len(), 1);
+    // ADAPTED (feature: sdlc-triage): a fresh brief also fires the intake triage classifier, so two
+    // invokes queue (persona reply + triage).
+    assert_eq!(fake.jobs.lock().unwrap().len(), 2);
 }
 
 #[test]

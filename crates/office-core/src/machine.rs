@@ -152,6 +152,12 @@ pub enum ProjectTransition {
     Halt { reason: String },
     /// Running -> Done (all tasks Done).
     Complete { at_ms: u64 },
+    /// Ready -> Drafting AND Drafting -> Drafting (SDLC re-triage / escalation to a heavier track,
+    /// pre-authorize only — feature: sdlc-triage). A light track (patch/enhancement) whose board is
+    /// already built in Ready can be sent back to Drafting to re-run the fuller ceremony; the
+    /// Drafting -> Drafting self-edge lets the kernel call this uniformly without special-casing the
+    /// phase. Never legal from Running/Interrupted/Halted/Done — escalation is pre-authorize.
+    Retriage,
 }
 
 fn phase_label(phase: &ProjectPhase) -> &'static str {
@@ -173,6 +179,7 @@ fn project_transition_label(t: &ProjectTransition) -> &'static str {
         ProjectTransition::Resume { .. } => "Resume",
         ProjectTransition::Halt { .. } => "Halt",
         ProjectTransition::Complete { .. } => "Complete",
+        ProjectTransition::Retriage => "Retriage",
     }
 }
 
@@ -214,6 +221,12 @@ pub fn step_project(
             }
         }
         (ProjectPhase::Halted { .. }, ProjectTransition::Resume { .. }) => Ok(ProjectPhase::Running),
+
+        // SDLC re-triage / escalation to a heavier track (pre-authorize only): Ready -> Drafting to
+        // rebuild the board under the fuller ceremony, or a Drafting -> Drafting self-edge so the
+        // kernel need not branch on the current phase.
+        (ProjectPhase::Ready, ProjectTransition::Retriage) => Ok(ProjectPhase::Drafting),
+        (ProjectPhase::Drafting, ProjectTransition::Retriage) => Ok(ProjectPhase::Drafting),
 
         _ => Err(err()),
     }

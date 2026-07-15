@@ -391,6 +391,9 @@ mod tests {
             interrupted_from: Some(ProjectPhase::Running),
             gate_cleared: false,
             gate_invoke_live_hint: false,
+            // sdlc-triage: a non-default track must round-trip through serde intact.
+            track: "enhancement".to_string(),
+            triage_pending: false,
             pending_breakdown: None,
             seq: 42,
             worktree_desks: false,
@@ -429,6 +432,8 @@ mod tests {
         assert_eq!(deserialized.config.safeguard_role, "safeguard");
         // The approval/nudge additive fields + the autonomous-safeguard fields all round-trip.
         assert!(deserialized.assumptions_approved, "assumptions_approved round-trips");
+        // sdlc-triage: the intake track round-trips intact (not coerced back to the default).
+        assert_eq!(deserialized.track, "enhancement", "the SDLC track round-trips");
         assert_eq!(deserialized.self_resolved_assumptions.len(), 1);
         assert_eq!(deserialized.capture_nudge_count, 2);
         assert_eq!(deserialized.assumption_rounds, 1);
@@ -497,6 +502,11 @@ mod tests {
         assert!(p.pending_breakdown.is_none(), "absent pending_breakdown defaults to None");
         assert_eq!(p.config.research_mode, "auto", "absent research_mode defaults to 'auto'");
         assert!(p.config.drafter_model.is_none(), "absent drafter_model defaults to None");
+        // SDLC intake track (feature: sdlc-triage): absent on a pre-feature state file -> the safe
+        // full-ceremony "project" default (a named-fn default, NOT an empty string); the runtime-only
+        // `triage_pending` flag is `#[serde(skip)]` and deserializes to false.
+        assert_eq!(p.track, "project", "absent track defaults to 'project', not empty");
+        assert!(!p.triage_pending, "absent/skip triage_pending defaults to false");
     }
 
     #[test]

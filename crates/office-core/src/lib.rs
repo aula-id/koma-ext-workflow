@@ -14,7 +14,8 @@ pub mod prompts;
 
 pub mod report;
 pub use report::{
-    AssumeCheck, AssumeVerdict, AuditReport, ReportStatus, ReportTrailer, ReviewTrailer, Verdict,
+    AssumeCheck, AssumeVerdict, AuditReport, ReportStatus, ReportTrailer, ReviewTrailer,
+    TriageTrack, TriageVerdict, Verdict,
 };
 
 pub mod digest;

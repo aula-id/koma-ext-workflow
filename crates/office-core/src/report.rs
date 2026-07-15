@@ -151,6 +151,7 @@ const REVIEW_KEYS: &[&str] = &["verdict", "reasons", "hygiene"];
 const RESEARCH_KEYS: &[&str] = &["findings"];
 const AUDIT_KEYS: &[&str] = &["grade", "failures"];
 const ASSUME_KEYS: &[&str] = &["verdict"];
+const TRIAGE_KEYS: &[&str] = &["track", "rationale", "existing"];
 
 /// A parsed `OFFICE-AUDIT` block (ARCHITECTURE.md 6.2c). `grade` is `None` when no numeric
 /// grade could be read (an inconclusive audit); the kernel fails OPEN on that (completes with a
@@ -298,6 +299,95 @@ fn strip_leading_tag(s: &str, tag: &str) -> Option<String> {
         Some(rest.to_string())
     } else {
         None
+    }
+}
+
+/// The SDLC intake track a brief is classified into (feature: sdlc-triage). `Project` = the full
+/// PRD/TRD/CRD ceremony (the safe default); `Enhancement` = one change-brief + a small breakdown;
+/// `Patch` = no documents, one task straight to Ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriageTrack {
+    Project,
+    Enhancement,
+    Patch,
+}
+
+impl TriageTrack {
+    /// The persisted string form stored on `Project.track` and rendered on the wire digests.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriageTrack::Project => "project",
+            TriageTrack::Enhancement => "enhancement",
+            TriageTrack::Patch => "patch",
+        }
+    }
+}
+
+/// A parsed `SDLC-TRIAGE` block (feature: sdlc-triage). `track` is the classified track;
+/// `rationale` a one-line justification; `existing` whether the brief targets an EXISTING delivery
+/// (only meaningful for enhancement/patch). Parsing NEVER fails — a missing/garbled block yields the
+/// [`TriageVerdict::project_default`] (full ceremony is the safe fallback).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriageVerdict {
+    pub track: TriageTrack,
+    pub rationale: String,
+    pub existing: bool,
+}
+
+impl TriageVerdict {
+    /// The defensive default: the full-ceremony `project` track, used when the classifier block is
+    /// absent or unparseable, or the invoke errored.
+    pub fn project_default() -> Self {
+        TriageVerdict {
+            track: TriageTrack::Project,
+            rationale: String::new(),
+            existing: false,
+        }
+    }
+}
+
+/// Classify a raw `track:` value word into a [`TriageTrack`] (feature: sdlc-triage). Tolerant and
+/// conservative: a leading `enhance`/`patch` (case-insensitive) picks that track; ANYTHING ELSE —
+/// including `project`, an empty value, or garbage — is the safe `Project` default.
+fn classify_track(word: &str) -> TriageTrack {
+    let w = word.trim().to_ascii_lowercase();
+    if w.starts_with("enhance") {
+        TriageTrack::Enhancement
+    } else if w.starts_with("patch") {
+        TriageTrack::Patch
+    } else {
+        TriageTrack::Project
+    }
+}
+
+/// Parse the LAST `SDLC-TRIAGE` block out of `text` (feature: sdlc-triage), tolerant exactly like
+/// the other trailer scanners: fence-tolerant marker match, case drift ignored, continuation lines
+/// folded. `track:` is classified by [`classify_track`] (unknown -> `Project`); `existing:` reads a
+/// leading yes/true. A MISSING block (or any unrecognized track) yields
+/// [`TriageVerdict::project_default`] — the full ceremony is the safe fallback, never a hard error.
+pub fn parse_triage(text: &str) -> TriageVerdict {
+    let map = match scan_block(text, "SDLC-TRIAGE", TRIAGE_KEYS) {
+        Some(m) => m,
+        None => return TriageVerdict::project_default(),
+    };
+    let track = map
+        .get("track")
+        .and_then(|v| v.first())
+        .map(|s| classify_track(s))
+        .unwrap_or(TriageTrack::Project);
+    let rationale = joined(&map, "rationale").unwrap_or_default();
+    let existing = map
+        .get("existing")
+        .and_then(|v| v.first())
+        .map(|s| {
+            let v = s.trim().to_ascii_lowercase();
+            v.starts_with("yes") || v.starts_with("true")
+        })
+        .unwrap_or(false);
+    TriageVerdict {
+        track,
+        rationale,
+        existing,
     }
 }
 

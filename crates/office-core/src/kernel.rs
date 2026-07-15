@@ -108,6 +108,27 @@ const TRDCRD_NUDGE_INSTRUCTION: &str = "\nYour previous reply was missing the re
 const PRD_TAGS: &[&str] = &["prd"];
 const TRDCRD_TAGS: &[&str] = &["trd", "crd"];
 
+/// The system-appended instruction on an ENHANCEMENT change-brief capture-miss nudge (feature:
+/// sdlc-triage): the reply dropped the ```change fence, so re-ask for ONLY the fenced change-brief.
+const CHANGE_NUDGE_INSTRUCTION: &str = "\nYour previous reply did not include the required ```change \
+fence. Emit ONLY the complete change-brief in the fence now (Current behavior / Desired behavior / \
+Acceptance criteria) — no prose.\n";
+
+/// SDLC escalation threshold (feature: sdlc-triage): an ENHANCEMENT whose change-brief gate surfaces
+/// MORE than this many material assumptions is wider than a change and escalates to the full project
+/// track. N = 4 (documented in requirement 3).
+const ENHANCEMENT_ASSUMPTION_ESCALATION_MAX: usize = 4;
+
+/// SDLC escalation threshold (feature: sdlc-triage): an ENHANCEMENT whose breakdown returns MORE
+/// than this many tasks is wider than a change and escalates to the full project track. The small
+/// breakdown prompt already caps at 3; this catches a model that overshoots anyway.
+const ENHANCEMENT_BREAKDOWN_TASK_MAX: usize = 3;
+
+/// SDLC escalation trigger (feature: sdlc-triage): a PATCH whose single task reaches this many
+/// bounces is wider than a patch and escalates (converts) to the enhancement track before its next
+/// re-dispatch. "The single task bounces twice" -> escalate on the 2nd bounce.
+const PATCH_BOUNCE_ESCALATION: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // Public protocol
 // ---------------------------------------------------------------------------
@@ -654,6 +675,207 @@ pub(crate) fn is_approval_intent(msg: &str) -> bool {
     APPROVAL_PHRASES.iter().any(|p| h.contains(&format!(" {p} ")))
 }
 
+/// Deterministic SDLC override-intent phrases (feature: sdlc-triage) — the SAME mechanism as
+/// [`APPROVAL_PHRASES`], a new phrase set. When a project is on a LIGHT track (patch/enhancement)
+/// and pre-authorize, one of these in a user message re-triages it to the full `project` ceremony.
+const OVERRIDE_PHRASES: &[&str] = &[
+    "full process", "make it a project", "make it a full project", "full project",
+    "full ceremony", "treat it as a project", "do the full process", "full sdlc",
+];
+
+/// Whether `msg` is a deterministic SDLC override to the full project track (feature: sdlc-triage):
+/// at least one [`OVERRIDE_PHRASES`] entry as a whole word/phrase AND no [`APPROVAL_NEGATIONS`]
+/// token (so "don't make it a project" does NOT trigger) — mirroring [`is_approval_intent`].
+pub(crate) fn is_override_intent(msg: &str) -> bool {
+    let h = normalize_for_match(msg);
+    if APPROVAL_NEGATIONS.iter().any(|n| h.contains(&format!(" {n} "))) {
+        return false;
+    }
+    OVERRIDE_PHRASES.iter().any(|p| h.contains(&format!(" {p} ")))
+}
+
+/// Whether a project is still PRE-AUTHORIZE (feature: sdlc-triage): Drafting or Ready, i.e. the
+/// board has not started grinding. SDLC override + enhancement->project escalation are only legal
+/// here; once Running, the track is locked in.
+fn is_pre_authorize(p: &Project) -> bool {
+    matches!(p.phase, ProjectPhase::Drafting | ProjectPhase::Ready)
+}
+
+/// Re-triage a light-track project to the full `project` ceremony (feature: sdlc-triage) — the
+/// user's explicit override, or an enhancement escalation via the same path. Sets the track, drops
+/// the light-track drafting artifacts (board if one was built in Ready, the placeholder/partial
+/// TRD+CRD, the gate + breakdown state, any pending assumptions), and — from Ready — regresses the
+/// phase back to Drafting so the fuller ceremony re-runs. The captured change-brief (in the PRD
+/// slot) is KEPT as carried context; the persona reply that follows (in `office_message`) now drafts
+/// under the project contract. NEVER touches a Running/authorized project (guarded by the caller).
+fn retriage_to_project(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let was_ready = matches!(p.phase, ProjectPhase::Ready);
+    if let Ok(ph) = step_project(&p.phase, ProjectTransition::Retriage) {
+        p.phase = ph;
+    }
+    p.track = "project".to_string();
+    // A light track that reached Ready built a board; drop it so the project ceremony rebuilds it.
+    if was_ready {
+        p.epics.clear();
+        p.stories.clear();
+        p.tasks.clear();
+    }
+    // Drop light-track doc/gate placeholders; the project ceremony authors a real TRD+CRD + re-gates.
+    // The change-brief in `prd_markdown` is deliberately KEPT as carried context.
+    p.trd_markdown.clear();
+    p.crd_markdown.clear();
+    p.gate_cleared = false;
+    p.gate_invoke_live_hint = false;
+    p.pending_breakdown = None;
+    p.pending_assumptions.clear();
+    trace(p, now_ms, "sdlc", "re-triaged to project (user override)", ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: reclassified as a full project — re-drafting under the full process.", p.id.0),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
+/// Fire the intake TRIAGE classifier invoke (feature: sdlc-triage) on the `safeguard_role` — a
+/// lightweight gate-family classification, NOT a doc-drafting invoke (never `drafter_model`). Sets
+/// `triage_pending` so the persona reply's doc-capture is suppressed until the track is known.
+fn start_triage(p: &mut Project, brief: &str, now_ms: u64, ctx: &mut Ctx) {
+    let (system, prompt) = office::build_triage_prompt(p, brief);
+    p.triage_pending = true;
+    trace(p, now_ms, "sdlc", "triage — classifying the brief", ctx);
+    emit_invoke(ctx, InvokePurpose::Triage, &p.config.safeguard_role, system, prompt);
+}
+
+/// The intake TRIAGE classifier returned (feature: sdlc-triage). Parse defensively (unparseable /
+/// error -> `project`), store the track, trace + notice the verdict, and route: `patch` builds the
+/// one-task board straight to Ready; `enhancement`/`project` just record the track (the persona now
+/// drafts under the track-aware contract). Always clears `triage_pending` so capture can proceed.
+fn handle_triage_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    p.triage_pending = false;
+    ctx.dirty = true;
+    let verdict = match &outcome {
+        Ok(text) => report::parse_triage(text),
+        Err(e) => {
+            trace(p, now_ms, "sdlc", format!("triage errored — defaulting to project: {}", trace_preview(e, 60)), ctx);
+            report::TriageVerdict::project_default()
+        }
+    };
+    let track = verdict.track.as_str();
+    p.track = track.to_string();
+    let rationale = if verdict.rationale.trim().is_empty() {
+        "no rationale given".to_string()
+    } else {
+        verdict.rationale.clone()
+    };
+    trace(p, now_ms, "sdlc", format!("classified as {} — {}", track, trace_preview(&rationale, 80)), ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: intake classified as {} — {}", p.id.0, track, trace_preview(&rationale, 160)),
+        ctx,
+    );
+    if matches!(verdict.track, report::TriageTrack::Patch) {
+        build_patch_board(p, now_ms, ctx);
+    }
+}
+
+/// The intake brief text for a patch task (feature: sdlc-triage): the FIRST user turn in the
+/// transcript — reliably the brief, since a patch board is built immediately after the first message
+/// (before any folding). Empty when somehow absent.
+fn intake_brief_text(p: &Project) -> String {
+    p.office_transcript
+        .iter()
+        .find(|m| matches!(m.who, ChatAuthor::User))
+        .map(|m| m.text.clone())
+        .unwrap_or_default()
+}
+
+/// A short single-line title for a patch task, derived from the brief's first non-empty line.
+fn patch_task_title(brief: &str) -> String {
+    let first = brief
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['#', '-', '*', ' ']))
+        .find(|l| !l.is_empty())
+        .unwrap_or("Patch");
+    let t = trace_preview(first, 80);
+    if t.is_empty() {
+        "Patch".to_string()
+    } else {
+        t
+    }
+}
+
+/// Build the PATCH-track board programmatically (feature: sdlc-triage): NO documents, NO breakdown
+/// invoke — the brief text becomes a single Todo task and the project goes straight Drafting ->
+/// Ready, awaiting authorize. Grind + merge review then run as normal; the final audit is skipped
+/// (merge review is the gate — see [`maybe_complete_project`]). Guarded to Drafting so a late/racey
+/// call can never rebuild a board.
+fn build_patch_board(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if !matches!(p.phase, ProjectPhase::Drafting) {
+        return;
+    }
+    let brief = intake_brief_text(p);
+    let brief = if brief.trim().is_empty() {
+        "Apply the requested change.".to_string()
+    } else {
+        brief
+    };
+    let proj = p.id.0.clone();
+    let epic_id = crate::domain::EpicId(format!("{}/patch", proj));
+    let story_id = crate::domain::StoryId(format!("{}/patch/change", proj));
+    let task_id = TaskId(format!("{}/patch/change/apply", proj));
+    let task = Task {
+        id: task_id.clone(),
+        title: patch_task_title(&brief),
+        description: brief,
+        acceptance: vec![
+            "The change described in the task is fully implemented and working".to_string(),
+            "The delivered tree stays clean (no trash or dead files; README preserved)".to_string(),
+        ],
+        blocked_by: Vec::new(),
+        priority: 0,
+        state: TaskState::Todo,
+        bounces: 0,
+        comments: Vec::new(),
+        desk: None,
+        last_report: None,
+        last_review: None,
+        history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
+    };
+    p.epics = vec![crate::domain::Epic {
+        id: epic_id,
+        title: "Patch".to_string(),
+        intent: "A single-task patch".to_string(),
+        stories: vec![story_id.clone()],
+    }];
+    p.stories = vec![crate::domain::Story {
+        id: story_id,
+        title: "Change".to_string(),
+        intent: "The requested change".to_string(),
+        tasks: vec![task_id],
+    }];
+    p.tasks = vec![task];
+    if let Ok(ph) = step_project(&p.phase, ProjectTransition::AcceptBreakdown) {
+        p.phase = ph;
+    }
+    trace(p, now_ms, "sdlc", "patch board built — 1 task, straight to Ready", ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: board is ready — 1 task (patch track). Authorize with a delivery path (workflow_authorize) to start the production line.",
+            p.id.0
+        ),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
 /// Append the user turn and issue a persona invoke. If the assembled prompt would cross
 /// the fold threshold, a summarize invoke is issued FIRST (6.2); the persona invoke is
 /// re-issued from `invoke_result` once the fold lands.
@@ -663,6 +885,13 @@ pub(crate) fn is_approval_intent(msg: &str) -> bool {
 /// (`assumptions_approved`), `pending_assumptions` cleared, and a trace notice queued — so the
 /// persona invoke that follows re-emits the doc and `gate_doc` fails open instead of re-stopping.
 fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
+    // SDLC override (feature: sdlc-triage): a clear "make it a full project" intent on a LIGHT track
+    // (patch/enhancement) that is still pre-authorize re-triages it to the full ceremony. Checked
+    // before anything else, and naturally a no-op on a fresh project (track is still "project").
+    if p.track != "project" && is_pre_authorize(p) && is_override_intent(&text) {
+        retriage_to_project(p, now_ms, ctx);
+    }
+
     if !p.pending_assumptions.is_empty() && is_approval_intent(&text) {
         p.assumptions_approved = true;
         p.pending_assumptions.clear();
@@ -675,6 +904,20 @@ fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
             format!("office[{}]: assumptions approved — gate closed for this project.", p.id.0),
             ctx,
         );
+    }
+
+    // Intake TRIAGE (feature: sdlc-triage): the FIRST message of a fresh, docless Drafting project
+    // fires ONE additional lightweight classifier invoke ALONGSIDE the persona reply below. Guarded
+    // so it fires exactly once per project and never on a mid-drafting continuation: an empty
+    // transcript (this is the first user turn), still Drafting, no PRD/change-brief captured yet, and
+    // none already in flight. Built from `text` before it is moved into the transcript.
+    let first_message = p.office_transcript.is_empty();
+    if first_message
+        && matches!(p.phase, ProjectPhase::Drafting)
+        && p.prd_markdown.trim().is_empty()
+        && !p.triage_pending
+    {
+        start_triage(p, &text, now_ms, ctx);
     }
 
     // Trace BEFORE the move: the preview is the first ~80 chars, never the whole message.
@@ -854,13 +1097,39 @@ fn restart_research_if_running(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 /// pre-migration state.
 fn maybe_author_trdcrd(p: &mut Project, now_ms: u64, research_spawned_at_ms: Option<u64>, ctx: &mut Ctx) {
     self_heal_stale_prd_gate(p, now_ms, research_spawned_at_ms, ctx);
-    if p.gate_cleared
-        && p.research.is_none()
-        && p.trd_markdown.trim().is_empty()
-        && p.crd_markdown.trim().is_empty()
-    {
+    if !(p.gate_cleared && p.research.is_none()) {
+        return;
+    }
+    // SDLC enhancement track (feature: sdlc-triage): SKIP the full TRD/CRD trio — go straight to a
+    // small breakdown (the change-brief gate already cleared, standing in for the second gate too).
+    if p.track == "enhancement" {
+        maybe_start_enhancement_breakdown(p, now_ms, ctx);
+    } else if p.trd_markdown.trim().is_empty() && p.crd_markdown.trim().is_empty() {
         start_trdcrd_invoke(p, now_ms, ctx);
     }
+}
+
+/// The ENHANCEMENT-track post-change-brief join (feature: sdlc-triage): once the change-brief gate
+/// has cleared AND research settled, skip the TRD/CRD trio and start a SMALL breakdown directly. The
+/// CRD is inherited if a prior one exists, else a minimal hygiene-only CRD is generated
+/// PROGRAMMATICALLY (no invoke round) so the completion audit still has a checklist. Once-only:
+/// guarded on no stashed breakdown, an empty board, and still Drafting (matching the project join's
+/// "not already captured" idempotency).
+fn maybe_start_enhancement_breakdown(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if p.pending_breakdown.is_some()
+        || !p.tasks.is_empty()
+        || !matches!(p.phase, ProjectPhase::Drafting)
+    {
+        return;
+    }
+    if p.crd_markdown.trim().is_empty() {
+        p.crd_markdown = office::minimal_hygiene_crd();
+        trace(p, now_ms, "sdlc", "enhancement: minimal hygiene CRD generated", ctx);
+    } else {
+        trace(p, now_ms, "sdlc", "enhancement: inheriting existing CRD", ctx);
+    }
+    trace(p, now_ms, "sdlc", "enhancement: skipping TRD/CRD trio — small breakdown", ctx);
+    start_early_breakdown(p, now_ms, ctx);
 }
 
 /// Self-heal a PRD gate wedged by pre-migration state (review finding, design-speedup
@@ -1268,6 +1537,31 @@ fn handle_assume_check_result(
     let verdict = check.as_ref().map(|c| c.verdict).unwrap_or(report::AssumeVerdict::Clean);
     let items: Vec<String> = check.map(|c| c.items).unwrap_or_default();
     let auto_mode = p.config.assumption_mode == "auto";
+
+    // SDLC escalation (feature: sdlc-triage): an ENHANCEMENT whose change-brief gate (PostPrd)
+    // surfaces MORE than N material assumptions is wider than a change -> escalate to the full
+    // project track. Flip the track + trace here; the gate then finishes normally (resolve/freeze/
+    // verify on the change-brief), and on clear the PostPrd join authors TRD+CRD (project branch)
+    // instead of the small enhancement breakdown. Pre-authorize by construction (the gate runs in
+    // Drafting).
+    if matches!(deferred, Deferred::PostPrd)
+        && p.track == "enhancement"
+        && verdict == report::AssumeVerdict::Assumptions
+        && items.len() > ENHANCEMENT_ASSUMPTION_ESCALATION_MAX
+    {
+        trace(p, now_ms, "sdlc", "escalating enhancement → project", ctx);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: {} material assumptions on the change — wider than an enhancement; reclassified as a full project.",
+                p.id.0,
+                items.len()
+            ),
+            ctx,
+        );
+        p.track = "project".to_string();
+    }
 
     // (1) Inline revision — only the compressed auto-mode gate revises, and only on an assumptions
     // verdict.
@@ -1686,6 +1980,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
         return;
     }
     match purpose {
+        InvokePurpose::Triage => handle_triage_result(p, outcome, now_ms, ctx),
         InvokePurpose::Persona => {
             let reply = match outcome {
                 Ok(t) => t,
@@ -1709,62 +2004,101 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             // while the board stays empty (live-test 2026-07-15). A fenceless reply while
             // `pending_assumptions` is set re-runs the gate on the newest doc-set so the updated
             // transcript is re-judged.
-            if matches!(p.phase, ProjectPhase::Drafting) {
-                if let Some(prd) = office::extract_prd(&reply) {
-                    p.prd_markdown = prd;
-                    p.capture_nudge_count = 0; // a successful capture resets the nudge cap
-                    p.gate_cleared = false; // fresh doc-set: the PRD gate has not cleared yet
-                    trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
-                    queue_notice(
-                        p,
-                        now_ms,
-                        format!(
-                            "office[{}]: PRD drafted (full text in the Workflow panel) — researching the stack and checking assumptions in parallel; do not authorize yet.",
-                            p.id.0
-                        ),
-                        ctx,
-                    );
-                    // Item 2/4: spawn research now (or defer/skip per research_mode), concurrently
-                    // with the PRD gate below.
-                    start_research_at_capture(p, now_ms, ctx);
-                    gate_doc(p, Deferred::PostPrd, now_ms, ctx);
-                    ctx.dirty = true;
-                    return;
-                }
-                let (chat_trd, chat_crd) = office::extract_trd_crd(&reply);
-                if chat_trd.is_some() || chat_crd.is_some() {
-                    reset_trdcrd_capture(p, now_ms, ctx);
-                    p.capture_nudge_count = 0;
-                    if let Some(t) = chat_trd {
-                        p.trd_markdown = t;
+            // Intake TRIAGE (feature: sdlc-triage): while the classifier is still in flight the track
+            // — which decides WHICH fence/contract applies — is not yet known, so a Drafting reply
+            // does NOT capture a doc into the pipeline (`!p.triage_pending`); it only flows to chat
+            // below. Once the track is known, the capture path branches on it.
+            if matches!(p.phase, ProjectPhase::Drafting) && !p.triage_pending {
+                match p.track.as_str() {
+                    // ENHANCEMENT: capture the ```change change-brief into the PRD slot (so the
+                    // gate/research/JOIN machinery reuses unchanged), then run the SAME research + gate
+                    // as a PRD; on clear the PostPrd join skips the TRD/CRD trio for a small breakdown.
+                    "enhancement" => {
+                        if let Some(cb) = office::extract_fenced(&reply, "change") {
+                            p.prd_markdown = cb;
+                            p.capture_nudge_count = 0;
+                            p.gate_cleared = false;
+                            trace(p, now_ms, "capture", format!("change-brief captured ({} bytes)", p.prd_markdown.len()), ctx);
+                            queue_notice(
+                                p,
+                                now_ms,
+                                format!(
+                                    "office[{}]: change-brief drafted (full text in the Workflow panel) — checking assumptions before the small breakdown; do not authorize yet.",
+                                    p.id.0
+                                ),
+                                ctx,
+                            );
+                            start_research_at_capture(p, now_ms, ctx);
+                            gate_doc(p, Deferred::PostPrd, now_ms, ctx);
+                            ctx.dirty = true;
+                            return;
+                        }
+                        if !p.pending_assumptions.is_empty() {
+                            recheck_pending_assumptions(p, now_ms, ctx);
+                        }
                     }
-                    if let Some(c) = chat_crd {
-                        p.crd_markdown = c;
-                    }
-                    trace(
-                        p,
-                        now_ms,
-                        "capture",
-                        format!("TRD+CRD captured via chat (trd {}B, crd {}B)", p.trd_markdown.len(), p.crd_markdown.len()),
-                        ctx,
-                    );
-                    queue_notice(p, now_ms, format!("office[{}]: TRD + clean-build requirements updated (panel).", p.id.0), ctx);
-                    gate_doc(p, Deferred::Breakdown, now_ms, ctx);
-                    ctx.dirty = true;
-                    return;
-                }
+                    // PATCH: the board is built programmatically at triage-resolve, so a Drafting reply
+                    // never captures a doc — fall through to the chat notice.
+                    "patch" => {}
+                    // PROJECT (default): the unchanged full-ceremony capture path.
+                    _ => {
+                        if let Some(prd) = office::extract_prd(&reply) {
+                            p.prd_markdown = prd;
+                            p.capture_nudge_count = 0; // a successful capture resets the nudge cap
+                            p.gate_cleared = false; // fresh doc-set: the PRD gate has not cleared yet
+                            trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
+                            queue_notice(
+                                p,
+                                now_ms,
+                                format!(
+                                    "office[{}]: PRD drafted (full text in the Workflow panel) — researching the stack and checking assumptions in parallel; do not authorize yet.",
+                                    p.id.0
+                                ),
+                                ctx,
+                            );
+                            // Item 2/4: spawn research now (or defer/skip per research_mode), concurrently
+                            // with the PRD gate below.
+                            start_research_at_capture(p, now_ms, ctx);
+                            gate_doc(p, Deferred::PostPrd, now_ms, ctx);
+                            ctx.dirty = true;
+                            return;
+                        }
+                        let (chat_trd, chat_crd) = office::extract_trd_crd(&reply);
+                        if chat_trd.is_some() || chat_crd.is_some() {
+                            reset_trdcrd_capture(p, now_ms, ctx);
+                            p.capture_nudge_count = 0;
+                            if let Some(t) = chat_trd {
+                                p.trd_markdown = t;
+                            }
+                            if let Some(c) = chat_crd {
+                                p.crd_markdown = c;
+                            }
+                            trace(
+                                p,
+                                now_ms,
+                                "capture",
+                                format!("TRD+CRD captured via chat (trd {}B, crd {}B)", p.trd_markdown.len(), p.crd_markdown.len()),
+                                ctx,
+                            );
+                            queue_notice(p, now_ms, format!("office[{}]: TRD + clean-build requirements updated (panel).", p.id.0), ctx);
+                            gate_doc(p, Deferred::Breakdown, now_ms, ctx);
+                            ctx.dirty = true;
+                            return;
+                        }
 
-                // No fresh fence, but the pipeline is STOPPED on a prior gate's assumptions and the
-                // user just replied — their approval / answers / delegation now sit in the
-                // transcript. Re-run the gate on the newest captured doc so that UPDATED transcript
-                // is re-judged; a clean re-check clears `pending_assumptions` and resumes the
-                // deferred stage. Without this, a stopped gate never re-fires and Drafting wedges
-                // forever (live-test 2026-07-15: the persona answered in prose, no new fence, and
-                // the gate never re-ran). Exactly ONE re-check per persona exchange: the AssumeCheck
-                // result is not a persona result, so it cannot recurse. The persona reply itself
-                // still flows to chat below.
-                if !p.pending_assumptions.is_empty() {
-                    recheck_pending_assumptions(p, now_ms, ctx);
+                        // No fresh fence, but the pipeline is STOPPED on a prior gate's assumptions and the
+                        // user just replied — their approval / answers / delegation now sit in the
+                        // transcript. Re-run the gate on the newest captured doc so that UPDATED transcript
+                        // is re-judged; a clean re-check clears `pending_assumptions` and resumes the
+                        // deferred stage. Without this, a stopped gate never re-fires and Drafting wedges
+                        // forever (live-test 2026-07-15: the persona answered in prose, no new fence, and
+                        // the gate never re-ran). Exactly ONE re-check per persona exchange: the AssumeCheck
+                        // result is not a persona result, so it cannot recurse. The persona reply itself
+                        // still flows to chat below.
+                        if !p.pending_assumptions.is_empty() {
+                            recheck_pending_assumptions(p, now_ms, ctx);
+                        }
+                    }
                 }
             }
 
@@ -1789,22 +2123,29 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 }
             }
 
-            // Capture miss (feature: capture nudge): in Drafting, a long reply that landed no
-            // ```prd fence while the PRD slot is still empty is almost always a PRD the office
-            // narrated but forgot to fence (live-test 2026-07-15). Fire ONE deterministic re-invoke
-            // asking for ONLY the fenced doc, capped at MAX_CAPTURE_NUDGES in a row so a model that
-            // never emits the fence falls back to today's wait-for-user behavior instead of looping.
-            // TRD/CRD are authored through their own dedicated invokes, never this Persona channel,
-            // so the PRD is the only doc this nudge targets.
+            // Capture miss (feature: capture nudge): in Drafting, a long reply that landed no primary
+            // doc fence while the doc slot is still empty is almost always a doc the office narrated
+            // but forgot to fence (live-test 2026-07-15). Fire ONE deterministic re-invoke asking for
+            // ONLY the fenced doc, capped at MAX_CAPTURE_NUDGES in a row. The doc is the PRD on the
+            // project track and the change-brief (```change) on the enhancement track (feature:
+            // sdlc-triage) — both live in the PRD slot. Never during triage (track unknown) and never
+            // on the patch track (it drafts no doc); TRD/CRD are authored through dedicated invokes.
             if matches!(p.phase, ProjectPhase::Drafting)
+                && !p.triage_pending
+                && p.track != "patch"
                 && p.prd_markdown.trim().is_empty()
                 && reply.len() > PRD_NUDGE_MIN_REPLY_BYTES
                 && p.capture_nudge_count < MAX_CAPTURE_NUDGES
             {
                 p.capture_nudge_count += 1;
-                trace(p, now_ms, "nudge", format!("PRD capture-miss nudge #{}", p.capture_nudge_count), ctx);
+                let (doc_label, instruction) = if p.track == "enhancement" {
+                    ("change-brief", CHANGE_NUDGE_INSTRUCTION)
+                } else {
+                    ("PRD", PRD_NUDGE_INSTRUCTION)
+                };
+                trace(p, now_ms, "nudge", format!("{doc_label} capture-miss nudge #{}", p.capture_nudge_count), ctx);
                 let (mut system, prompt) = office::build_invoke(p, "");
-                system.push_str(PRD_NUDGE_INSTRUCTION);
+                system.push_str(instruction);
                 emit_draft_invoke(p, ctx, InvokePurpose::Persona, system, prompt);
                 ctx.dirty = true;
                 return;
@@ -1945,6 +2286,13 @@ fn apply_or_stash_breakdown(
     ctx: &mut Ctx,
 ) {
     if matches!(p.phase, ProjectPhase::Drafting) {
+        // SDLC escalation (feature: sdlc-triage): an ENHANCEMENT whose breakdown returns more than 3
+        // tasks is wider than a change — escalate to the full project ceremony (author TRD+CRD)
+        // instead of stashing this plan. Pre-authorize only (we are in Drafting).
+        if p.track == "enhancement" && breakdown.task_count() > ENHANCEMENT_BREAKDOWN_TASK_MAX {
+            escalate_enhancement_to_project_via_breakdown(p, breakdown.task_count(), now_ms, ctx);
+            return;
+        }
         p.pending_breakdown = Some(text);
         trace(p, now_ms, "breakdown", "breakdown stashed (early)", ctx);
         maybe_apply_breakdown(p, now_ms, ctx);
@@ -1952,6 +2300,31 @@ fn apply_or_stash_breakdown(
     } else {
         land_breakdown(p, breakdown, now_ms, ctx);
     }
+}
+
+/// Escalate an ENHANCEMENT to the full project track because its breakdown was wider than a change
+/// (feature: sdlc-triage). Flip the track, discard the oversized plan and the placeholder hygiene
+/// CRD, and author the real TRD+CRD from the change-brief (which stays in the PRD slot as context).
+/// The change-brief/PRD gate already cleared, so authoring can fire immediately.
+fn escalate_enhancement_to_project_via_breakdown(p: &mut Project, task_count: usize, now_ms: u64, ctx: &mut Ctx) {
+    trace(p, now_ms, "sdlc", "escalating enhancement → project", ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: the change needs {} tasks — wider than an enhancement; reclassified as a full project, drafting TRD + CRD.",
+            p.id.0, task_count
+        ),
+        ctx,
+    );
+    p.track = "project".to_string();
+    p.pending_breakdown = None;
+    // The placeholder hygiene CRD (and any partial TRD) is dropped — the project ceremony authors the
+    // real pair. `gate_cleared` stays true (the change-brief/PRD gate passed), so authoring fires now.
+    p.crd_markdown.clear();
+    p.trd_markdown.clear();
+    start_trdcrd_invoke(p, now_ms, ctx);
+    ctx.dirty = true;
 }
 
 /// Land a validated breakdown on the board and announce it — shared by the first attempt,
@@ -2049,7 +2422,11 @@ fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
         InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {
             Some("json")
         }
-        InvokePurpose::Persona
+        // Triage asks for the `SDLC-TRIAGE` TEXT block, so it stays OUT of json mode for the same
+        // reason as the assume-check gate (json mode 400s / breaks the tolerant text parser on the
+        // common chat-completions dialects) — and it fails OPEN to `project` on an unparseable result.
+        InvokePurpose::Triage
+        | InvokePurpose::Persona
         | InvokePurpose::TrdCrd
         | InvokePurpose::Fold
         | InvokePurpose::AssumeCheckPrd
@@ -2080,6 +2457,11 @@ fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     // for THIS process once Interrupted, by the same "process boundary" reasoning as the on-load
     // default.
     p.gate_invoke_live_hint = false;
+    // Intake triage (feature: sdlc-triage): same "process boundary" reasoning — a triage invoke in
+    // flight at interrupt has its result dropped by the `Interrupted` guard in `invoke_result`, so a
+    // `triage_pending` left `true` would suppress the persona doc-capture forever after resume. Clear
+    // it; the track stays whatever it was (default "project"), which is the safe fallback.
+    p.triage_pending = false;
     // Cut off the project-level drafting/completion analysts (research 6.2b, audit 6.2c). They
     // are NOT task bindings, so the normalization loop below never touches them; a dangling
     // researcher/auditor would keep burning tokens against an interrupted project (feature:
@@ -2136,6 +2518,8 @@ fn soft_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     // invoke's result unconditionally (soft drain does not exempt kernel-level invokes, only
     // sub-agent `HostEvent::Result`s), so a hint left `true` would never clear on its own.
     p.gate_invoke_live_hint = false;
+    // Intake triage (feature: sdlc-triage): clear the pending flag for the same reason.
+    p.triage_pending = false;
 }
 
 /// Kill the project-level analyst bindings (research 6.2b / audit 6.2c) on a hard interrupt
@@ -2611,6 +2995,29 @@ fn bounce_task(p: &mut Project, idx: usize, attempt: u32, note: String, now_ms: 
     record(&mut p.tasks[idx], now_ms, "review:fail");
     ctx.dirty = true;
 
+    // SDLC escalation (feature: sdlc-triage): a PATCH whose single task bounces twice is wider than a
+    // patch — convert the track to enhancement and re-dispatch (do NOT park), giving the task another
+    // life under the richer framing before its next attempt. Running-time relabel, no re-drafting.
+    // Fires once: the track is no longer "patch" afterward.
+    if p.track == "patch" && p.tasks[idx].bounces >= PATCH_BOUNCE_ESCALATION {
+        p.track = "enhancement".to_string();
+        trace(p, now_ms, "sdlc", "escalating patch → enhancement", ctx);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: patch bounced {} times — escalating to an enhancement; re-dispatching.",
+                p.id.0, p.tasks[idx].bounces
+            ),
+            ctx,
+        );
+        set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
+        p.tasks[idx].state = TaskState::Todo;
+        let label = format!("{} → todo (patch escalation)", short_task(&p.tasks[idx].id));
+        trace(p, now_ms, "task", label, ctx);
+        return;
+    }
+
     if p.tasks[idx].bounces > p.config.bounce_budget {
         let notice = format!(
             "production line: task {} '{}' exceeded the review bounce budget; the office parked it. Advise or edit the board.",
@@ -3056,6 +3463,16 @@ fn maybe_complete_project(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         return;
     }
     if p.tasks.is_empty() || !p.tasks.iter().all(|t| matches!(t.state, TaskState::Done { .. })) {
+        return;
+    }
+    // SDLC patch track (feature: sdlc-triage): no CRD and merge review IS the gate, so SKIP the final
+    // clean-build audit, traced. (A pure patch has an empty CRD and would complete without an audit
+    // anyway; this makes the skip explicit + testable. A patch that ESCALATED to enhancement has
+    // track != "patch", so it still takes the audit path below.)
+    if p.track == "patch" {
+        complete_project(p, now_ms);
+        trace(p, now_ms, "sdlc", "audit skipped (patch track)", ctx);
+        trace(p, now_ms, "phase", "project complete — all tasks done", ctx);
         return;
     }
     // A CRD present + no audit already running -> gate completion on a clean-build audit. If the
