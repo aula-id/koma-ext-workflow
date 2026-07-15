@@ -97,6 +97,9 @@ export interface Project {
   /** Live office activity (full snapshot only, 6.2d), present only while an activity is in
    * flight; omitted entirely (not null) when idle. At most one is live at a time. */
   officeActivity?: { label: string; sinceMs: number } | null;
+  /** SDLC intake track (feature: sdlc-triage): `'project'` | `'enhancement'` | `'patch'`.
+   * Optional — absent on older snapshots renders no badge (back-compat). */
+  track?: string;
 }
 
 const COLUMNS: { key: ColumnKey; label: string }[] = [
@@ -452,6 +455,28 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
               <span className="wf-status-dot" style={{ background: PHASE_COLOR[phaseKind] }} />
               {phaseKind}
             </span>
+            {/* SDLC track badge (feature: sdlc-triage): same flat uppercase tag recipe as the
+                doc-card "doc" label above — no filled chip. Absent track (older snapshot) renders
+                nothing (back-compat). */}
+            {project.track && (
+              <span
+                data-testid="project-track-badge"
+                style={{
+                  fontSize: '0.6rem',
+                  fontWeight: 600,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase',
+                  color: 'var(--wf-dim)',
+                  border: '1px solid var(--wf-border)',
+                  borderRadius: 'var(--wf-radius)',
+                  padding: '0.1rem 0.4rem',
+                  flex: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {project.track}
+              </span>
+            )}
           </div>
           {/* Phase-dependent actions: one set at a time, never three alarm
               buttons side by side for every state. flex:none so a long project

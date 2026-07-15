@@ -3489,17 +3489,61 @@ fn enhancement_escalates_to_project_on_oversized_breakdown() {
 fn override_retriages_enhancement_to_project_in_drafting() {
     let mut p = drafting_intake();
     p.track = "enhancement".to_string();
-    p.prd_markdown = "# change-brief\nstuff".into(); // carried context (kept)
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::Office, text: "```change\nCurrent: none\nDesired: stuff\n```".into() });
+    p.prd_markdown = "# change-brief\nstuff".into();
     p.crd_markdown = crate::office::minimal_hygiene_crd();
     p.gate_cleared = true;
     let fx = step(&mut p, Input::Command(Command::OfficeMessage { text: "actually, make it a full project".into() }), 1000, 4);
     assert_eq!(p.track, "project");
     assert!(p.crd_markdown.is_empty(), "the light-track CRD placeholder is cleared");
     assert!(!p.gate_cleared, "the gate is reset for the full ceremony");
-    assert!(p.prd_markdown.contains("change-brief"), "the change-brief is KEPT as carried context");
+    // Review finding (MINOR, soft-stall fix): the `prd_markdown` SLOT is cleared (not kept) so the
+    // capture-miss nudge machinery re-arms for a fresh full PRD; the change-brief TEXT itself is
+    // still readable by the persona from `office_transcript`, untouched by retriage.
+    assert!(p.prd_markdown.trim().is_empty(), "the change-brief slot is cleared, awaiting a full PRD");
+    assert!(
+        p.office_transcript.iter().any(|m| m.text.contains("Desired: stuff")),
+        "the change-brief text itself stays in the transcript as carried context"
+    );
+    assert!(p.trace.iter().any(|e| e.summary == "retriage: change-brief cleared, awaiting full PRD"));
     assert!(p.trace.iter().any(|e| e.summary == "re-triaged to project (user override)"));
     assert!(fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Persona, .. })), "the message still drives a persona reply");
-    assert!(!fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })), "no re-triage (a PRD-slot doc already exists)");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })), "no re-triage (triage only ever fires on a truly fresh, empty transcript)");
+}
+
+#[test]
+fn override_from_ready_clears_prd_slot_and_rearms_capture_nudge() {
+    // Review finding (MINOR): override-from-Ready soft-stall — retriage used to KEEP the change-brief
+    // in `prd_markdown`, so the capture-miss nudge (guarded on the slot being EMPTY) never re-armed;
+    // if the project-track persona just chatted instead of emitting a fresh ```prd fence, the gate
+    // never re-ran. Fixed: the slot is cleared on retriage, so a fenceless reply nudges again.
+    let mut p = project(ProjectPhase::Ready, vec![task("proj/e/change/apply", TaskState::Todo, 0, &[])]);
+    p.track = "enhancement".to_string();
+    // A project that already reached Ready has a real prior conversation — seed one turn so this
+    // message is not mistaken for a fresh intake (the `project()` builder otherwise starts with an
+    // empty transcript, which would spuriously re-fire the ONE-SHOT intake triage).
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::Office, text: "```change\nCurrent: none\nDesired: old scope\n```".into() });
+    p.prd_markdown = "# change-brief\nold enhancement scope".into();
+    p.crd_markdown = crate::office::minimal_hygiene_crd();
+    p.gate_cleared = true;
+    p.capture_nudge_count = 0;
+    let fx0 = step(&mut p, Input::Command(Command::OfficeMessage { text: "make it a full project".into() }), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert_eq!(p.phase, ProjectPhase::Drafting, "a Ready light track regresses to Drafting");
+    assert!(p.prd_markdown.trim().is_empty(), "prd_markdown slot cleared on retriage");
+    assert!(p.trace.iter().any(|e| e.summary == "retriage: change-brief cleared, awaiting full PRD"));
+    assert!(!p.triage_pending, "no fresh intake triage — this project already had a conversation");
+    assert!(
+        !fx0.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })),
+        "no re-triage on an override"
+    );
+
+    // A long fenceless persona reply now nudges (the slot is empty again), instead of the gate
+    // staying wedged with a stale non-empty prd_markdown.
+    let long_reply = format!("Here is my detailed product thinking. {}", "detail. ".repeat(80));
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(long_reply)), 1100, 4);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Persona, "the capture-miss nudge re-fires a persona invoke");
+    assert!(p.trace.iter().any(|e| e.kind == "nudge"), "capture-miss nudge fired");
 }
 
 #[test]
@@ -3562,4 +3606,116 @@ fn project_golden_path_unchanged_by_triage() {
     assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research spawns");
     assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "the PRD gate fires — unchanged");
     assert_eq!(p.track, "project", "the default track is project");
+}
+
+// ---- persona-first race (review finding, MAJOR) ---------------------------
+//
+// The first message fires the triage classifier AND the persona invoke CONCURRENTLY. These tests
+// simulate the persona reply landing FIRST (while `triage_pending` is still true, so the Persona
+// capture path suppresses capture) and assert the doc is RECOVERED — not dropped — once the triage
+// verdict resolves the track.
+
+#[test]
+fn triage_race_recovers_prd_captured_by_a_persona_reply_that_beat_the_verdict() {
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "build a thing".into() });
+    p.triage_pending = true;
+
+    // The persona reply lands FIRST, carrying the fenced PRD, while triage is still in flight.
+    let reply = "Sure, here's the plan.\n```prd\n# App\nBuild it.\n```";
+    let fx1 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty(), "capture suppressed while triage is still pending");
+    assert!(invoke_effects(&fx1).is_empty(), "nothing captured yet -> no gate/research invoke");
+    assert!(
+        p.office_transcript.iter().any(|m| matches!(m.who, ChatAuthor::Office) && m.text.contains("```prd")),
+        "the reply still lands in the transcript regardless of triage state"
+    );
+
+    // The triage verdict arrives afterward, resolving the track to "project".
+    let fx2 = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: project\nrationale: new build\n".into())),
+        1100,
+        4,
+    );
+    assert_eq!(p.track, "project");
+    assert_eq!(p.prd_markdown, "# App\nBuild it.", "the raced PRD is recovered, not dropped");
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::AssumeCheckPrd, "the PRD gate fired on the recovered doc");
+    assert!(p.trace.iter().any(|e| e.summary.contains("triage race")), "the recovery is traced");
+}
+
+#[test]
+fn triage_race_recovers_change_brief_captured_by_a_persona_reply_that_beat_the_verdict() {
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "add a small toggle".into() });
+    p.triage_pending = true;
+
+    let reply = "Sure.\n```change\nCurrent behavior: none.\nDesired behavior: a toggle.\nAcceptance criteria: it persists.\n```";
+    let fx1 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty(), "capture suppressed while triage is still pending");
+    assert!(invoke_effects(&fx1).is_empty());
+
+    let fx2 = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: enhancement\nrationale: small change\n".into())),
+        1100,
+        4,
+    );
+    assert_eq!(p.track, "enhancement");
+    assert!(p.prd_markdown.contains("Desired behavior"), "the raced change-brief is recovered");
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::AssumeCheckPrd, "the change-brief gate fired on the recovered doc");
+    assert!(p.trace.iter().any(|e| e.summary.contains("triage race")));
+}
+
+#[test]
+fn triage_race_patch_verdict_ignores_any_raced_persona_reply() {
+    // Patch never captures a doc, so a persona reply that raced ahead — even one carrying a fence —
+    // must not be scanned or captured once the verdict resolves to "patch"; the board still builds
+    // programmatically with zero doc invokes, unchanged.
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "fix the footer typo".into() });
+    p.triage_pending = true;
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# not actually a project\n```".into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty());
+
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: patch\nrationale: tiny fix\n".into())),
+        1100,
+        4,
+    );
+    assert_eq!(p.track, "patch");
+    assert_eq!(p.phase, ProjectPhase::Ready, "patch board still builds straight to Ready");
+    assert_eq!(p.tasks.len(), 1);
+    assert!(p.prd_markdown.trim().is_empty(), "patch never captures a doc, race or not");
+    assert!(invoke_effects(&fx).is_empty(), "no gate invoke for patch");
+}
+
+// ---- escalated patch gains completion ceremony (review finding, MINOR) ----
+
+#[test]
+fn escalated_patch_generates_hygiene_crd_and_audits_on_completion() {
+    // An escalated patch (track flipped "patch" -> "enhancement" on its 2nd bounce) used to complete
+    // with ZERO ceremony: `maybe_complete_project` fell through the `track == "patch"` skip (track is
+    // no longer "patch") AND the CRD-gated audit (crd_markdown stayed empty). Fixed: the escalation
+    // site now generates the same minimal hygiene CRD the enhancement track would have, so completion
+    // audits for real.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("proj/patch/change/apply", TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 2 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    p.crd_markdown = String::new();
+    p.tasks[0].bounces = 1; // already bounced once
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: fail\nreasons: still broken\n".into() }), 1000, 0);
+    assert_eq!(p.track, "enhancement", "the second bounce escalates");
+    assert!(!p.crd_markdown.trim().is_empty(), "a minimal hygiene CRD was generated at escalation");
+    assert!(p.trace.iter().any(|e| e.summary == "escalation: minimal hygiene CRD generated for completion audit"));
+
+    // The re-dispatched task eventually passes review; completion must audit against the hygiene CRD
+    // instead of silently skipping it.
+    p.tasks[0].state = TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 3 };
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: pass\nreasons: fixed\n".into() }), 1200, 4);
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "completion audits against the hygiene CRD instead of skipping");
+    assert!(matches!(p.phase, ProjectPhase::Running), "still Running — the audit gates Done, not an immediate completion");
 }
