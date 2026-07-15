@@ -92,6 +92,13 @@ if command -v koma &> /dev/null; then
   echo "Using 'koma ext install --dev' (auto-grants requires, tier dev, replaces $EXT_ID in place)."
   koma ext install --dev "$ZIP_FILE"
 
+  # koma's Rust unpacker only chmod+x's the manifest runtime.exec (office-daemon);
+  # bin/workflow-mcp comes out non-executable on unix and the MCP server then fails
+  # to spawn. Re-mark everything in bin/ (no-op on Windows / already-executable files).
+  if [ -d "$INSTALL_DIR/bin" ]; then
+    chmod +x "$INSTALL_DIR/bin/"* 2>/dev/null || true
+  fi
+
   if [ -f "$CONFIG_FILE" ] && command -v jq &> /dev/null; then
     cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
   fi
@@ -125,6 +132,10 @@ fi
 
 # Extract the zip file
 unzip -q "$ZIP_FILE" -d "$INSTALL_DIR"
+
+# Belt+braces: some unzip/zip combinations drop unix exec bits; the daemon AND the
+# MCP server must both be executable or koma silently fails to spawn them.
+chmod +x "$INSTALL_DIR/bin/"* 2>/dev/null || true
 
 echo "Extension files extracted."
 
