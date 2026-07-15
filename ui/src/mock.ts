@@ -299,58 +299,12 @@ function buildDraftingProject() {
     '```',
   ].join('\n');
 
-  const trdMarkdown = [
-    '# Technical Requirements',
-    '',
-    '## Stack',
-    '',
-    '| Layer | Choice | Version |',
-    '|---|---|---|',
-    '| API | Node + Fastify | 4.x |',
-    '| DB | PostgreSQL | 16 |',
-    '| Cache | Redis | 7 |',
-    '| Jobs | BullMQ | 5.x |',
-    '',
-    '## Data model',
-    '',
-    'Reuse the existing `points_ledger` table as the source of truth; add a derived',
-    '`user_tier` materialized view refreshed nightly from trailing-12mo spend.',
-    '',
-    '## Constraints',
-    '',
-    '- No new ledger table (PRD non-negotiable).',
-    '- Tier recompute must be idempotent and driven from the ledger, never incremented in place.',
-  ].join('\n');
-
   const researchNotes = [
     '- **Fastify 4.x**: stable; prefer `@fastify/postgres` over a raw pool for connection lifecycle.',
     '- **PostgreSQL 16**: materialized views suit the nightly tier recompute; index the',
     '  `trailing_spend` column the tier function reads.',
     '- **BullMQ 5.x**: the maintained successor to `bull`; run it against a dedicated Redis 7 instance.',
     '- Pitfall: trailing-12-month windows drift — recompute from the ledger, do not mutate in place.',
-  ].join('\n');
-
-  const crdMarkdown = [
-    '# Clean-build Requirements',
-    '',
-    '## Expected file tree',
-    '',
-    '- `src/tiers/` — tier engine (recompute + lookup), imported by the API layer',
-    '- `migrations/` — the `user_tier` materialized view; no new ledger table',
-    '- `README.md` — setup + run instructions',
-    '',
-    '## No trash',
-    '',
-    '- No `.bak`/temp files, no dead deps, no commented-out code, no debug prints left in.',
-    '- Every module is imported by something (no unwired files).',
-    '',
-    '## Grading rubric (weights sum to 100)',
-    '',
-    '- Builds + lints clean — 30',
-    '- File-tree shape matches — 20',
-    '- No unwired/trash files — 20',
-    '- Tier recompute idempotent + ledger-driven — 20',
-    '- README present + accurate — 10',
   ].join('\n');
 
   return {
@@ -363,24 +317,22 @@ function buildDraftingProject() {
     epics: [],
     stories: [],
     prdMarkdown,
-    trdMarkdown,
+    // TRD not drafted yet — research already came back, and the office brain is now
+    // mid-draft on the TRD (see `officeActivity` below). Doc-cards matrix: prd done,
+    // research done, trd active, crd backlog.
+    trdMarkdown: '',
     researchNotes,
-    crdMarkdown,
-    // A live research binding sample so the office view animates the researcher reading
-    // (the drafting pipeline is mid web-research). Mirrors digest.rs `researchActive`.
-    researchActive: true,
-    research: { extAgentId: 501, kind: 'Researcher', spawnedAtMs: nowMs() },
-    pendingAssumptions: [
-      'Assumed tier downgrades happen at renewal, but the user left downgrade timing open.',
-      'Assumed Redis 7 for BullMQ; the user never named a cache.',
-    ],
+    crdMarkdown: '',
+    pendingAssumptions: [],
+    // Live office-brain activity (6.2d): drafting the TRD now that research is in.
+    officeActivity: { label: 'drafting the TRD', sinceMs: nowMs() - 90 * 1000 },
     officeTranscript: [
       { who: 'user', text: 'We want to redesign the loyalty program around tiers instead of a flat points balance.' },
       { who: 'office', text: 'Got it. Should tiers be based on trailing spend, lifetime spend, or something else?' },
       { who: 'user', text: 'Trailing 12 months, so people can drop a tier if they slow down.' },
       { who: 'office', text: 'Makes sense. Drafted a PRD with three tiers (Bronze/Silver/Gold) and left tier-downgrade timing as an open question — take a look at the doc.' },
       { who: 'user', text: 'Looks good. Let\'s also make sure the existing points_ledger table stays authoritative, no new ledger.' },
-      { who: 'office', text: 'Added that as a non-negotiable in the PRD. Ready to break this down into epics/stories whenever you are.' },
+      { who: 'office', text: 'Added that as a non-negotiable in the PRD. Research on the stack is back — drafting the TRD now.' },
     ],
     officeSummary: 'User wants tiered loyalty (Bronze/Silver/Gold) based on trailing-12mo spend, redeemable for discounts or partner perks, keeping points_ledger authoritative; tier-downgrade timing still open.',
     outbox: [
@@ -388,6 +340,56 @@ function buildDraftingProject() {
       { id: 2, text: 'Still waiting on a decision for tier-downgrade timing before breakdown can start.', sent: false, paused: true },
       { id: 3, text: 'Reminder: this project has been in Drafting for 3 days.', sent: false, paused: false },
     ],
+    config: defaultConfig(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Project 2b — Drafting: "Bulk CSV Import Wizard". Doc-cards matrix continued:
+// PRD authored but the safeguard flagged an ungrounded assumption, so the panel
+// waits on the user (review/assumptions) with research/TRD/CRD still backlog.
+// ---------------------------------------------------------------------------
+
+function buildDraftingAssumptionsProject() {
+  const prdMarkdown = [
+    '# Bulk CSV Import Wizard',
+    '',
+    'Let admins bulk-import products via CSV instead of entering them one at a time.',
+    '',
+    '## Goals',
+    '',
+    '- Validate every row client-side before upload',
+    '- Show a per-row error report so a bad row does not block the whole file',
+    '',
+    '## Open questions',
+    '',
+    '- Should a partially-valid file commit the good rows, or is it all-or-nothing?',
+  ].join('\n');
+
+  return {
+    id: 'csv-import',
+    name: 'Bulk CSV Import Wizard',
+    phase: { kind: 'drafting' },
+    deliveryPath: null,
+    seq: 2,
+    tasks: [],
+    epics: [],
+    stories: [],
+    prdMarkdown,
+    trdMarkdown: '',
+    researchNotes: '',
+    crdMarkdown: '',
+    // Doc-cards matrix: prd review/assumptions (newest non-empty doc), research/trd/crd
+    // still backlog behind it.
+    pendingAssumptions: [
+      'Assumed partial imports commit the valid rows and skip the invalid ones — the user never said.',
+    ],
+    officeTranscript: [
+      { who: 'user', text: 'Admins need to bulk-import products from a CSV instead of typing them in one at a time.' },
+      { who: 'office', text: 'Drafted a PRD with client-side validation and a per-row error report. One open question I could not resolve: should a partially-valid file commit the good rows, or is it all-or-nothing? Flagged that as an assumption for now — take a look.' },
+    ],
+    officeSummary: 'Admin bulk CSV import with client-side validation and a per-row error report; partial-import commit behavior is an open/assumed question.',
+    outbox: [],
     config: defaultConfig(),
   };
 }
@@ -469,7 +471,7 @@ function buildHaltedProject() {
 }
 
 function buildInitialProjects(): any[] {
-  return [buildRunningProject(), buildDraftingProject(), buildHaltedProject()];
+  return [buildRunningProject(), buildDraftingProject(), buildDraftingAssumptionsProject(), buildHaltedProject()];
 }
 
 // ---------------------------------------------------------------------------

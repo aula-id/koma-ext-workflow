@@ -9,6 +9,7 @@ import TaskDetail from './TaskDetail';
 import Prd from './Prd';
 import OfficeMap from './OfficeMap';
 import ConfirmButton from '../components/ConfirmButton';
+import { docCards, DocCard } from '../lib/docCards';
 
 /** Project shape, full mode, per docs/PANEL_PROTOCOL.md 2.1 (frozen W7 contract). */
 export interface ProjectPhase {
@@ -139,6 +140,97 @@ export function guardCardMove(state: TaskStateKey, to: ColumnKey, killWorker: bo
   return { legal: true };
 }
 
+const DOC_STATE_DOT: Partial<Record<DocCard['state'], string>> = {
+  active: 'var(--wf-info)',
+  checking: 'var(--wf-review)',
+  assumptions: 'var(--wf-warn)',
+};
+
+/**
+ * Synthetic drafting-doc card: the same flat card recipe as `Card`, but visually
+ * distinct (dashed border — it is not a task, not draggable) and never carries the
+ * per-task signals (agent, bounces, ...). Clicking it jumps to the docs tab, where the
+ * full doc renders.
+ */
+const DocCardView: React.FC<{ card: DocCard; onClick: () => void }> = ({ card, onClick }) => {
+  const dotColor = DOC_STATE_DOT[card.state];
+  const statusText: string | undefined =
+    card.state === 'active'
+      ? card.detail ?? 'active'
+      : card.state === 'checking'
+        ? 'fact-checking'
+        : card.state === 'assumptions'
+          ? card.detail
+          : card.state === 'done' || card.state === 'skipped'
+            ? card.detail
+            : undefined;
+
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -6 }}
+      transition={{ duration: 0.18 }}
+      onClick={onClick}
+      style={{
+        background: 'var(--wf-panel)',
+        borderRadius: 'var(--wf-radius)',
+        border: '1px dashed var(--wf-border)',
+        padding: '0.5rem 0.6rem',
+        cursor: 'pointer',
+      }}
+      whileHover={{ borderColor: 'var(--wf-grip)' }}
+      data-testid="doc-card"
+      data-doc-key={card.key}
+    >
+      <div style={{ fontSize: '0.82rem', color: 'var(--wf-fg)', lineHeight: 1.35 }}>
+        <span
+          style={{
+            fontSize: '0.6rem',
+            fontWeight: 600,
+            letterSpacing: '0.06em',
+            textTransform: 'uppercase',
+            color: 'var(--wf-dim)',
+            marginRight: '0.45rem',
+          }}
+        >
+          doc
+        </span>
+        {card.title}
+      </div>
+
+      {statusText && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.35rem',
+            marginTop: '0.35rem',
+            fontSize: '0.68rem',
+            color: dotColor ?? 'var(--wf-dim)',
+          }}
+        >
+          {dotColor && (
+            <motion.span
+              animate={card.state === 'active' ? { opacity: [0.35, 1, 0.35] } : undefined}
+              transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
+              style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor, display: 'inline-block' }}
+            />
+          )}
+          {statusText}
+        </div>
+      )}
+
+      {card.blockedBy.length > 0 && (
+        <div style={{ marginTop: '0.35rem', fontSize: '0.68rem', color: 'var(--wf-dim)' }}>
+          blocked by {card.blockedBy.join(', ')}
+        </div>
+      )}
+    </motion.div>
+  );
+};
+
 export interface BoardProps {
   projectId: string;
   onBack?: () => void;
@@ -220,6 +312,22 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
     }
     for (const key of Object.keys(grouped) as ColumnKey[]) {
       grouped[key] = grouped[key].slice().sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
+    }
+    return grouped;
+  }, [project]);
+
+  // Drafting-pipeline docs (PRD/research/TRD/CRD/audit) projected as synthetic cards,
+  // rendered above the task cards in whichever column their live state maps to.
+  const docCardsByColumn = useMemo(() => {
+    const grouped: Record<ColumnKey, DocCard[]> = {
+      backlog: [],
+      todo: [],
+      onprogress: [],
+      review: [],
+      done: [],
+    };
+    for (const c of docCards(project)) {
+      grouped[c.column].push(c);
     }
     return grouped;
   }, [project]);
@@ -457,6 +565,11 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
                   <span>{tasksByColumn[col.key].length}</span>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <AnimatePresence initial={false}>
+                    {docCardsByColumn[col.key].map((card) => (
+                      <DocCardView key={card.key} card={card} onClick={() => setTab('prd')} />
+                    ))}
+                  </AnimatePresence>
                   <AnimatePresence initial={false}>
                     {tasksByColumn[col.key].map((task) => (
                       <Card
