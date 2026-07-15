@@ -533,9 +533,29 @@ fn event_agent_turn_end_and_foreground_change() {
 
 #[test]
 fn event_agents_done_private_notify_maps_to_agents_done() {
+    // No `error` field (a clean `done`, or an old koma): the optional field parses `None`.
     let (tx, rx) = channel();
     on_event("agents.done", json!({ "agentId": 42, "status": "done" }), &tx);
-    assert_eq!(recv_event(&rx), HostEvent::AgentsDone { agent_id: 42, status: "done".to_string() });
+    assert_eq!(
+        recv_event(&rx),
+        HostEvent::AgentsDone { agent_id: 42, status: "done".to_string(), error: None }
+    );
+
+    // koma's additive failure text on a non-`done` status is captured verbatim.
+    let (tx, rx) = channel();
+    on_event(
+        "agents.done",
+        json!({ "agentId": 7, "status": "error", "error": "model call failed" }),
+        &tx,
+    );
+    assert_eq!(
+        recv_event(&rx),
+        HostEvent::AgentsDone {
+            agent_id: 7,
+            status: "error".to_string(),
+            error: Some("model call failed".to_string()),
+        }
+    );
 }
 
 #[test]

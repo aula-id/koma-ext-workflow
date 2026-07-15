@@ -159,8 +159,11 @@ pub enum HostEvent {
         agent_id: u64,
         spawned_at_ms: u64,
     },
-    /// A sub-agent reached a terminal host status (`done`/`error`/`killed`).
-    AgentsDone { agent_id: u64, status: String },
+    /// A sub-agent reached a terminal host status (`done`/`error`/`killed`). `error` is the
+    /// optional additive failure text koma now sends alongside a non-`done` status (feature C);
+    /// `None` when absent (old komas) or on the driver's own `agents.status`-poll path, so the
+    /// event shape stays back-compatible.
+    AgentsDone { agent_id: u64, status: String, error: Option<String> },
     /// The driver fetched a terminal agent's report/review text.
     Result { agent_id: u64, text: String },
     /// A `Spawn` effect failed before producing any report.
@@ -1137,7 +1140,9 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
             agent_id,
             spawned_at_ms,
         } => on_spawned(p, &task, agent_id, spawned_at_ms, now_ms, ctx),
-        HostEvent::AgentsDone { agent_id, status } => on_agents_done(p, agent_id, &status, now_ms, ctx),
+        HostEvent::AgentsDone { agent_id, status, error } => {
+            on_agents_done(p, agent_id, &status, error.as_deref(), now_ms, ctx)
+        }
         HostEvent::Result { agent_id, text } => on_result(p, agent_id, text, now_ms, ctx),
         HostEvent::SpawnFailed { task, reason } => on_spawn_failed(p, &task, reason, now_ms, ctx),
         HostEvent::ResearchSpawned { agent_id, spawned_at_ms } => {
@@ -1173,10 +1178,21 @@ fn on_spawned(p: &mut Project, task: &TaskId, agent_id: u64, spawned_at_ms: u64,
     }
 }
 
+/// Build a binding-failure reason from a terminal `status` plus koma's optional additive
+/// `error` text (feature C): `"<who> <status>: <error>"` when error text is present, else
+/// `"<who> <status>"` (old komas, and the driver's own `agents.status`-poll path, send none).
+fn degrade_reason(who: &str, status: &str, error: Option<&str>) -> String {
+    match error {
+        Some(e) if !e.is_empty() => format!("{who} {status}: {e}"),
+        _ => format!("{who} {status}"),
+    }
+}
+
 /// Terminal host status. `done` -> fetch the report (no state change yet);
 /// `error`/`killed`/anything else -> re-queue the task (worker -> Todo attempt++,
-/// reviewer -> Review{None}).
-fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx: &mut Ctx) {
+/// reviewer -> Review{None}). `error` is koma's optional failure text, folded into the
+/// project-level research/audit degrade reason when present.
+fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, error: Option<&str>, now_ms: u64, ctx: &mut Ctx) {
     // Research binding (6.2b) is project-level, checked before the task bindings. `done` ->
     // fetch the findings (existing FetchResult path); anything else is a dead researcher and
     // degrades exactly like a spawn failure (never wedges Drafting).
@@ -1184,7 +1200,7 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx
         if status.eq_ignore_ascii_case("done") {
             ctx.fx.push(Effect::FetchResult { ext_agent_id: agent_id });
         } else {
-            research_degrade(p, format!("researcher {status}"), now_ms, ctx);
+            research_degrade(p, degrade_reason("researcher", status, error), now_ms, ctx);
         }
         return;
     }
@@ -1194,7 +1210,7 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx
         if status.eq_ignore_ascii_case("done") {
             ctx.fx.push(Effect::FetchResult { ext_agent_id: agent_id });
         } else {
-            audit_degrade(p, format!("auditor {status}"), now_ms, ctx);
+            audit_degrade(p, degrade_reason("auditor", status, error), now_ms, ctx);
         }
         return;
     }

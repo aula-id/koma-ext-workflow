@@ -675,6 +675,7 @@ fn full_task_lifecycle_effect_sequence() {
         Input::Host(HostEvent::AgentsDone {
             agent_id: 10,
             status: "done".into(),
+            error: None,
         }),
         1500,
         4,
@@ -705,6 +706,7 @@ fn full_task_lifecycle_effect_sequence() {
         Input::Host(HostEvent::AgentsDone {
             agent_id: 11,
             status: "done".into(),
+            error: None,
         }),
         2500,
         4,
@@ -822,6 +824,7 @@ fn worker_error_requeues_with_attempt_increment() {
         Input::Host(HostEvent::AgentsDone {
             agent_id: 6,
             status: "error".into(),
+            error: None,
         }),
         1000,
         0, // cap 0: observe Todo before re-dispatch
@@ -1368,7 +1371,7 @@ fn prd_capture_spawns_research_and_defers_breakdown() {
 fn research_done_status_fetches_the_findings() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.research = Some(researcher_binding(55, 1000));
-    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 55, status: "done".into() }), 2000, 4);
+    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 55, status: "done".into(), error: None }), 2000, 4);
     assert_eq!(fx, vec![Effect::FetchResult { ext_agent_id: 55 }]);
 }
 
@@ -1719,7 +1722,7 @@ fn audit_done_status_fetches_the_verdict() {
     let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
     p.crd_markdown = "# CRD".into();
     p.audit = Some(auditor_binding(50, 100));
-    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "done".into() }), 2000, 4);
+    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "done".into(), error: None }), 2000, 4);
     assert_eq!(fx, vec![Effect::FetchResult { ext_agent_id: 50 }]);
 }
 
@@ -1819,7 +1822,7 @@ fn dead_auditor_degrades_to_done() {
     let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
     p.crd_markdown = "# CRD".into();
     p.audit = Some(auditor_binding(50, 100));
-    step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "killed".into() }), 2000, 4);
+    step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "killed".into(), error: None }), 2000, 4);
     assert!(matches!(p.phase, ProjectPhase::Done { .. }));
     assert!(p.audit.is_none());
     assert!(p.outbox.iter().any(|n| n.text.contains("audit skipped")));
