@@ -251,7 +251,7 @@ dependencies = [
 [[package]]
 name = "koma-extension"
 version = "0.0.0"
-source = "git+ssh://git@github.com/aula-id/koma.git?branch=main#be5ee881c71ab2df32e268e031e6a254c053a11c"
+source = "git+ssh://git@github.com/aula-id/koma.git?branch=main#3ac5243000a0efdcff19a4002f702fd8b2d3548d"
 dependencies = [
  "serde",
  "serde_json",

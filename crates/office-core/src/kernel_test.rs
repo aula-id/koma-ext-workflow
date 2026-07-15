@@ -418,6 +418,187 @@ fn pending_comment_stays_pending_through_first_try_done() {
 }
 
 // ---------------------------------------------------------------------------
+// Mid-run comment injection (feature 4): a comment added to a task with a LIVE binding is
+// pushed to the running agent via `agents.send` (Effect::InjectComment); the receipt flips
+// Pending -> Delivered ONLY when the driver confirms with HostEvent::CommentDelivered.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn live_worker_comment_emits_inject_and_delivers_on_success_event() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task(
+            "t1",
+            TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 },
+            0,
+            &[],
+        )],
+    );
+    let fx = step(
+        &mut p,
+        Input::Command(Command::AddComment {
+            task: TaskId("t1".into()),
+            author: CommentAuthor::User,
+            text: "watch the race".into(),
+        }),
+        100,
+        0, // cap 0: no dispatch churn, isolate the injection behavior
+    );
+    let cid = find_task(&p, "t1").comments[0].id;
+    // The comment is pushed to the live worker (id 7), framed with its id + ack instruction.
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::InjectComment { ext_agent_id: 7, comment_id, text }
+            if *comment_id == cid
+                && text.contains("watch the race")
+                && text.contains(&format!("c{}", cid.0))
+                && text.contains("OFFICE-REPORT")
+    )));
+    // Emission alone does not deliver: the receipt waits for the driver's success event.
+    assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Pending));
+
+    // Driver reports `agents.send` succeeded -> Delivered.
+    step(
+        &mut p,
+        Input::Host(HostEvent::CommentDelivered { task: TaskId("t1".into()), comment_id: cid }),
+        200,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Delivered { .. }));
+}
+
+#[test]
+fn live_reviewer_comment_emits_inject_to_reviewer_agent() {
+    // A `Review` state with a spawned reviewer binding is also a live target.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task(
+            "t1",
+            TaskState::Review { binding: Some(reviewer_binding(9, 0)), attempt: 1 },
+            0,
+            &[],
+        )],
+    );
+    let fx = step(
+        &mut p,
+        Input::Command(Command::AddComment {
+            task: TaskId("t1".into()),
+            author: CommentAuthor::User,
+            text: "double-check the edge case".into(),
+        }),
+        100,
+        0,
+    );
+    assert!(fx.iter().any(|e| matches!(e, Effect::InjectComment { ext_agent_id: 9, .. })));
+}
+
+#[test]
+fn live_comment_without_delivery_event_stays_pending() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task(
+            "t1",
+            TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 },
+            0,
+            &[],
+        )],
+    );
+    let fx = step(
+        &mut p,
+        Input::Command(Command::AddComment {
+            task: TaskId("t1".into()),
+            author: CommentAuthor::User,
+            text: "note".into(),
+        }),
+        100,
+        0,
+    );
+    assert!(fx.iter().any(|e| matches!(e, Effect::InjectComment { ext_agent_id: 7, .. })));
+    // No CommentDelivered fed (an `agents.send` error path) -> stays Pending.
+    assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Pending));
+    // A CommentDelivered for a DIFFERENT (unknown) comment id is a no-op.
+    step(
+        &mut p,
+        Input::Host(HostEvent::CommentDelivered {
+            task: TaskId("t1".into()),
+            comment_id: CommentId(999),
+        }),
+        150,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Pending));
+}
+
+#[test]
+fn comment_without_live_binding_emits_no_inject() {
+    // Todo (no binding), Review{None} (no reviewer yet), and a PROVISIONAL worker binding
+    // (id 0, spawn not yet acked) all lack a reachable agent: AddComment must not emit an
+    // InjectComment, and the comment simply waits Pending for the spawn-boundary fold.
+    for state in [
+        TaskState::Todo,
+        TaskState::Review { binding: None, attempt: 1 },
+        TaskState::OnProgress { binding: worker_binding(0, 0), attempt: 1 },
+    ] {
+        let mut p = project(ProjectPhase::Running, vec![task("t1", state, 0, &[])]);
+        let fx = step(
+            &mut p,
+            Input::Command(Command::AddComment {
+                task: TaskId("t1".into()),
+                author: CommentAuthor::User,
+                text: "n".into(),
+            }),
+            100,
+            0,
+        );
+        assert!(!fx.iter().any(|e| matches!(e, Effect::InjectComment { .. })));
+        assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Pending));
+    }
+}
+
+#[test]
+fn injected_comment_folds_at_next_spawn_when_delivery_never_confirmed() {
+    // Live-binding comment emits InjectComment, but if the driver never confirms delivery the
+    // receipt stays Pending — and the existing spawn-boundary fold still delivers it when the
+    // task bounces and re-dispatches a worker.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task(
+            "t1",
+            TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 },
+            0,
+            &[],
+        )],
+    );
+    step(
+        &mut p,
+        Input::Command(Command::AddComment {
+            task: TaskId("t1".into()),
+            author: CommentAuthor::User,
+            text: "note".into(),
+        }),
+        100,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Pending));
+
+    // Worker finishes -> Review (still Pending; no delivery event, no ack).
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 7, text: REPORT_OK.into() }), 200, 0);
+    assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Pending));
+
+    // Reviewer spawns, then FAILS -> the task bounces back to Todo and the same step
+    // re-dispatches a worker, whose spawn-boundary fold flips the still-Pending comment.
+    step(&mut p, Input::Host(HostEvent::Tick), 300, 4); // spawn reviewer (provisional)
+    step(
+        &mut p,
+        Input::Host(HostEvent::Spawned { task: TaskId("t1".into()), agent_id: 8, spawned_at_ms: 300 }),
+        300,
+        4,
+    );
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 8, text: REVIEW_FAIL.into() }), 400, 4);
+    assert!(matches!(find_task(&p, "t1").comments[0].receipt, Receipt::Delivered { .. }));
+}
+
+// ---------------------------------------------------------------------------
 // Desk layout (ARCHITECTURE.md 7.1): flat, human-readable, obviously-marked
 // ---------------------------------------------------------------------------
 

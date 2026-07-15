@@ -15,8 +15,8 @@
 //! wall clock once per iteration and threads it in.
 //!
 //! ## Off-loop work (deadlock rule, 5.1)
-//! `Koma::call` blocks up to 120s and `models.invoke` up to 25s; neither may stall
-//! the tick loop. The lease heartbeat runs on its OWN thread ([`heartbeat_owned`]) so
+//! `Koma::call` blocks up to 120s and `models.invoke` up to ~360s (wire cap
+//! `EXT_MODELS_CALL_TIMEOUT`; broker inner ~330s); neither may stall the tick loop. The lease heartbeat runs on its OWN thread ([`heartbeat_owned`]) so
 //! a slow host call can never age the lease past the 60s steal window (4.4, 5.6), and
 //! `InvokeModel` effects are handed to a worker pool in W9 (the kernel emits none in
 //! W7, so the effect arm here is a documented no-op).
@@ -30,7 +30,8 @@ use koma_extension::Koma;
 use office_core::digest::{context_blob, panel_snapshot};
 use office_core::office::{self, InvokePurpose};
 use office_core::{
-    kernel, CommentAuthor, Effect, Project, ProjectPhase, SnapshotMode, TaskId, TaskState,
+    kernel, CommentAuthor, CommentId, Effect, Project, ProjectPhase, SnapshotMode, TaskId,
+    TaskState,
 };
 use office_store::{lease, Lease, Store};
 use serde_json::{json, Value};
@@ -158,6 +159,10 @@ pub struct InvokeJob {
     pub prompt: String,
     /// Whether the one timeout retry has already been spent (5.1 / 6.2).
     pub retried: bool,
+    /// The `models.invoke` output format (feature 5), forwarded as the `format` param when
+    /// `Some` — the host maps `"json"` to a chat-completions `response_format: json_object`;
+    /// other dialects ignore it. `None` for the prose invokes (persona/TRD/CRD/fold).
+    pub format: Option<String>,
 }
 
 /// Runs an [`InvokeJob`] OFF the driver tick loop (5.1). Production spawns a worker thread
@@ -177,7 +182,7 @@ impl Invoker for NoopInvoker {
 }
 
 /// Production invoker: each `run` spawns a thread holding its own `try_clone`'d `Koma`,
-/// performs the 25s `models.invoke`, and posts the outcome back on `tx` as an
+/// performs the `models.invoke` (up to the ~330s broker-inner budget), and posts the outcome back on `tx` as an
 /// `InvokeDone` command. The driver's `INVOKE_POOL_CAP` bounds how many run at once.
 pub struct ThreadInvoker {
     koma: Koma,
@@ -201,6 +206,11 @@ impl Invoker for ThreadInvoker {
             }
             if !job.system.is_empty() {
                 params["system"] = json!(job.system);
+            }
+            // Feature 5: structured-output invokes ask for JSON; chat-completions dialects honor
+            // it (response_format json_object), others silently ignore it.
+            if let Some(fmt) = &job.format {
+                params["format"] = json!(fmt);
             }
             let reply = koma.call("models.invoke", params);
             let result = match reply.get("output").and_then(Value::as_str) {
@@ -729,6 +739,11 @@ impl<H: Host> Driver<H> {
                     self.host.call("agents.kill", json!({ "agentId": ext_agent_id }));
                 }
                 Effect::FetchResult { ext_agent_id } => self.fetch_result(idx, ext_agent_id, now_ms),
+                Effect::InjectComment {
+                    ext_agent_id,
+                    comment_id,
+                    text,
+                } => self.exec_inject_comment(idx, ext_agent_id, comment_id, text, now_ms),
                 Effect::QueueChatPrompt { .. } => {
                     // The notice is already durable in `project.outbox`; the tick's
                     // `drain_outbox` sends it under the 6.5 budget discipline.
@@ -751,8 +766,9 @@ impl<H: Host> Driver<H> {
                     role,
                     system,
                     prompt,
+                    format,
                     ..
-                } => self.submit_invoke(idx, purpose, role, system, prompt),
+                } => self.submit_invoke(idx, purpose, role, system, prompt, format),
             }
         }
     }
@@ -928,6 +944,40 @@ impl<H: Host> Driver<H> {
         );
     }
 
+    /// Execute an `InjectComment` (feature 4): push a mid-run board comment to a live sub-agent
+    /// via `agents.send`. On a success reply (`{"sent":true}` / `{"sent":true,"status":"queued"}`)
+    /// feed `CommentDelivered` back so the kernel flips the comment `Pending -> Delivered`. Any
+    /// error reply (agent terminal / unknown id / session closed) is swallowed: the comment stays
+    /// `Pending` and the existing spawn-boundary fold delivers it on the next attempt — one shot
+    /// per comment at add time, no retry loop.
+    fn exec_inject_comment(
+        &mut self,
+        idx: usize,
+        ext_agent_id: u64,
+        comment_id: CommentId,
+        text: String,
+        now_ms: u64,
+    ) {
+        // Resolve the owning task from the live binding so the success event can address it (a
+        // comment id is per-task, so the kernel needs the task to disambiguate). The binding was
+        // live when the kernel emitted this effect; guard against it having vanished since.
+        let task = match task_bound_to(&self.projects[idx].project, ext_agent_id) {
+            Some(t) => t.id.clone(),
+            None => return,
+        };
+        let reply = self.host.call(
+            "agents.send",
+            json!({ "agentId": ext_agent_id, "message": text }),
+        );
+        if reply.get("sent").and_then(Value::as_bool) == Some(true) {
+            self.step(
+                idx,
+                kernel::Input::Host(kernel::HostEvent::CommentDelivered { task, comment_id }),
+                now_ms,
+            );
+        }
+    }
+
     // -- front office (6.2 / 6.3) ------------------------------------------
 
     /// Resolve the project a `workflow_brief` targets: an explicit id, or (when absent)
@@ -1100,8 +1150,16 @@ impl<H: Host> Driver<H> {
 
     /// Register a new invoke job and start it if a pool slot is free (else queue it). The
     /// job runs OFF the tick loop, so dispatch/reconcile/heartbeat/panel-reads stay
-    /// responsive through the 25-125s of a PRD/breakdown flow.
-    fn submit_invoke(&mut self, idx: usize, purpose: InvokePurpose, role: String, system: String, prompt: String) {
+    /// responsive through the (up to several-minute) PRD/breakdown flow.
+    fn submit_invoke(
+        &mut self,
+        idx: usize,
+        purpose: InvokePurpose,
+        role: String,
+        system: String,
+        prompt: String,
+        format: Option<&'static str>,
+    ) {
         self.next_req_id += 1;
         let req_id = self.next_req_id;
         let job = InvokeJob {
@@ -1112,6 +1170,7 @@ impl<H: Host> Driver<H> {
             system,
             prompt,
             retried: false,
+            format: format.map(str::to_string),
         };
         self.invoke_pending.insert(req_id, job);
         self.start_or_queue_invoke(req_id);
@@ -1635,8 +1694,8 @@ fn is_terminal(status: &str) -> bool {
     matches!(status, "done" | "error" | "killed")
 }
 
-/// Whether an invoke error string is the host's 25s-budget timeout (`model call timed
-/// out`, EXTENSIONS.md:444) — the one class the driver retries exactly once (5.1 / 6.2).
+/// Whether an invoke error string is the host's model-call timeout (`model call timed
+/// out`; broker inner 330s, wire cap 360s) — the one class the driver retries exactly once (5.1 / 6.2).
 fn is_invoke_timeout(err: &str) -> bool {
     err.contains("timed out") || err.contains("timeout")
 }

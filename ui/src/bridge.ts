@@ -1,3 +1,5 @@
+import type { HostThemePayload } from './theme';
+
 export interface Snapshot {
   kind: 'snapshot';
   seq: number;
@@ -91,6 +93,50 @@ export class Bridge {
         this.listeners.splice(idx, 1);
       }
     };
+  }
+
+  /**
+   * Subscribe to koma host theme changes (koma 0.3.0). Delegates to `window.KomaPanel.onTheme`,
+   * the dedicated theme channel in koma-panel.js — theme pushes ride a distinct `kind:"theme"`
+   * envelope, NOT the `onPush` snapshot channel, so they never collide with board snapshots. A
+   * host/mock without the theme channel (standalone or the mock harness) is a silent no-op, so
+   * the panel keeps its manual dark/light toggle. Fires immediately with the current theme if one
+   * has already arrived. Returns a no-op unsubscribe (koma-panel.js has no off).
+   */
+  onTheme(listener: (payload: HostThemePayload) => void): () => void {
+    const kp = window.KomaPanel;
+    if (kp && typeof kp.onTheme === 'function') {
+      kp.onTheme((payload: any) => {
+        try {
+          listener(payload as HostThemePayload);
+        } catch (error) {
+          console.error('Theme listener error:', error);
+        }
+      });
+    }
+    return () => {};
+  }
+
+  /**
+   * Query the host for the current theme (koma 0.3.0), resolving `null` when no host theme is
+   * available (standalone / mock / a host build without the theme channel) so callers keep the
+   * manual toggle. Delegates to `window.KomaPanel.getTheme`, which sends the `kind:"theme?"`
+   * query and resolves the reply's `payload`.
+   */
+  async getTheme(): Promise<HostThemePayload | null> {
+    const kp = window.KomaPanel;
+    if (!kp || typeof kp.getTheme !== 'function') {
+      return null;
+    }
+    try {
+      const payload = await kp.getTheme();
+      if (payload && payload.palette) {
+        return payload as HostThemePayload;
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   private notifyListeners(snapshot: Snapshot): void {

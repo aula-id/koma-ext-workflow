@@ -16,10 +16,12 @@
  *   - flat minimalist: sections separate by whitespace + hairline rules,
  *     full boxes ONLY for contained things (kanban cards, code blocks)
  *
- * The host does not push --koma-* vars into extension panels, so the default
- * dark values (#0b0e14 / #c8d3f5) and light values (#fafaf6 / #141414) are
- * pinned here. If a host theme channel ever appears, only --wf-bg/--wf-fg
- * need to move.
+ * These pinned dark (#0b0e14 / #c8d3f5) and light (#fafaf6 / #141414) values are
+ * the STANDALONE fallback — no koma host, or the mock harness. When koma is present
+ * it pushes a live palette over the 0.3.0 theme channel; theme.ts `applyHostPalette`
+ * then overrides --wf-bg/--wf-fg/--wf-accent/--wf-dim/--wf-panel + the status roles
+ * inline on <html>, and the derived surfaces below color-mix off the new bg/fg so
+ * they follow automatically.
  *
  * No component may declare a literal hex/rgb/hsl for anything these roles
  * cover — new colors belong here as tokens.

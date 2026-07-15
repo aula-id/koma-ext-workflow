@@ -13,6 +13,15 @@ use std::path::Path;
 /// < 12 KB"). Per-field caps below are sized so a worst-case call stays under this.
 pub const PROMPT_TARGET_CAP: usize = 12 * 1024;
 
+/// Loop guard appended to the worker/reviewer spawn prompts (feature 2): koma auto-inherits the
+/// human's `mcp__*` tools onto every spawned sub-agent with no opt-out, so a worker/reviewer that
+/// called `mcp__workflow__*` could spawn/authorize projects recursively. The prompt tells the
+/// agent those tools do not exist. Mirrored in each sub-agent's manifest `prompt` (the
+/// system-level copy of this guard); see ARCHITECTURE.md's "Recursion guard".
+const MCP_LOOP_GUARD: &str = "You may see mcp__workflow__* tools. NEVER call them — they belong \
+to the human's main agent; calling them can create runaway projects. Treat them as if they do \
+not exist.";
+
 const CAP_TITLE: usize = 200;
 const CAP_INTENT: usize = 300;
 const CAP_DESCRIPTION: usize = 2500;
@@ -163,6 +172,10 @@ pub fn worker(
          blocked-reason: <only when status: blocked — what a human must decide>\n",
     );
 
+    out.push('\n');
+    out.push_str(MCP_LOOP_GUARD);
+    out.push('\n');
+
     out
 }
 
@@ -219,6 +232,10 @@ pub fn reviewer(
          verdict: pass | fail\n\
          reasons: <numbered, tied to criteria; required on fail>\n",
     );
+
+    out.push('\n');
+    out.push_str(MCP_LOOP_GUARD);
+    out.push('\n');
 
     out
 }

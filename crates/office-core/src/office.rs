@@ -10,8 +10,9 @@
 //! stateless text oracle the driver calls.
 //!
 //! ## Multi-turn on a single-shot API (6.2)
-//! `models.invoke` is `system`+`prompt` only (no messages array), 32KB prompt cap, 25s
-//! budget. We rebuild multi-turn ourselves: `office_summary` (rolling) + the newest
+//! `models.invoke` is `system`+`prompt` only (no messages array), 32KB prompt cap, and a
+//! ~330s broker-inner / 360s wire budget (wire.rs `EXT_MODELS_CALL_TIMEOUT`). We rebuild
+//! multi-turn ourselves: `office_summary` (rolling) + the newest
 //! transcript turns + the output contract. When the assembled prompt would cross
 //! [`FOLD_THRESHOLD`], the kernel first issues a summarize invoke ([`build_fold`]) that
 //! compresses the oldest half into `office_summary` ([`apply_fold`]), then re-issues the

@@ -4,6 +4,7 @@ import { createRoot, Root } from 'react-dom/client';
 import { useStore } from '../store';
 import Settings, { clampMaxWorkers } from './Settings';
 import { bridge } from '../bridge';
+import { themeManager } from '../theme';
 
 // Regression: this file used to test a copy-pasted reimplementation of
 // `clampMaxWorkers` and a hand-built `config_set` payload object — neither of which
@@ -91,6 +92,9 @@ describe('Settings (real component, rendered)', () => {
 
   beforeEach(() => {
     (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+    // Start every case with no host theme so the manual toggle vs. "following koma theme"
+    // branch is deterministic (the themeManager singleton persists across tests in this file).
+    themeManager.clearHostPalette();
     useStore.setState({ snapshot: null, projects: [] });
     vi.mocked(bridge.send).mockReset();
     vi.mocked(bridge.send).mockResolvedValue({ ok: true, accepted: true });
@@ -206,6 +210,44 @@ describe('Settings (real component, rendered)', () => {
     vi.mocked(bridge.send).mockResolvedValueOnce({ error: 'grant denied: config_set' });
     await submitForm();
     expect(container.textContent).toContain('Access denied');
+  });
+
+  it('shows "following koma theme" instead of the manual toggle when a host theme is active (koma 0.3.0)', () => {
+    themeManager.applyHostPalette({
+      palette: {
+        bg: '#101418',
+        fg: '#e6edf3',
+        accent: '#7ee787',
+        dim: '#8b949e',
+        panel: '#161b22',
+        warn: '#d29922',
+        success: '#3fb950',
+        info: '#58a6ff',
+        error: '#f85149',
+      },
+      name: 'gruvbox',
+      dark: true,
+    });
+    seedProject();
+    renderSettings();
+
+    const following = container.querySelector('[data-testid="settings-following-koma-theme"]');
+    expect(following).toBeTruthy();
+    expect(following?.textContent).toContain('following koma theme (gruvbox)');
+    // The manual dark/light toggle buttons are replaced by the following-koma line.
+    const buttonLabels = Array.from(container.querySelectorAll('button')).map((b) => b.textContent);
+    expect(buttonLabels).not.toContain('dark');
+    expect(buttonLabels).not.toContain('light');
+  });
+
+  it('shows the manual dark/light toggle when no host theme is active (standalone / mock)', () => {
+    seedProject();
+    renderSettings();
+
+    expect(container.querySelector('[data-testid="settings-following-koma-theme"]')).toBeFalsy();
+    const buttonLabels = Array.from(container.querySelectorAll('button')).map((b) => b.textContent);
+    expect(buttonLabels).toContain('dark');
+    expect(buttonLabels).toContain('light');
   });
 
   describe('danger zone: delete project', () => {

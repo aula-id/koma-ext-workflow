@@ -177,6 +177,11 @@ pub enum HostEvent {
     /// a cross-process `{status:"sent"}` reply, a dead/killed auditor, or the runtime ceiling
     /// (6.2c). The project degrades to Done WITHOUT an audit (never wedges completion).
     AuditFailed { reason: String },
+    /// The driver's `agents.send` for a mid-run comment injection (feature 4) succeeded
+    /// (`{"sent":true}` / `{"sent":true,"status":"queued"}`). Flips that comment's receipt
+    /// `Pending -> Delivered`. Only emitted on success; an `agents.send` error produces no
+    /// event, leaving the comment `Pending` for the spawn-boundary fold to deliver later.
+    CommentDelivered { task: TaskId, comment_id: CommentId },
 }
 
 /// Side effects for the driver to execute. `InvokeModel`/`PublishContext` are part
@@ -210,12 +215,31 @@ pub enum Effect {
     FetchResult {
         ext_agent_id: u64,
     },
+    /// Deliver a board comment to a LIVE sub-agent mid-run via the host `agents.send` verb
+    /// (feature 4). Emitted by `AddComment` only when the task carries a real (non-provisional)
+    /// binding — an in-flight worker (`OnProgress`) or a spawned reviewer (`Review` with a
+    /// reviewer binding). `text` is the framed injection line the agent acks in its report. The
+    /// comment stays `Pending` until the driver reports the send succeeded (feeding back
+    /// `HostEvent::CommentDelivered`); on any `agents.send` error the driver drops it and the
+    /// existing spawn-boundary fold (`spawn_worker`) delivers it on the next attempt — one shot
+    /// per comment at add time, no retry loop.
+    InjectComment {
+        ext_agent_id: u64,
+        comment_id: CommentId,
+        text: String,
+    },
     InvokeModel {
         req_id: u64,
         purpose: InvokePurpose,
         role: String,
         system: String,
         prompt: String,
+        /// The `models.invoke` output format (feature 5): `Some("json")` for the structured
+        /// invokes (breakdown family + assume-check gate) maps host-side to a chat-completions
+        /// `response_format: json_object`; other dialects silently ignore it. `None` for the
+        /// prose invokes (persona/TRD/CRD/fold). Set by [`invoke_format`]; the driver forwards it
+        /// as the `models.invoke` `format` param only when `Some`.
+        format: Option<&'static str>,
     },
     PublishContext {
         text: String,
@@ -321,6 +345,21 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                         .unwrap_or(0)
                         + 1,
                 );
+                // If the task carries a LIVE (real-id) binding, push the comment to the running
+                // agent mid-run via `agents.send` (feature 4). Built BEFORE the comment is moved
+                // so the frame can borrow `text`. A provisional (id 0) or bindingless state has no
+                // reachable agent -> None, and the comment waits Pending for the spawn-boundary
+                // fold instead.
+                let inject = live_binding_id(&p.tasks[idx].state).map(|ext_agent_id| {
+                    Effect::InjectComment {
+                        ext_agent_id,
+                        comment_id: id,
+                        text: format!(
+                            "[user comment c{}] {}\nAcknowledge in your OFFICE-REPORT ack-comments.",
+                            id.0, text
+                        ),
+                    }
+                });
                 p.tasks[idx].comments.push(Comment {
                     id,
                     author,
@@ -328,6 +367,9 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                     created_ms: now_ms,
                     receipt: Receipt::Pending,
                 });
+                if let Some(fx) = inject {
+                    ctx.fx.push(fx);
+                }
                 ctx.dirty = true;
             }
         }
@@ -976,7 +1018,8 @@ fn surface_compact_breakdown_failure(p: &mut Project, now_ms: u64, base: String,
     ctx.dirty = true;
 }
 
-/// Whether a breakdown invoke error string is the host's 25s-budget timeout — the one class
+/// Whether a breakdown invoke error string is the host's model-call timeout (broker inner 330s
+/// / wire 360s, wire.rs `EXT_MODELS_CALL_TIMEOUT`) — the one class
 /// [`handle_breakdown_result`] falls back to a compact attempt for. Mirrors the driver's own
 /// `is_invoke_timeout` (`office-daemon/driver.rs`), duplicated here since the kernel crate
 /// has no dependency on the daemon crate.
@@ -994,7 +1037,28 @@ fn emit_invoke(ctx: &mut Ctx, purpose: InvokePurpose, role: &str, system: String
         role: role.to_string(),
         system,
         prompt,
+        format: invoke_format(purpose),
     });
+}
+
+/// The `models.invoke` output format for a purpose (feature 5). `Some("json")` for the
+/// structured-output invokes — the breakdown family (a JSON plan) and the assume-check gate —
+/// which the host maps to a chat-completions `response_format: json_object` (other dialects
+/// ignore it). `None` for the prose/markdown invokes (persona, TRD, CRD, fold). Note: the
+/// assume-check prompt still emits its `ASSUME-CHECK` text block, and the safeguard fails OPEN
+/// on an unparseable result, so a dialect that honors json mode there degrades safely.
+fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
+    match purpose {
+        InvokePurpose::Breakdown
+        | InvokePurpose::BreakdownReask
+        | InvokePurpose::BreakdownCompact
+        | InvokePurpose::AssumeCheckPrd
+        | InvokePurpose::AssumeCheckTrd
+        | InvokePurpose::AssumeCheckCrd => Some("json"),
+        InvokePurpose::Persona | InvokePurpose::Trd | InvokePurpose::Crd | InvokePurpose::Fold => {
+            None
+        }
+    }
 }
 
 /// Hard interrupt (default): stop dispatch, kill every tracked binding, normalize
@@ -1073,6 +1137,9 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
             on_audit_spawned(p, agent_id, spawned_at_ms, ctx)
         }
         HostEvent::AuditFailed { reason } => audit_degrade(p, reason, now_ms, ctx),
+        HostEvent::CommentDelivered { task, comment_id } => {
+            on_comment_delivered(p, &task, comment_id, now_ms, ctx)
+        }
     }
 }
 
@@ -1808,6 +1875,44 @@ fn apply_acks(t: &mut Task, ids: &[CommentId], now_ms: u64) {
         if let Some(c) = t.comments.iter_mut().find(|c| &c.id == id) {
             if matches!(c.receipt, Receipt::Delivered { .. }) {
                 c.receipt = Receipt::Read { at_ms: now_ms };
+            }
+        }
+    }
+}
+
+/// The real (non-provisional) ext agent id a comment can be pushed to mid-run via `agents.send`
+/// (feature 4), if this state carries a LIVE binding: an in-flight worker (`OnProgress`) or a
+/// spawned reviewer (`Review` with a reviewer binding). A provisional binding (id `PROVISIONAL`,
+/// spawn not yet acked) or any bindingless state yields `None` — the comment then waits `Pending`
+/// for the spawn-boundary fold to deliver on the next spawn.
+fn live_binding_id(state: &TaskState) -> Option<u64> {
+    match state {
+        TaskState::OnProgress { binding, .. } if binding.ext_agent_id != PROVISIONAL => {
+            Some(binding.ext_agent_id)
+        }
+        TaskState::Review { binding: Some(b), .. } if b.ext_agent_id != PROVISIONAL => {
+            Some(b.ext_agent_id)
+        }
+        _ => None,
+    }
+}
+
+/// Apply a `CommentDelivered` host event (feature 4): the driver's `agents.send` for this comment
+/// succeeded, so flip its receipt `Pending -> Delivered`. Only from `Pending` — a comment already
+/// `Read` (acked) or `Delivered` is left untouched (never downgrade a read receipt, never
+/// re-timestamp). An unknown task/comment id is a silent no-op.
+fn on_comment_delivered(
+    p: &mut Project,
+    task: &TaskId,
+    comment_id: CommentId,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    if let Some(idx) = find_task(p, task) {
+        if let Some(c) = p.tasks[idx].comments.iter_mut().find(|c| c.id == comment_id) {
+            if matches!(c.receipt, Receipt::Pending) {
+                c.receipt = Receipt::Delivered { at_ms: now_ms };
+                ctx.dirty = true;
             }
         }
     }

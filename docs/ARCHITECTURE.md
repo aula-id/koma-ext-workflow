@@ -14,7 +14,7 @@ Design principles (locked):
   the worker/reviewer sub-agents are the only token spenders.
 - Everything resumable. Durable state survives extension restart AND koma restart.
 - Respect every host cap: context.set 8KB, chat.prompt 16KB + queue 5 + turn budget 10,
-  models.invoke 32KB/25s, panel push 1MiB, panel->host 256KiB, wire frame 4MiB fatal.
+  models.invoke 32KB/~360s (wire) budget, panel push 1MiB, panel->host 256KiB, wire frame 4MiB fatal.
 - No emoji anywhere. Tests in `*_test.rs` files.
 
 ---
@@ -353,6 +353,13 @@ open question; store.rs has none). The root is announced in the panel and in
       lease.json                   # dispatch ownership (4.4)
 ```
 
+**Manifest `workspace_dir` (koma 0.3.0)**: `manifest.json` declares top-level
+`"workspace_dir": "~/.koma-workflow"` (a sibling of `requires`). This announces the extension's
+file-tool containment root to the host, which koma validates host-side (policy). It intentionally
+matches the state root above, so the daemon's file operations stay contained to `~/.koma-workflow/`
+rather than leaking into `~` or the `remove_dir_all`'d install dir. It is purely additive — older
+hosts ignore the key.
+
 ### 4.2 Atomic writes, versioned schema
 
 - Every `state.json` write: serialize -> write `state.json.tmp` -> `fsync` -> atomic
@@ -457,7 +464,7 @@ rehydrate) use a `try_clone`'d handle for write-only `panel_push` — handler-sa
 sdk.rs:220-239.
 
 **Blocking calls must not run inline on the tick loop.** `Koma::call` blocks up to 120s
-(sdk.rs:560) and `models.invoke` up to its 25s internal budget (broker.rs:1026); a single
+(sdk.rs:560) and `models.invoke` up to its ~330s broker-inner / 360s wire budget (koma 0.3.0, wire.rs `EXT_MODELS_CALL_TIMEOUT`); a single
 slow call parked in the tick loop would stall dispatch, the 30s reconcile, the 10s lease
 heartbeat, AND every 100ms panel-read oneshot (section 11). The driver therefore owns two
 extra `try_clone`'d handles (sdk.rs:220 — the SDK primitive we already use for `panel_push`)
@@ -465,9 +472,10 @@ and offloads the two dangerous classes of call:
 
 - **Invoke worker pool**: an `InvokeModel` effect is NOT executed inline. The driver dispatches
   it to a small bounded worker pool (default 2 concurrent, capped) that each own a `try_clone`'d
-  `Koma`; the worker runs the 25s `models.invoke` and feeds the result back to the kernel as a
-  `Command::InvokeResult { req_id, ... }` on `CMD_TX`. The tick loop, reconcile, and panel-read
-  oneshots stay responsive during the 25-125s of a multi-invoke PRD authoring flow (6.2-6.3).
+  `Koma`; the worker runs the `models.invoke` (up to the ~330s broker-inner budget) and feeds the
+  result back to the kernel as a `Command::InvokeResult { req_id, ... }` on `CMD_TX`. The tick loop,
+  reconcile, and panel-read oneshots stay responsive during the (up to several-minute) multi-invoke
+  PRD authoring flow (6.2-6.3).
   This is what "NO LLM in the control loop" (design principle) means concretely: the kernel
   emits invoke *requests* and consumes invoke *results* as ordinary commands; it never blocks
   on a model. Nothing is lost if the driver is mid-tick when a result arrives — it buffers on
@@ -664,8 +672,8 @@ Channels, in order of reliability:
 
 ### 6.2 Persona over `models.invoke` (multi-turn on a single-shot API)
 
-`models.invoke` is prompt+system only, no messages array, 32KB prompt, 25s internal
-budget (broker.rs:934-1038). Multi-turn is reconstructed by the extension:
+`models.invoke` is prompt+system only, no messages array, 32KB prompt, and a ~330s broker-inner /
+360s wire budget (koma 0.3.0, wire.rs `EXT_MODELS_CALL_TIMEOUT`). Multi-turn is reconstructed by the extension:
 
 - `Project.office_transcript` holds `ChatMsg { who: User|Office, text }`.
 - Each call builds: `system` = office persona (fixed text: senior delivery manager,
@@ -679,8 +687,8 @@ budget (broker.rs:934-1038). Multi-turn is reconstructed by the extension:
   and additionally guarded by a hard truncate.
 - Every `models.invoke` here — persona reply, the 2-4 PRD-authoring calls, the breakdown call,
   and the fold summarize call — is emitted by the kernel as an `InvokeModel` effect and executed
-  on the invoke worker pool (5.1), NEVER inline on the driver tick loop. A PRD flow is 25-125s of
-  blocking that would otherwise freeze dispatch, reconcile, the heartbeat, and the 100ms
+  on the invoke worker pool (5.1), NEVER inline on the driver tick loop. A PRD flow is up to several
+  minutes of blocking that would otherwise freeze dispatch, reconcile, the heartbeat, and the 100ms
   panel-read oneshots; running it off the driver is what keeps "NO LLM in the control loop"
   literally true. Results return as `Command::InvokeResult` on `CMD_TX`.
 - Timeouts (`model call timed out`) -> one retry (re-emitted as a fresh `InvokeModel`), then
@@ -768,7 +776,7 @@ are non-empty + `pending_assumptions` + `assumption_check` (see the kernel.rs pi
 
 1. **Drafting**: user talks to the office (panel chat / workflow_brief / inbox). Office
    asks questions, negotiates scope. On "write the PRD", the extension drives 2-4
-   invokes (outline, then sections — each under the 25s budget) and stores `prd_markdown`.
+   invokes (outline, then sections — each within the models.invoke budget) and stores `prd_markdown`.
 2. **Breakdown**: office is asked (one invoke, JSON output contract) for epics/stories/
    tasks with `blocked_by` edges, acceptance criteria, priorities. The kernel VALIDATES:
    parse (one re-ask on failure with the parse error quoted), slug uniqueness, DAG
@@ -982,7 +990,7 @@ uppercase drift).
 | User edits board mid-flight | all mutations arrive as `Command`s through the same kernel queue | applied between transactions; moving a Running card asks "kill the worker?" in the panel; DAG edits re-validate acyclicity before commit; a Running task cannot be deleted, only interrupted. |
 | Two koma sessions racing | per-project lease + flock (4.4) | non-holders are read-only (+comments); stale lease (60s) is stolen; `spawn_into` returning `"sent"` = binding moved, lease released. |
 | Panel push dropped (256-entry outbox drop-oldest, closed tab) | pushes are full snapshots with `seq` | panel detects `seq` gap irrelevance (snapshot replaces state); on load/reload it rehydrates via request/reply. Deltas are never trusted for state (10.3). |
-| Office LLM timeout / garbage JSON | 25s budget error string; parse failure | one retry / one re-ask with the error quoted; then surface to user. The kernel never blocks on the LLM. |
+| Office LLM timeout / garbage JSON | model-call timeout error string; parse failure | one retry / one re-ask with the error quoted; then surface to user. The kernel never blocks on the LLM. |
 | chat.prompt budget exhausted | error string (only signal, verified) | outbox PAUSED until next `agent.turn_end`; panel remains authoritative. |
 | Delivery path deleted mid-run | spawn-time `mkdir -p` + per-dispatch existence check | dispatch pauses with panel alert "delivery path missing", phase untouched. |
 
@@ -1147,10 +1155,15 @@ model as `mcp__<sanitized aula.workflow>__workflow_*`.
 5. **Worker file tools are confined to the session workspace** (tool/mod.rs:283). Delivery
    path and desks must live inside it; `allow_outside_workspace` exists but relies on
    bash writes (subject to harness approval settings).
-6. **models.invoke is single-shot, 32KB, 25s** — long PRDs are built in multiple calls
-   and conversations are folded; a model that cannot answer in 25s cannot be the office.
-7. **No local install verb**: dev loop requires the manual registry edit (12) or a debug
-   build against the store's unsigned fallback.
+6. **models.invoke is single-shot, 32KB, ~330s broker-inner / 360s wire** (koma 0.3.0) — long PRDs
+   are built in multiple calls and conversations are folded; a model that cannot answer within the
+   budget cannot be the office. (The kernel also sets `format:"json"` on the breakdown/assume-check
+   invokes — chat-completions dialects honor it as JSON mode, others ignore it.)
+7. **Local install verb (RESOLVED, koma 0.3.0)**: `koma ext install --dev <zip>` sideloads the
+   unsigned build into `~/.koma/extensions/<id>/`, auto-grants `requires` (tier "dev", enabled),
+   and replaces the same id in place — `dev-install.sh` prefers it, falling back to the manual
+   registry edit (12) only when koma is not on PATH. The verb does NOT register the workflow-mcp
+   stdio server, so the script still upserts `.mcp_servers` itself in both paths.
 8. **No auto-restart after extension crash** (EXTENSIONS.md:790-792): with the GUI panel
    closed, the office stays down until koma restarts or the user opens the tab / an
    oauth/panel trigger fires. The line resumes cleanly but does not tick while down.
@@ -1172,3 +1185,90 @@ model as `mcp__<sanitized aula.workflow>__workflow_*`.
     N concurrently Running projects still cannot exceed 4 combined and one slot stays reserved
     for the user. A user burst can still queue office spawns (host queue keeps ids valid, so
     tracking survives).
+
+## 14. koma 0.3.0 host-API adoption
+
+Adopted additively when koma reached 0.3.0 (@3ac5243): every item below degrades cleanly on an
+older host (unknown manifest keys / verbs / params are ignored, extra prompt text is harmless).
+
+### 14.1 Manifest sub-agent tool allow-lists (`SubAgentDef.tools`)
+
+Each contributed sub-agent declares its own `tools` array in `manifest.json`, granted on install
+(koma `SubAgentDef.tools`; unknown names dropped + logged host-side; `task`/`task_send` hard-
+excluded; an empty list falls back to koma's read-only default):
+
+- `office-worker` — `read, grep, glob, write, edit, delete, bash, bash_output, bash_kill, cd, dir_list, checklist` (it builds).
+- `office-reviewer` — `read, grep, glob, bash, bash_output, dir_list` (read + verify only).
+- `office-researcher` — `read, grep, glob, web_search, web_fetch` (web research, no writes).
+- `office-auditor` — `read, grep, glob, bash, bash_output, dir_list` (read-only grading).
+
+### 14.2 Recursion guard
+
+**Residual risk.** koma 0.3.0 auto-inherits ALL of the human's `mcp__*` tools onto every spawned
+sub-agent, with no opt-out; koma only hard-excludes `task`/`task_send`. Our own MCP front door
+(`workflow-mcp`) is therefore visible to office workers/reviewers as `mcp__workflow__workflow_*`. A
+worker that called `mcp__workflow__workflow_brief`/`_authorize` could mint or authorize projects
+from inside a task — a runaway-project loop.
+
+**Mitigation (prompt-level, the only lever we have).** There is no host API to strip inherited MCP
+tools, so every sub-agent is told those tools do not exist. The guard lives in TWO places: the
+`prompt` of all four sub-agents in `manifest.json` (system-level, covers every run) AND the
+assembled worker/reviewer spawn prompts (`prompts.rs` `MCP_LOOP_GUARD`, reinforcing it per task).
+It is advisory — a sufficiently determined/confused model could still call the tool — but combined
+with the read-only researcher/auditor tool-sets and the office's own idempotent guards it makes an
+accidental loop unlikely. Prefer a real host opt-out if koma ever adds one.
+
+### 14.3 Silent completions (`ext_owned`) — host behavior
+
+Broker-spawned sub-agents are silenced in the human chat by koma's `SubAgent.ext_owned` flag (no
+"finished" fold note). We spawn via `sessions.spawn_into`, and koma sets `ext_owned` on that verb's
+LOCAL same-session path only. The CROSS-PROCESS path (`ClientRequest::SpawnAgent`, the
+`{status:"sent"}` reply) does NOT carry `ext_owned`, so a spawn whose bound session lives on another
+daemon completes NON-silently there. We take no action either way — no code lever exists on our side.
+The local spawn (the overwhelmingly common case) is silent, and the office already abandons a
+cross-process spawn via the lease-steal path (5.6), so the stray completion note lands in a session
+the office no longer owns. Documented here so the asymmetry is not mistaken for a bug.
+
+### 14.4 Mid-run comment injection (`agents.send`)
+
+A board comment added to a task whose state carries a LIVE binding (an in-flight worker, or a
+spawned reviewer) is pushed to the running agent immediately instead of only folding at the next
+spawn. The kernel emits `Effect::InjectComment { ext_agent_id, comment_id, text }`; the driver
+calls the `agents.send` verb (grant `agents:orchestrate`, which we hold). On a success reply
+(`{"sent":true}` / `{...,"status":"queued"}`) the driver feeds `HostEvent::CommentDelivered` back
+and the kernel flips the receipt `Pending -> Delivered`. On ANY error (agent terminal / unknown id /
+session closed) the comment stays `Pending` and the existing spawn-boundary fold delivers it on the
+next attempt — one shot per comment at add time, no retry loop. A provisional binding (spawn not yet
+acked) is treated as no live target. Read receipts (ack in the report) are unchanged.
+
+### 14.5 `format:"json"` (structured invokes)
+
+`Effect::InvokeModel` and the driver's `InvokeJob` carry a `format` field; the kernel sets
+`Some("json")` for the breakdown family (`Breakdown`/`BreakdownReask`/`BreakdownCompact`) and the
+assume-check gate, `None` for the prose invokes (persona/TRD/CRD/fold). The driver forwards it as
+the `models.invoke` `format` param. koma honors it only on chat-completions dialects (maps to
+`response_format: json_object`); Codex/Anthropic dialects silently ignore it. Note: the assume-check
+prompt still emits an `ASSUME-CHECK` text block and its safeguard fails OPEN on an unparseable
+result, so a dialect that enforces JSON there degrades safely (the gate effectively no-ops) rather
+than wedging drafting.
+
+### 14.6 Theme-aware panel
+
+The panel follows koma's live theme (koma 0.3.0 theme channel, delivered by `koma-panel.js`'s
+`onTheme`/`getTheme`). On a `theme` push (register + change) or the startup query, `theme.ts`
+`applyHostPalette` overrides the `--wf-bg/-fg/-accent/-dim/-panel` + status-role custom properties
+inline on `<html>` and sets `color-scheme`/`data-theme` from the payload's `dark` flag; the derived
+surfaces (panel2/border/hover/head/grip, tints) color-mix off bg/fg and follow automatically. While
+a host theme is active, Settings replaces the manual dark/light toggle with a dim "following koma
+theme (<name>)" line. Standalone / the mock harness (no theme channel) keep the manual toggle. The
+Rust daemon does nothing for theme — it is a pure panel/host concern.
+
+### 14.7 Host-side freebies (nothing to configure)
+
+Two koma 0.3.0 conveniences require no work on our side:
+
+- **Sub-agent sidebar grouping**: koma groups an extension's contributed sub-agents under the
+  extension in its sidebar automatically.
+- **Windows named-pipe transport**: the extension-to-koma socket is selected by the host via
+  `KOMA_EXT_SOCKET` (a named pipe on Windows, a unix socket elsewhere); the SDK handles it
+  transparently, so the daemon is unchanged across platforms.

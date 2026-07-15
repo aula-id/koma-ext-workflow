@@ -37,6 +37,9 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
   const { projects } = useStore();
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [theme, setTheme] = useState<Theme>('dark');
+  // Non-null while a koma host theme drives the palette (koma 0.3.0): the Appearance section then
+  // shows a "following koma theme (<name>)" line instead of the manual dark/light toggle.
+  const [hostThemeName, setHostThemeName] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -50,10 +53,14 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
   });
 
   useEffect(() => {
-    const currentTheme = themeManager.getTheme();
-    setTheme(currentTheme);
-    const unsubscribe = themeManager.subscribe(setTheme);
-    return unsubscribe;
+    setTheme(themeManager.getTheme());
+    setHostThemeName(themeManager.getHostThemeName());
+    const offTheme = themeManager.subscribe(setTheme);
+    const offHost = themeManager.subscribeHostTheme(setHostThemeName);
+    return () => {
+      offTheme();
+      offHost();
+    };
   }, []);
 
   useEffect(() => {
@@ -221,22 +228,31 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
         {/* Appearance */}
         <div className="wf-section" style={{ borderTop: 'none', marginTop: '1rem', paddingTop: 0 }}>
           <h2 className="wf-section-title">Appearance</h2>
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
-            {(['dark', 'light'] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => handleThemeChange(t)}
-                className="wf-btn"
-                style={
-                  theme === t
-                    ? { borderColor: 'var(--wf-grip)', color: 'var(--wf-fg)', background: 'var(--wf-hover)' }
-                    : { color: 'var(--wf-dim)' }
-                }
-              >
-                {t}
-              </button>
-            ))}
-          </div>
+          {hostThemeName !== null ? (
+            <p
+              style={{ color: 'var(--wf-dim)', fontSize: '0.8rem', margin: 0 }}
+              data-testid="settings-following-koma-theme"
+            >
+              following koma theme ({hostThemeName})
+            </p>
+          ) : (
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              {(['dark', 'light'] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => handleThemeChange(t)}
+                  className="wf-btn"
+                  style={
+                    theme === t
+                      ? { borderColor: 'var(--wf-grip)', color: 'var(--wf-fg)', background: 'var(--wf-hover)' }
+                      : { color: 'var(--wf-dim)' }
+                  }
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Project selector: flat rows, accent left bar for the active one */}

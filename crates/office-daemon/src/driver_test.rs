@@ -158,6 +158,48 @@ fn agents_done_fetches_result_moves_to_review_and_spawns_reviewer() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. mid-run comment injection (feature 4): agents.send + CommentDelivered feedback
+// ---------------------------------------------------------------------------
+
+#[test]
+fn comment_on_live_worker_injected_via_agents_send_and_marked_delivered() {
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("agents.send", json!({ "sent": true }));
+    let mut d = driver(store, host);
+
+    let t = task(
+        "auth/t1",
+        TaskState::OnProgress { binding: worker_binding(101, 1_000), attempt: 1 },
+    );
+    d.insert_for_test(project("auth", ProjectPhase::Running, vec![t]), 1_000);
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::Comment {
+            task: "auth/t1".to_string(),
+            text: "watch the race".to_string(),
+        }),
+        2_000,
+    );
+
+    // The comment was pushed to the live worker (101) via agents.send with the framed message.
+    assert_eq!(call_count(&d.host, "agents.send"), 1);
+    let send = last_call(&d.host, "agents.send").unwrap();
+    assert_eq!(send.get("agentId").and_then(Value::as_u64), Some(101));
+    assert!(send
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("watch the race"));
+
+    // The success reply flipped the receipt Pending -> Delivered.
+    match &d.project("auth").unwrap().tasks[0].comments[0].receipt {
+        office_core::Receipt::Delivered { .. } => {}
+        other => panic!("expected Delivered, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 3. reconcile: killed path off error VALUES + orphan sweep
 // ---------------------------------------------------------------------------
 

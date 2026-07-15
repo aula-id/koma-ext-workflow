@@ -9,7 +9,7 @@ This guide covers local development, testing, and deployment of the Workflow ext
   manifest.json               # Extension manifest (single source of truth)
   Cargo.toml                  # Rust workspace
   pack.sh                     # Build release binary and Vite UI -> dist/workflow.zip
-  dev-install.sh              # Unpack zip into ~/.koma/extensions/aula.workflow/
+  dev-install.sh              # Prefer 'koma ext install --dev'; else unpack into ~/.koma/extensions/aula.workflow/
   docs/
     ARCHITECTURE.md           # Design and implementation details
     BUILD_WAVES.md            # Wave-by-wave implementation plan
@@ -87,19 +87,22 @@ To install the extension into your local koma for testing:
 # 1. Build and package
 ./pack.sh
 
-# 2. Install into ~/.koma/extensions/aula.workflow/
+# 2. Install. When koma is on PATH, dev-install.sh uses koma's official dev sideload verb
+#    (koma ext install --dev dist/workflow.zip): it unpacks into ~/.koma/extensions/aula.workflow/,
+#    auto-grants every `requires` (tier "dev", enabled), and replaces the same id in place. When
+#    koma is NOT on PATH it falls back to the manual unzip + installed_extensions registry edit.
 ./dev-install.sh
 
-# 3. Restart koma:
-#    - If running GUI: restart the Workflow extension via the admin panel, or kill/restart koma
-#    - If running TUI: quit and restart
+# 3. Restart koma — ALREADY-RUNNING sessions must be restarted to pick up a new build:
+#    - GUI: restart the Workflow extension via the admin panel, or kill/restart koma
+#    - TUI: quit and restart
 
 # 4. Open the Workflow tab (appears as "Workflow" in the panel bar)
 ```
 
-After installation, the extension state root is at `~/.koma-workflow/` (outside the install dir, so upgrades don't wipe state).
+After installation, the extension state root is at `~/.koma-workflow/` (outside the install dir, so upgrades don't wipe state). `manifest.json` also declares this as the extension's `workspace_dir` (koma 0.3.0) — koma's host-side file-tool containment root.
 
-`dev-install.sh` also upserts an `.mcp_servers` entry (name `workflow`) into `~/.koma/config.json` pointing at `bin/workflow-mcp`, preserving an existing entry's `uuid`.
+`dev-install.sh` upserts an `.mcp_servers` entry (name `workflow`) into `~/.koma/config.json` pointing at `bin/workflow-mcp`, preserving an existing entry's `uuid`. This runs in BOTH install paths, because `koma ext install --dev` registers the extension + grants but NOT the MCP server.
 
 ## MCP tools
 
@@ -282,6 +285,33 @@ The UI has ~500 MB of dev dependencies. This is normal and is excluded from the 
 ### "workspace file inbox" not working in GUI
 
 In `--daemon` mode (the default for the GUI in 0.2.0+), contributed tools are not visible to the model. The extension provides a documented workaround: the main chat can write JSON files to `<workspace>/koma-workflow/inbox/` to reach the office. The extension polls this directory each tick and answers via `chat.prompt`.
+
+## koma 0.3.0 host API adoption
+
+The extension targets koma 0.3.0 (SDK pinned via `cargo update -p koma-extension`). All of these are
+additive — an older host ignores unknown manifest keys / verbs / params and the extra prompt text
+(see ARCHITECTURE.md 14 for full detail):
+
+- **Sub-agent tools** — each contributed sub-agent declares a `tools` allow-list in `manifest.json`
+  (worker gets write/edit/bash; reviewer/researcher/auditor are read-only + web). Unknown names are
+  dropped host-side; `task`/`task_send` are hard-excluded.
+- **Recursion guard** — koma auto-inherits the human's `mcp__*` tools onto spawned agents with no
+  opt-out, so every sub-agent prompt (manifest + `prompts.rs`) tells the agent NEVER to call
+  `mcp__workflow__*`. Prompt-level only; there is no host lever.
+- **Mid-run comment injection** — a comment on a task with a live worker/reviewer binding is pushed
+  immediately via the `agents.send` verb (`Effect::InjectComment` -> success `HostEvent::CommentDelivered`);
+  on error it stays Pending for the spawn-boundary fold. No retry loop.
+- **`format:"json"`** — the kernel asks for JSON output on the breakdown + assume-check invokes;
+  chat-completions dialects honor it, others ignore it.
+- **Theme-aware panel** — the panel follows koma's live palette (`koma-panel.js` `onTheme`/`getTheme`
+  -> `theme.ts applyHostPalette`); Settings shows "following koma theme" while host-themed, and keeps
+  the manual dark/light toggle standalone.
+- **`models.invoke` timeout** — the wire cap is 360s (broker inner ~330s), not the old 25s; long
+  PRD/breakdown flows run off the driver's invoke pool so nothing blocks the tick loop.
+- **Dev sideload verb** — `dev-install.sh` prefers `koma ext install --dev` (see above).
+- **Host-side freebies (nothing to configure)** — koma groups the contributed sub-agents under the
+  extension in its sidebar, and selects the extension socket via `KOMA_EXT_SOCKET` (a Windows named
+  pipe / unix socket elsewhere) transparently in the SDK.
 
 ## Notes
 

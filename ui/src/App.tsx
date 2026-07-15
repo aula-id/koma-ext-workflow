@@ -4,6 +4,7 @@ import Board from './views/Board';
 import Settings from './views/Settings';
 import { bridge } from './bridge';
 import { useStore } from './store';
+import { themeManager } from './theme';
 
 type ViewType = 'dashboard' | 'board' | 'settings';
 type BoardTab = 'board' | 'drilldown' | 'depmap' | 'prd';
@@ -92,6 +93,17 @@ const App: React.FC = () => {
       useStore.getState().updateSnapshot(snap);
     });
     return unsubscribe;
+  }, []);
+
+  // Subscribe to koma's host theme (koma 0.3.0): apply each pushed palette, and seed once via a
+  // direct query in case the register-time push raced our subscription. A host without the theme
+  // channel (standalone / mock harness) no-ops, leaving Settings' manual dark/light toggle.
+  useEffect(() => {
+    const off = bridge.onTheme((payload) => themeManager.applyHostPalette(payload));
+    bridge.getTheme().then((payload) => {
+      if (payload) themeManager.applyHostPalette(payload);
+    });
+    return off;
   }, []);
 
   useEffect(() => {
