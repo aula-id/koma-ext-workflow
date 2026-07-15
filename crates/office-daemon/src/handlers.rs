@@ -44,6 +44,10 @@ pub enum Command {
     /// `{ op: "breakdown", project }` — ask the office to author + land the epic/story/
     /// task breakdown for the project's PRD (6.3.2). No contributed tool; panel-only.
     Breakdown { project: String },
+    /// `{ op: "approve", project }` — explicit human approval of the safeguard's pending
+    /// assumptions (6.2c): clears `pending_assumptions` and resumes the drafting pipeline.
+    /// No contributed tool; MCP `workflow_approve` + inbox, owner-only like `authorize`.
+    Approve { project: String },
     /// An off-loop `models.invoke` completed (W9): posted by the invoke worker pool onto
     /// the driver channel, NOT parsed from the wire. `req_id` matches the driver's pending
     /// job; `result` is the model output or the error string. The driver applies its one
@@ -74,7 +78,7 @@ pub enum Command {
     /// `{ op: "edit_deps", task, ... }`.
     EditDeps { task: String, patch: Value },
     /// `{ op: "config_set", project, maxWorkers?, bounceBudget?, workerModel?,
-    /// reviewerModel?, keepDesks?, crdPassGrade?, assumptionCheck?, assumptionTrust? }`.
+    /// reviewerModel?, keepDesks?, crdPassGrade?, assumptionCheck?, assumptionMode? }`.
     ConfigSet {
         project: String,
         max_workers: Option<u32>,
@@ -84,7 +88,7 @@ pub enum Command {
         keep_desks: Option<bool>,
         crd_pass_grade: Option<u32>,
         assumption_check: Option<bool>,
-        assumption_trust: Option<bool>,
+        assumption_mode: Option<String>,
     },
     /// `{ op: "project_create", name }`.
     ProjectCreate { name: String },
@@ -431,7 +435,7 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
                     .and_then(Value::as_u64)
                     .map(|n| n as u32),
                 assumption_check: payload.get("assumptionCheck").and_then(Value::as_bool),
-                assumption_trust: payload.get("assumptionTrust").and_then(Value::as_bool),
+                assumption_mode: opt_str_field(&payload, "assumptionMode"),
             }
         }
         "project_create" => {

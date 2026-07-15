@@ -157,6 +157,8 @@ const DOC_STATE_DOT: Partial<Record<DocCard['state'], string>> = {
   active: 'var(--wf-info)',
   checking: 'var(--wf-review)',
   assumptions: 'var(--wf-warn)',
+  // Autonomous resolution is activity (info), not attention (warn) — the office is deciding it.
+  resolving: 'var(--wf-info)',
 };
 
 /**
@@ -172,7 +174,7 @@ const DocCardView: React.FC<{ card: DocCard; onClick: () => void }> = ({ card, o
       ? card.detail ?? 'active'
       : card.state === 'checking'
         ? 'fact-checking'
-        : card.state === 'assumptions'
+        : card.state === 'assumptions' || card.state === 'resolving'
           ? card.detail
           : card.state === 'done' || card.state === 'skipped'
             ? card.detail
@@ -226,7 +228,7 @@ const DocCardView: React.FC<{ card: DocCard; onClick: () => void }> = ({ card, o
         >
           {dotColor && (
             <motion.span
-              animate={card.state === 'active' ? { opacity: [0.35, 1, 0.35] } : undefined}
+              animate={card.state === 'active' || card.state === 'resolving' ? { opacity: [0.35, 1, 0.35] } : undefined}
               transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
               style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor, display: 'inline-block' }}
             />

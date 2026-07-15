@@ -72,4 +72,36 @@ describe('Dashboard phase rendering', () => {
     expect(project.phase).toEqual({ kind: 'halted', reason: 'blocked' });
     expect(project.phase.kind).toBe('halted');
   });
+
+  it('surfaces a pending-assumptions row in Attention needed and hides elapsed for the waiting state', () => {
+    // Safeguard feature 5: a drafting project stopped on pending assumptions is attention-worthy
+    // and carries a `sinceMs: 0` waiting activity (the elapsed suffix is suppressed).
+    act(() => {
+      useStore.getState().updateSnapshot({
+        kind: 'snapshot',
+        seq: 3,
+        projects: [
+          {
+            id: 'csv',
+            name: 'CSV Import',
+            phase: { kind: 'drafting' },
+            tasks: [],
+            pendingAssumptions: ['assumed partial commit', 'assumed skip invalid'],
+            officeActivity: { label: 'waiting on you — 2 assumptions', sinceMs: 0 },
+          },
+        ],
+      });
+    });
+
+    act(() => {
+      root.render(React.createElement(Dashboard));
+    });
+
+    // Attention needed lists the waiting project with a count-aware row.
+    expect(container.textContent).toContain('2 assumptions await approval');
+    // The live-activity line shows the waiting label...
+    expect(container.textContent).toContain('waiting on you — 2 assumptions');
+    // ...with NO elapsed suffix (the sinceMs === 0 sentinel is hidden, never "· 9999:59").
+    expect(container.textContent).not.toMatch(/assumptions · \d/);
+  });
 });

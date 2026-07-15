@@ -789,14 +789,96 @@ under "Open questions", never in the doc body; delegated choices are recorded as
 decision: ...". After ANY prd/trd/crd fence capture, and BEFORE the pipeline proceeds (research
 spawn / CRD invoke / breakdown), the kernel issues an `InvokePurpose::AssumeCheck{Prd,Trd,Crd}`
 invoke on `config.safeguard_role` (default `"safeguard"`). Given ONLY the user's own chat turns +
-research notes + the doc, the safeguard emits `ASSUME-CHECK\nverdict: clean|assumptions\n- <item>`
-(tolerant-parsed by `report::parse_assume_check`). `clean` -> proceed with the deferred stage;
-`assumptions` -> STOP, storing `Project.pending_assumptions` and noticing the user (the doc is
-stored/visible; a chat answer + a fresh fence re-runs the gate, and a clean check clears the list);
-`Err` -> FAIL-OPEN (proceed). `config.assumption_check` (default true) skips the gate entirely when
-false. The deferred stage is a pure function of the doc identity on the check's purpose — no hidden
-"which stage" state is persisted, so the resume point is reconstructible from `phase` + which docs
-are non-empty + `pending_assumptions` + `assumption_check` (see the kernel.rs pipeline resume rule).
+research notes + the doc, the safeguard emits `ASSUME-CHECK\nverdict: clean|assumptions\n- [critical|auto] <item>`
+(tolerant-parsed by `report::parse_assume_check`; each item is classified by `report::classify_assumption`).
+`clean` -> proceed with the deferred stage; `Err` -> FAIL-OPEN (proceed). A dirty `assumptions`
+verdict is handled per `config.assumption_mode` (see below). `config.assumption_check` (default true)
+skips the gate entirely when false — regardless of mode. The deferred stage is a pure function of the
+doc identity on the check's purpose — no hidden "which stage" state is persisted, so the resume point
+is reconstructible from `phase` + which docs are non-empty + `pending_assumptions` +
+`assumption_check` + `assumption_mode` + `assumption_rounds`.
+
+*Two modes — autonomous by default (autonomous-safeguard pivot 2026-07-15).* `config.assumption_mode`
+(default `"auto"`) governs a dirty verdict; `"ask"` is the original freeze-and-ask behavior, now a
+fallback. The checker TAGS each flagged item with its criticality, and the definition of `[critical]`
+is deliberately NARROW: a choice is critical ONLY if it spends real money, requires accounts /
+credentials / secrets, modifies or deletes EXISTING user data or systems, picks a deployment target
+going live, or creates legal-exposure content. EVERYTHING else — stack / library / framework /
+language / database choice, data format, project structure, scope details, UX details — is `[auto]`
+(an untagged item defaults to `[auto]`). Handling (`kernel::handle_assumptions`):
+
+- **`ask` mode** — freeze on EVERY material item: store `pending_assumptions` (tags stripped) and
+  notice the user, exactly as before the pivot.
+- **`auto` mode, ANY `[critical]` item** — freeze on the CRITICAL items ONLY (`pending_assumptions`
+  carries just those; the `[auto]` items are dropped this round and covered by the user's
+  approval/answers, or auto-resolved on a later re-check). Notice: "N critical assumptions need you".
+- **`auto` mode, all `[auto]`** — AUTO-RESOLUTION: the kernel emits an `InvokePurpose::AssumeResolve`
+  invoke on `config.office_role` (the office decides each item itself with best judgment + the
+  research notes, revises the doc, re-emits the COMPLETE doc in its fence). On result the kernel
+  updates that doc (recovered from state via `newest_gated_doc`, exactly like the re-check path — so
+  one Copy variant with no payload suffices) and RE-RUNS the same `AssumeCheck` gate on the revised
+  body. `pending_assumptions` stays EMPTY (no disk waiting-state): the in-flight invoke chain IS the
+  live signal, surfaced as ACTIVITY, never attention. `Project.assumption_rounds` bounds the loop —
+  bumped per resolution round, reset to 0 on every fresh doc capture (a persona/TRD/CRD fence, NOT a
+  resolution capture), and capped at `AUTO_ROUND_CAP` (2). After the cap, another all-auto verdict
+  PROCEEDS anyway with the undecided items documented in the doc ("ultra-automatic mode never stalls
+  on paperwork"). An `AssumeResolve` `Err` or a missing fence also PROCEEDS — a flaky resolver never
+  wedges Drafting.
+
+*Research interplay.* Auto-resolution runs with WHATEVER `research_notes` exist — possibly empty, if
+the gated doc is the PRD and research has not run yet (the normal pipeline research still runs after
+the PRD gate clears). This is a deliberate simplification: the kernel spawns NO extra research for a
+resolution round, keeping the loop simple and deterministic.
+
+*Material-only calibration.* The safeguard flags ONLY MATERIAL assumptions — technology/stack
+choices, scope added/removed, data persistence or external services, security/auth posture, or
+anything else cost- or deliverable-shaping. It NEVER flags implementation micro-details (input
+validation, display formatting, ordering, folder layout, transitions), NEVER flags content the doc
+discloses under "Proposed defaults"/"Delegated decisions"/"Open questions", and returns `clean` the
+moment the user's own turns contain any delegation ("you decide" / "up to you" / "approved" /
+"proceed"). This keeps the gate from wedging on trivia (live-test 2026-07-15 flagged 13 micro-details
+as assumptions).
+
+*Re-running a stopped gate.* A stopped gate re-fires three ways, all off pure state: (1) the persona
+re-emits the fence and the fresh capture re-runs the gate; (2) **the persona replies WITHOUT a new
+fence while `pending_assumptions` is set** — the kernel Persona arm then re-emits the gate for the
+newest captured doc (`recheck_pending_assumptions`) so the transcript, now grown by the user's
+approval/answer/delegation, is re-judged (exactly ONE re-check per persona exchange, since an
+AssumeCheck result is not itself a persona result and cannot recurse); (3) **`workflow_approve`**
+(`office_core::inboxmsg::approve` -> daemon `Command::Approve` -> kernel `Command::ApproveAssumptions`,
+owner-only over the inbox like `authorize`) — explicit human approval OUTRANKS the checker: it
+appends an approval turn to the transcript, clears `pending_assumptions` directly, and resumes the
+deferred stage with no further invoke. A clean re-check (paths 1/2) or an approve (path 3) both
+notice the user ("assumptions resolved/approved — resuming"). This closes the live-test-2026-07-15
+wedge, where the persona answered a safeguard stop in PROSE (no new fence), the gate never re-ran,
+and the project sat in Drafting forever.
+
+*Powerlessness clause.* Because the persona is a planner with no ability to start work — no worker
+can hear it and nothing happens from prose — every doc-authoring contract states this explicitly
+(`office::POWERLESSNESS_CLAUSE`): work begins ONLY when the system captures a fenced doc and the
+human authorizes a delivery path; the persona must never roleplay dispatching/greenlighting workers.
+A companion clause (`office::DISCLOSE_REEMIT_CLAUSE`) tells it to disclose minor choices under
+"Proposed defaults (applied unless you object)" and to RE-EMIT the full doc in its fence (with
+"Delegated decision:" annotations) once the user approves/delegates — a belt to the kernel's
+re-check-on-reply brace.
+
+*Waiting-on-user visibility (critical freezes only).* A freeze — `ask`-mode or an `auto`-mode
+critical stop — leaves `pending_assumptions` non-empty. While it is non-empty and nothing else is
+live, the driver's `office_activity` reports a `waiting on you — N assumptions` label with
+`sinceMs: 0` (the UI hides the elapsed suffix for the sentinel); the dashboard "Attention needed"
+section adds a `N assumptions await approval` row, the pixel office shows the PM at the front office
+with a "?" bubble tagged "front office - waiting on you", and `workflow_status` prints a
+`waiting on user: N unapproved assumptions` line (read straight off the on-disk `pending_assumptions`).
+
+*Auto-resolution visibility (activity, not attention).* While the office is auto-resolving, the
+in-flight `AssumeResolve`/`AssumeCheck` invokes drive `office_activity` to a `resolving assumptions`
+label (a normal elapsed-clock activity, `sinceMs` = submit time); the docs tab renders the gated
+(newest non-empty) doc as a `resolving` card (info dot, "resolving assumptions", derived from the
+activity label since `pending_assumptions` is empty in this mode); the dashboard shows it as live
+ACTIVITY on the project row and adds NO attention entry. `workflow_status` reads the store directly
+and has no access to the in-flight invokes, so it shows NO auto-resolution line — an accepted gap,
+since auto-resolution leaves no disk state by design (only the critical-freeze `waiting on user` line
+persists).
 
 ### 6.3 PRD -> breakdown -> authorization flow
 

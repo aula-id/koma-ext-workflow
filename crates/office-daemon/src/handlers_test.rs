@@ -348,7 +348,7 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
                 "keepDesks": true,
                 "crdPassGrade": 92,
                 "assumptionCheck": false,
-                "assumptionTrust": true
+                "assumptionMode": "ask"
             }
         }),
         &tx,
@@ -364,7 +364,8 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
             keep_desks: Some(true),
             crd_pass_grade: Some(92),
             assumption_check: Some(false),
-            assumption_trust: Some(true),
+            // Autonomous-safeguard pivot: assumptionMode parses through end-to-end.
+            assumption_mode: Some("ask".to_string()),
         }
     );
 

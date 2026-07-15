@@ -240,6 +240,24 @@ If you modify `crates/office-core/src/kernel.rs`:
 2. Run `cargo test crate::kernel_test`
 3. Every Effect case must be exercised and verified deterministic
 
+### Safeguard assumption handling (autonomous by default)
+
+The no-assume safeguard (ARCHITECTURE.md 6.2c) is **autonomous by default**: `config.assumption_mode`
+is `"auto"`, so only `[critical]` assumptions (spend money / need accounts-credentials-secrets /
+touch existing data or systems / go live / legal exposure) freeze the pipeline for the human;
+everything else is auto-resolved by the office (`InvokePurpose::AssumeResolve`) over a bounded loop
+(`Project.assumption_rounds`, cap 2), then the pipeline proceeds. `"ask"` mode is the old
+freeze-on-everything fallback. `assumption_check == false` still disables the checker entirely.
+
+Consequences when testing:
+
+- Tests that assert the **freeze** behavior must set `p.config.assumption_mode = "ask"` (the default
+  is now `"auto"`, which resolves untagged/auto items instead of freezing). Existing such tests are
+  flagged in `kernel_test.rs`.
+- Auto-resolution leaves **no on-disk state** (`pending_assumptions` stays empty); it surfaces as the
+  `resolving assumptions` office activity and a `resolving` doc card, NOT as a dashboard attention row
+  or a `workflow_status` "waiting on user" line (those are critical freezes only).
+
 ### Updating the Panel
 
 If you modify files in `ui/src/`:

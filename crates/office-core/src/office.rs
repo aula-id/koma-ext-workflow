@@ -80,6 +80,14 @@ pub enum InvokePurpose {
     AssumeCheckTrd,
     /// The safeguard no-assume gate over the CRD (6.2c). `clean` -> proceed to the breakdown.
     AssumeCheckCrd,
+    /// The autonomous assumption-RESOLUTION invoke (autonomous-safeguard pivot 2026-07-15). Emitted
+    /// in `assumption_mode == "auto"` when the checker flagged only `[auto]` (non-critical) items:
+    /// the office decides each one itself with best judgment + the research notes, revises the doc,
+    /// and re-emits the COMPLETE doc in its `<doc>` fence. The kernel then updates that doc and
+    /// re-runs the matching `AssumeCheck{Prd,Trd,Crd}` gate. Which doc it targets is recovered from
+    /// state (`newest_gated_doc`) exactly like the re-check-on-reply path, so a single Copy variant
+    /// suffices. An `Err` or a missing fence PROCEEDS anyway (never wedges).
+    AssumeResolve,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +151,31 @@ pub const NO_ASSUME_CLAUSE: &str = "\nDo NOT assume anything the user did not st
 choice that is not user-stated, research-grounded, or explicitly delegated ('you decide' / 'up \
 to you') belongs under an 'Open questions' section, never in the doc body. Record delegated \
 choices as 'Delegated decision: ...'.\n";
+
+/// The persona's powerlessness clause (safeguard hardening, ARCHITECTURE.md 6.2c): the front
+/// office is a PLANNER, not an executor — no prose it emits moves the production line, and no
+/// worker can hear it. Work begins ONLY when the system captures a fenced doc AND the human
+/// authorizes a delivery path. Appended to every doc-authoring contract so the persona never
+/// roleplays dispatching / greenlighting / addressing workers (live-test 2026-07-15: a prose
+/// "workers — you're greenlit, @worker1 go" left the project wedged in Drafting, since no fence
+/// was emitted and the stopped gate never re-ran).
+pub const POWERLESSNESS_CLAUSE: &str = "\nYou cannot start work, dispatch, greenlight, or address \
+workers — no worker can hear you and NOTHING happens from prose. The ONLY way work begins: the \
+system captures your fenced docs, then the human authorizes with a delivery path. Never roleplay \
+execution or progress — if you want the line to move, emit the fenced doc and ask the human to \
+authorize.\n";
+
+/// The disclose-and-re-emit clause (safeguard hardening, ARCHITECTURE.md 6.2c): minor
+/// implementation choices are DISCLOSED under a 'Proposed defaults (applied unless you object)'
+/// heading rather than buried in the body (the safeguard never flags disclosed defaults), and
+/// once the user approves the doc or delegates a choice, the persona RE-EMITS the COMPLETE doc in
+/// its fence with 'Delegated decision:' annotations — that re-emitted fence is what re-runs the
+/// gate and advances the pipeline (a belt to the kernel's re-check-on-reply brace).
+pub const DISCLOSE_REEMIT_CLAUSE: &str = "\nMinor implementation choices you make (reasonable \
+defaults) belong under a 'Proposed defaults (applied unless you object)' heading — disclosed, \
+never hidden in the doc body. After the user approves the doc or delegates a choice to you, \
+RE-EMIT the COMPLETE updated document inside its fence, annotating each now-settled item as \
+'Delegated decision: ...' — that re-emitted fence is what advances the pipeline.\n";
 
 const PERSONA_CONTRACT: &str = "\nRespond as the Workflow front office: negotiate scope, \
 answer clearly, and drive toward a PRD. Be concise and decisive.\n\
@@ -243,6 +276,8 @@ fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
         prompt.push('\n');
     }
     prompt.push_str(PERSONA_CONTRACT);
+    prompt.push_str(POWERLESSNESS_CLAUSE);
+    prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
     prompt
 }
 
@@ -394,6 +429,8 @@ data model, API surface, testing strategy, deployment, and constraints. Be concr
 decisive; this document drives the epic/story/task breakdown.\n",
     );
     prompt.push_str(NO_ASSUME_CLAUSE);
+    prompt.push_str(POWERLESSNESS_CLAUSE);
+    prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
@@ -430,6 +467,8 @@ Then a 'Grading rubric' section: a bulleted list of checks, each with an explici
 whose weights SUM TO EXACTLY 100.\n",
     );
     prompt.push_str(NO_ASSUME_CLAUSE);
+    prompt.push_str(POWERLESSNESS_CLAUSE);
+    prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
@@ -440,10 +479,12 @@ whose weights SUM TO EXACTLY 100.\n",
 /// label ("PRD"/"TRD"/"CRD"); `doc_body` is that doc's markdown. Pure + byte-bounded; the caller
 /// (kernel) emits it on the `safeguard_role`.
 pub fn build_assume_check_prompt(p: &Project, doc_label: &str, doc_body: &str) -> (String, String) {
-    let system = "You are a strict requirements safeguard. Your ONE job is to catch ungrounded \
-assumptions: choices a document asserts that the user never stated, that were not established by \
-research, and that the user did not explicitly delegate. You do not rewrite the document; you \
-only audit it for unapproved assumptions. Be precise and terse."
+    let system = "You are a requirements safeguard with a HIGH bar. Your ONE job is to catch \
+MATERIAL ungrounded assumptions: decisions that shape cost, scope, or the deliverable that the \
+user never stated, research never established, and the user never delegated. You do NOT rewrite \
+the document and you do NOT nitpick implementation details — you flag only choices that would \
+change WHAT gets built or how much it costs. Be precise and conservative: when in doubt, do not \
+flag."
         .to_string();
 
     // Only the user's OWN turns are ground truth — the office's prior replies are not (an
@@ -469,14 +510,85 @@ only audit it for unapproved assumptions. Be precise and terse."
     prompt.push_str(&format!("\n{} UNDER REVIEW:\n", doc_label));
     prompt.push_str(&truncate_bytes(doc_body, HARD_PROMPT_CAP / 3));
     prompt.push_str(
-        "\n\nList every choice in the document that the user did NOT state, research did NOT \
-ground, and the user did NOT explicitly delegate ('you decide' / 'up to you' / recorded as a \
-'Delegated decision'). A delegated or research-grounded choice is NOT an assumption. Output \
-ONLY this block, nothing else:\n\
+        "\n\nFlag ONLY MATERIAL assumptions — a choice is material only if it changes cost, scope, \
+or the deliverable:\n\
+- technology / stack / framework / language / database choices the user did not state\n\
+- scope added or removed (features, integrations, platforms) beyond what was asked\n\
+- data persistence, storage, or external services / third-party APIs introduced\n\
+- security or auth posture (who can access what, how secrets/credentials are handled)\n\
+- anything else that is clearly cost- or deliverable-shaping\n\
+Do NOT flag implementation micro-details — these are the author's job and are NEVER assumptions: \
+input-validation specifics, display / formatting choices, sort ordering, folder or file layout, \
+UI transitions, naming, trimming input, character counts, or other reasonable defaults.\n\
+NEVER flag anything the document discloses under a heading like 'Proposed defaults', 'Delegated \
+decisions', or 'Open questions' — those are already surfaced, not hidden assumptions.\n\
+If the user's statements contain ANY delegation ('you decide' / 'up to you' / 'your call' / \
+'approved' / 'proceed'), the verdict is clean — the user handed the office the pen.\n\
+\nTAG EACH flagged item with its criticality — the office will decide the rest ITSELF, so reserve \
+[critical] for the NARROW set of choices that genuinely need a human:\n\
+- [critical] ONLY IF the choice: spends real money; requires accounts, credentials, or secrets; \
+modifies or deletes EXISTING user data or systems; picks a deployment target going live; or \
+creates legal-exposure content. These need a human before anything happens.\n\
+- [auto] for EVERYTHING else — stack / library / framework / language / database choice, data \
+format, project structure, scope details, UX details, and every other reasonable design decision. \
+The office is trusted to decide these; do NOT mark them critical.\n\
+When unsure, tag [auto], not [critical].\n\
+Output ONLY this block, nothing else:\n\
 ASSUME-CHECK\n\
 verdict: clean | assumptions\n\
-- <one ungrounded assumption per line; omit these lines entirely when verdict is clean>\n",
+- [critical] <one MATERIAL ungrounded assumption per line>\n\
+- [auto] <one MATERIAL ungrounded assumption per line>\n\
+(omit the '- ' lines entirely when verdict is clean; an untagged item is treated as [auto])\n",
     );
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// Build the autonomous assumption-resolution `(system, prompt)` for `models.invoke`
+/// (autonomous-safeguard pivot 2026-07-15). In `assumption_mode == "auto"`, when the checker
+/// flagged only non-critical `[auto]` assumptions, the office decides each ITSELF — "research,
+/// decide, disclose" — rather than freezing on the human. The prompt hands it the doc, the list of
+/// auto assumptions to settle, and the research notes when present, and instructs it to REVISE the
+/// doc, record every decision under a 'Delegated decisions (auto)' heading with a one-line
+/// rationale, and re-emit the COMPLETE revised document inside its `<doc>` fence (the same fence the
+/// gate captures). `doc_label` is "PRD"/"TRD"/"CRD"; the fence tag is its lowercase form. Pure +
+/// byte-bounded like the other builders.
+pub fn build_assume_resolve_prompt(
+    p: &Project,
+    doc_label: &str,
+    doc_body: &str,
+    auto_items: &[String],
+) -> (String, String) {
+    let tag = doc_label.to_ascii_lowercase();
+    let system = format!(
+        "You are the Workflow front office resolving your own open assumptions. You are TRUSTED to \
+decide reasonable design choices yourself — stack, libraries, formats, structure, UX details. \
+Decide each assumption below with best judgment and the research notes, then revise the {label} to \
+reflect those decisions. Be decisive; do NOT punt back to the human on non-critical calls.",
+        label = doc_label
+    );
+
+    let mut prompt = String::new();
+    prompt.push_str(&format!("{} UNDER REVISION:\n", doc_label));
+    prompt.push_str(&truncate_bytes(doc_body, HARD_PROMPT_CAP / 3));
+    prompt.push_str("\n\nASSUMPTIONS TO DECIDE YOURSELF (each is non-critical — settle it):\n");
+    if auto_items.is_empty() {
+        prompt.push_str("(none listed — re-emit the document unchanged)\n");
+    } else {
+        let list: String = auto_items.iter().map(|a| format!("- {}\n", a)).collect();
+        prompt.push_str(&truncate_bytes(&list, HARD_PROMPT_CAP / 4));
+    }
+    if !p.research_notes.trim().is_empty() {
+        prompt.push_str("\nRESEARCH FINDINGS (lean on these where relevant):\n");
+        prompt.push_str(&truncate_bytes(&p.research_notes, HARD_PROMPT_CAP / 4));
+    }
+    prompt.push_str(&format!(
+        "\n\nDecide EVERY assumption above yourself using best judgment and the research notes. \
+REVISE the document so each decision is baked in, and add a 'Delegated decisions (auto)' section \
+where every decision appears with a one-line rationale. Then re-emit the COMPLETE revised document \
+as markdown inside a fenced block that starts with ```{tag} and ends with ``` — that exact fence is \
+how the system captures it. Output NOTHING outside that fence — no JSON, no preamble, no prose.\n",
+        tag = tag
+    ));
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 

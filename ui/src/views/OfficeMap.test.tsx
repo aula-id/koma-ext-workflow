@@ -70,4 +70,21 @@ describe('OfficeMap', () => {
     });
     expect(clicked).toBe('p/a');
   });
+
+  it('shows the PM waiting on the user with a "?" bubble when assumptions are pending', () => {
+    const waiting: any = {
+      id: 'w',
+      name: 'Waiting',
+      phase: { kind: 'drafting' },
+      config: { maxWorkers: 2 },
+      tasks: [],
+      officeActivity: { label: 'waiting on you — 2 assumptions', sinceMs: 0 },
+    };
+    act(() => {
+      root.render(React.createElement(OfficeMap, { project: waiting, onTaskClick: () => {} }));
+    });
+
+    expect(container.textContent).toContain('front office - waiting on you');
+    expect(container.querySelector('[data-testid="pm-waiting-bubble"]')).not.toBeNull();
+  });
 });

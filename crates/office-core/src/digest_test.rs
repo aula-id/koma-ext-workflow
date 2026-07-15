@@ -48,6 +48,7 @@ mod tests {
             assumptions_approved: false,
             self_resolved_assumptions: vec![],
             capture_nudge_count: 0,
+            assumption_rounds: 0,
             office_transcript: vec![ChatMsg { who: ChatAuthor::User, text: "hi".to_string() }],
             office_summary: String::new(),
             delivery_path: Some(format!("/work/{id}/deliver").into()),

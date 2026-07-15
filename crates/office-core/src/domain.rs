@@ -233,14 +233,18 @@ pub struct ProjectConfig {
     /// like `office_role` for the persona. Named-fn default `"safeguard"`; no panel affordance.
     #[serde(default = "default_safeguard_role")]
     pub safeguard_role: String,
-    /// Trust mode — the owner's "just do it" contract. When `true`, a safeguard verdict of
-    /// `assumptions` does NOT stop the drafting pipeline: the kernel self-resolves the flagged
-    /// items (recording them on `Project.self_resolved_assumptions` for the audit trail) and
-    /// proceeds to the next stage. Off by default (`#[serde(default)]` -> `false`, the careful
-    /// posture); this is the blanket escape hatch, while the per-project approval intent
-    /// (`Project.assumptions_approved`) is the lighter-weight one. Toggled via `ConfigSet`.
-    #[serde(default)]
-    pub assumption_trust: bool,
+    /// How the safeguard handles flagged assumptions once the checker returns (autonomous-safeguard
+    /// pivot 2026-07-15). `"auto"` (default) = ULTRA-AUTOMATIC: only `[critical]` items freeze the
+    /// pipeline for the human; everything else is auto-resolved by the office ("research, decide,
+    /// disclose") over a bounded round loop and the pipeline never stalls on paperwork. `"ask"` =
+    /// the original freeze-and-ask behavior for EVERY material item. `assumption_check == false`
+    /// still disables the checker entirely regardless of mode. Named-fn default `"auto"` (not
+    /// `#[serde(default)]`, which would force an empty string) so legacy state files load autonomous.
+    /// (Unification 2026-07-15: this single mode enum SUPERSEDES the branch's `assumption_trust`
+    /// bool — `"auto"` is the old `assumption_trust == true`, `"ask"` the old `false`; the new
+    /// default flips to autonomous.)
+    #[serde(default = "default_assumption_mode")]
+    pub assumption_mode: String,
 }
 
 fn default_crd_pass_grade() -> u32 {
@@ -253,6 +257,10 @@ fn default_assumption_check() -> bool {
 
 fn default_safeguard_role() -> String {
     "safeguard".to_string()
+}
+
+fn default_assumption_mode() -> String {
+    "auto".to_string()
 }
 
 impl ProjectConfig {
@@ -268,7 +276,7 @@ impl ProjectConfig {
             crd_pass_grade: default_crd_pass_grade(),
             assumption_check: default_assumption_check(),
             safeguard_role: default_safeguard_role(),
-            assumption_trust: false,
+            assumption_mode: default_assumption_mode(),
         }
     }
 }
@@ -315,25 +323,29 @@ pub struct Project {
     /// status line when present (6.2c). `#[serde(default)]` (None) for back-compat.
     #[serde(default)]
     pub last_audit_grade: Option<u32>,
-    /// Ungrounded assumptions the safeguard flagged in the LAST doc gate (6.2c/safeguard). Non-
-    /// empty means the drafting pipeline is stopped waiting on the user to approve/answer/delegate;
-    /// a subsequent clean check on any doc clears it. `#[serde(default)]` for back-compat.
+    /// Ungrounded assumptions the safeguard flagged in the LAST doc gate that STOP the pipeline for
+    /// the human (6.2c/safeguard). In `assumption_mode == "ask"` this is every material item; in
+    /// `"auto"` it is ONLY the `[critical]` items (auto items are resolved autonomously and never
+    /// persisted here). Non-empty means the pipeline is stopped waiting on the user to
+    /// approve/answer/delegate; a subsequent clean check on any doc clears it. `#[serde(default)]`
+    /// for back-compat.
     #[serde(default)]
     pub pending_assumptions: Vec<String>,
     /// Sticky per-project approval of the safeguard gate. Set once the user answers a
-    /// pending-assumptions stop with a deterministic approval intent (kernel `office_message`);
-    /// thereafter `gate_doc` fails OPEN for every doc in THIS project (`assumptions_approved ||
-    /// !config.assumption_check`), so a re-emitted doc proceeds instead of re-stopping (the audit's
-    /// approval loop). NEVER auto-reset — the owner's "super-autonomous once approved" contract:
-    /// once set it dominates, so toggling `config.assumption_check` does NOT re-gate this project.
-    /// `config.assumption_check` remains the wholesale gate on/off escape hatch for projects that
-    /// were never approved. `#[serde(default)]` (false) for back-compat.
+    /// pending-assumptions stop with a deterministic approval intent (kernel `office_message`) OR
+    /// invokes `workflow_approve` (kernel `approve_assumptions`); thereafter `gate_doc` fails OPEN
+    /// for every doc in THIS project (`assumptions_approved || !config.assumption_check`), so a
+    /// re-emitted doc proceeds instead of re-stopping (the audit's approval loop). NEVER auto-reset
+    /// — the owner's "super-autonomous once approved" contract: once set it dominates, so toggling
+    /// `config.assumption_check` does NOT re-gate this project. `config.assumption_check` remains
+    /// the wholesale gate on/off escape hatch for projects that were never approved.
+    /// `#[serde(default)]` (false) for back-compat.
     #[serde(default)]
     pub assumptions_approved: bool,
-    /// Append-only audit trail of assumptions the safeguard flagged that trust mode
-    /// (`config.assumption_trust`) or an active approval auto-resolved instead of stopping on.
-    /// Capped to the most recent ~100 entries so a long drafting session can never balloon the
-    /// state file. `#[serde(default)]` for back-compat.
+    /// Append-only audit trail of assumptions the safeguard flagged that an active approval
+    /// (`assumptions_approved`, set by chat intent or `workflow_approve`) auto-resolved instead of
+    /// stopping on. Capped to the most recent ~100 entries so a long drafting session can never
+    /// balloon the state file. `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub self_resolved_assumptions: Vec<String>,
     /// Consecutive deterministic capture-miss nudges issued for the current PRD (kernel Persona
@@ -343,6 +355,14 @@ pub struct Project {
     /// user rather than looping forever. `#[serde(default)]` (0) for back-compat.
     #[serde(default)]
     pub capture_nudge_count: u32,
+    /// How many autonomous auto-resolution rounds the safeguard has run on the CURRENT doc capture
+    /// (autonomous-safeguard pivot). Bumped each time an `InvokePurpose::AssumeResolve` invoke is
+    /// emitted, RESET to 0 on every fresh doc capture (a persona/TRD/CRD fence), and capped at
+    /// `AUTO_ROUND_CAP` (2) — after the cap the pipeline proceeds anyway with the undecided items
+    /// documented in the doc (ultra-automatic mode never stalls). Persisted so the round budget
+    /// survives a store reload. `#[serde(default)]` (0) for back-compat.
+    #[serde(default)]
+    pub assumption_rounds: u32,
     pub office_transcript: Vec<ChatMsg>,
     pub office_summary: String,
     pub delivery_path: Option<PathBuf>,

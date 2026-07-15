@@ -230,9 +230,24 @@ export function formatElapsed(nowMs: number, sinceMs: number): string {
 
 const NON_DRAFTING_LABELS = new Set(['researching the stack', 'auditing the delivery']);
 
+/** The prefix the driver stamps on the "waiting on you — N assumptions" activity label
+ * (office-daemon driver.rs `office_activity`), when the drafting pipeline is stopped on the
+ * safeguard's pending assumptions. */
+const WAITING_ON_USER_PREFIX = 'waiting on you';
+
+/** Whether an officeActivity label is the safeguard's "waiting on you — N assumptions" state
+ * (the pipeline is stopped pending the user's approval), as opposed to live work. Prefix-matched
+ * because the label carries a variable assumption count. */
+export function isWaitingOnUserActivity(label: string | undefined | null): boolean {
+  return Boolean(label) && (label as string).startsWith(WAITING_ON_USER_PREFIX);
+}
+
 /** Whether an officeActivity label is a "drafting family" activity (drafting/fact-checking/
- * breaking-down/replying/summarizing) as opposed to research/audit, which have their own
- * dedicated staff animations elsewhere in the office map. */
+ * breaking-down/replying/summarizing) as opposed to research/audit (which have their own
+ * dedicated staff animations elsewhere in the office map) or the waiting-on-user state (which is
+ * not live work at all). */
 export function isDraftingFamilyActivity(label: string | undefined | null): boolean {
-  return Boolean(label) && !NON_DRAFTING_LABELS.has(label as string);
+  if (!label) return false;
+  if (isWaitingOnUserActivity(label)) return false;
+  return !NON_DRAFTING_LABELS.has(label);
 }

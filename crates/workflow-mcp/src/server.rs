@@ -1,7 +1,8 @@
-//! The `workflow` MCP server: a hand-rolled [`ServerHandler`] exposing eight tools.
+//! The `workflow` MCP server: a hand-rolled [`ServerHandler`] exposing nine tools.
 //!
-//! Seven are COMMAND tools (brief/authorize/comment/interrupt/resume/breakdown/delete_project): each builds
-//! the exact inbox JSON via `office_core::inboxmsg` and drops it into the resolved inbox
+//! Eight are COMMAND tools (brief/authorize/comment/interrupt/resume/breakdown/delete_project/
+//! approve): each builds the exact inbox JSON via `office_core::inboxmsg` and drops it into the
+//! resolved inbox
 //! directory — the office picks it up and answers as a CHAT NOTICE, so the tool result only
 //! confirms the drop. One is a READ tool (status): it reads the store directly and returns
 //! the digest inline. Tools and JSON schemas are written out by hand (no `#[tool]` macros)
@@ -23,9 +24,9 @@ use crate::write::{inbox_dir_for, write_inbox_file};
 /// Server-level instructions surfaced to the MCP client at initialize.
 const INSTRUCTIONS: &str = "Workflow office control tools. The command tools \
 (workflow_brief / workflow_authorize / workflow_comment / workflow_interrupt / \
-workflow_resume / workflow_breakdown / workflow_delete_project) drop a request into the office \
-inbox and return immediately; the office's acknowledgement and any reply arrive as CHAT \
-NOTICES, not in the tool result. workflow_delete_project is an IRREVERSIBLE two-step confirm: \
+workflow_resume / workflow_breakdown / workflow_delete_project / workflow_approve) drop a request \
+into the office inbox and return immediately; the office's acknowledgement and any reply arrive as \
+CHAT NOTICES, not in the tool result. workflow_delete_project is an IRREVERSIBLE two-step confirm: \
 pass confirm equal to the exact project slug, or it deletes nothing and tells you the value to \
 send. workflow_status is read-only and returns the board digest inline.";
 
@@ -133,6 +134,12 @@ impl ServerHandler for WorkflowServer {
                     )));
                 }
                 write_command(inboxmsg::archive_project(&project), workspace)
+            }
+            "workflow_approve" => {
+                let Some(project) = nonempty(&args, "project") else {
+                    return Ok(error_result("workflow_approve requires a non-empty 'project'"));
+                };
+                write_command(inboxmsg::approve(&project), workspace)
             }
             other => {
                 // An unknown tool name is unroutable -> a JSON-RPC protocol error.
@@ -284,6 +291,21 @@ fn tool_defs() -> Vec<Tool> {
                     "workspace": { "type": "string", "description": "Optional workspace dir override for where the request file is written." }
                 }),
                 &["project", "confirm"],
+            ),
+        ),
+        Tool::new(
+            "workflow_approve",
+            "Approve the safeguard's pending assumptions for a drafting project so the office \
+             stops waiting and resumes drafting. Use this when the office flagged unapproved \
+             assumptions and you are fine with its proposed choices (equivalent to saying 'you \
+             decide, proceed'). Dropped into the office inbox; the office acknowledges in chat, \
+             not in this tool result.",
+            object_schema(
+                json!({
+                    "project": { "type": "string", "description": "The project id whose pending assumptions to approve." },
+                    "workspace": { "type": "string", "description": "Optional workspace dir override for where the request file is written." }
+                }),
+                &["project"],
             ),
         ),
     ]

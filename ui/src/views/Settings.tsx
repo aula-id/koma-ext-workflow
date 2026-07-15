@@ -50,6 +50,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     keepDesks: false,
     crdPassGrade: 98,
     assumptionCheck: true,
+    assumptionMode: 'auto',
   });
 
   useEffect(() => {
@@ -84,6 +85,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
       // `??` not `||` so a legitimate 0 is not coerced to the default.
       crdPassGrade: project.config?.crdPassGrade ?? 98,
       assumptionCheck: project.config?.assumptionCheck ?? true,
+      assumptionMode: project.config?.assumptionMode ?? 'auto',
     });
   };
 
@@ -123,6 +125,10 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     setFormData({ ...formData, assumptionCheck: !formData.assumptionCheck });
   };
 
+  const handleAssumptionModeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    setFormData({ ...formData, assumptionMode: e.target.value === 'ask' ? 'ask' : 'auto' });
+  };
+
   const handleThemeChange = (newTheme: Theme) => {
     themeManager.setTheme(newTheme);
     setTheme(newTheme);
@@ -146,6 +152,7 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
         keepDesks: formData.keepDesks,
         crdPassGrade: formData.crdPassGrade,
         assumptionCheck: formData.assumptionCheck,
+        assumptionMode: formData.assumptionMode,
       };
 
       const result = await bridge.send(payload);
@@ -435,6 +442,26 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                       <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>No-assume safeguard checks</span>
                       <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
                         gate each drafting doc (PRD/TRD/CRD) for ungrounded assumptions before the pipeline proceeds
+                      </span>
+                    </span>
+                  </label>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                    <select
+                      value={formData.assumptionMode}
+                      onChange={handleAssumptionModeChange}
+                      disabled={!formData.assumptionCheck}
+                      data-testid="settings-assumption-mode"
+                      style={{ width: 120, opacity: formData.assumptionCheck ? 1 : 0.5 }}
+                    >
+                      <option value="auto">auto</option>
+                      <option value="ask">ask</option>
+                    </select>
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Assumption handling</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        auto: resolve non-critical assumptions autonomously, only stop for critical ones;
+                        ask: stop on every flagged assumption
                       </span>
                     </span>
                   </label>

@@ -7,6 +7,7 @@ import {
   isAuditLive,
   isDraftingFamilyActivity,
   isResearchLive,
+  isWaitingOnUserActivity,
   occupiedCount,
   presenceFor,
   stationsFor,
@@ -222,11 +223,24 @@ describe('formatElapsed', () => {
 });
 
 describe('isDraftingFamilyActivity', () => {
-  it('classifies drafting-family labels as true, research/audit as false', () => {
+  it('classifies drafting-family labels as true, research/audit/waiting as false', () => {
     expect(isDraftingFamilyActivity('drafting the TRD')).toBe(true);
     expect(isDraftingFamilyActivity('researching the stack')).toBe(false);
     expect(isDraftingFamilyActivity('auditing the delivery')).toBe(false);
+    // The waiting-on-user state is not live work, so it is not a drafting-family activity.
+    expect(isDraftingFamilyActivity('waiting on you — 2 assumptions')).toBe(false);
     expect(isDraftingFamilyActivity(undefined)).toBe(false);
     expect(isDraftingFamilyActivity(null)).toBe(false);
+  });
+});
+
+describe('isWaitingOnUserActivity', () => {
+  it('prefix-matches the waiting-on-user label regardless of the assumption count', () => {
+    expect(isWaitingOnUserActivity('waiting on you — 1 assumption')).toBe(true);
+    expect(isWaitingOnUserActivity('waiting on you — 7 assumptions')).toBe(true);
+    expect(isWaitingOnUserActivity('drafting the TRD')).toBe(false);
+    expect(isWaitingOnUserActivity('researching the stack')).toBe(false);
+    expect(isWaitingOnUserActivity(undefined)).toBe(false);
+    expect(isWaitingOnUserActivity(null)).toBe(false);
   });
 });

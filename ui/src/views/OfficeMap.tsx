@@ -7,6 +7,7 @@ import {
   isAuditLive,
   isDraftingFamilyActivity,
   isResearchLive,
+  isWaitingOnUserActivity,
   clampMaxWorkers,
   occupiedCount,
   presenceFor,
@@ -137,6 +138,9 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
   const pmPacing = phaseKind === 'drafting' || phaseKind === 'ready';
   const researchLive = isResearchLive(project as any);
   const auditLive = isAuditLive(project as any);
+  // Safeguard feature 5: the drafting pipeline is stopped on pending assumptions — the PM stands
+  // at the front office with a "?" over their head, waiting on the user.
+  const waitingOnUser = isWaitingOnUserActivity(project?.officeActivity?.label);
 
   // PM: paces the bottom lane while drafting/ready, else stands by the wall board (running+).
   const pmLaneY = height - 84;
@@ -345,17 +349,32 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
             />
           )}
           <Sprite src={`${S}${pmStep}.png`} left={pmX} top={pmLaneY} w={STAFF} h={STAFF} z={5} flip={pmFlip} />
+          {/* Waiting on the user (pending assumptions): a "?" bubble above the PM. */}
+          {waitingOnUser && (
+            <img
+              src={`${S}bubble_q.png`}
+              alt=""
+              aria-hidden
+              data-testid="pm-waiting-bubble"
+              style={{
+                position: 'absolute', left: pmX + 14, top: pmLaneY - 22, width: BUB_W, height: BUB_H,
+                zIndex: 6, imageRendering: 'pixelated', pointerEvents: 'none',
+              }}
+            />
+          )}
           <div
             style={{
               position: 'absolute', left: pmX - 16, top: pmLaneY + STAFF, width: 80, textAlign: 'center',
-              fontSize: '0.62rem', color: 'var(--wf-dim)', zIndex: 5, whiteSpace: 'nowrap',
+              fontSize: '0.62rem', color: waitingOnUser ? 'var(--wf-warn)' : 'var(--wf-dim)', zIndex: 5, whiteSpace: 'nowrap',
             }}
           >
-            {pmPacing
-              ? 'front office'
-              : isDraftingFamilyActivity(project?.officeActivity?.label)
-                ? `PM · ${project.officeActivity!.label}`
-                : 'PM · standup'}
+            {waitingOnUser
+              ? 'front office - waiting on you'
+              : pmPacing
+                ? 'front office'
+                : isDraftingFamilyActivity(project?.officeActivity?.label)
+                  ? `PM · ${project.officeActivity!.label}`
+                  : 'PM · standup'}
           </div>
         </motion.div>
       </div>

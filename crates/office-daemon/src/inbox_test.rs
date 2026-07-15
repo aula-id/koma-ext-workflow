@@ -202,6 +202,37 @@ fn breakdown_parses() {
 }
 
 #[test]
+fn approve_parses() {
+    let tmp = TempDir::new().unwrap();
+    let inbox = tmp.path();
+    write_inbox_file(inbox, "7d-approve.json", r#"{"op":"approve","project":"shop"}"#);
+
+    let outcomes = poll(inbox, MAX_FILES_PER_TICK);
+    match &outcomes[0] {
+        InboxOutcome::Accepted { command, ack, .. } => {
+            assert_eq!(*command, Command::Approve { project: "shop".to_string() });
+            assert_eq!(ack, "queued");
+        }
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+}
+
+#[test]
+fn approve_missing_project_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let inbox = tmp.path();
+    write_inbox_file(inbox, "7e-approve-bad.json", r#"{"op":"approve"}"#);
+
+    let outcomes = poll(inbox, MAX_FILES_PER_TICK);
+    match &outcomes[0] {
+        InboxOutcome::Rejected { reason, .. } => {
+            assert!(reason.contains("project"), "reason: {reason}");
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+#[test]
 fn breakdown_missing_project_is_rejected() {
     let tmp = TempDir::new().unwrap();
     let inbox = tmp.path();
@@ -451,6 +482,13 @@ fn every_inboxmsg_builder_roundtrips_through_parse() {
                 project: "shop".to_string(),
             },
         ),
+        (
+            "11-approve.json",
+            inboxmsg::approve("shop"),
+            Command::Approve {
+                project: "shop".to_string(),
+            },
+        ),
     ];
 
     for (name, value, _expected) in &cases {
@@ -511,6 +549,10 @@ fn peek_target_classifies_every_op() {
     );
     assert_eq!(
         peek_target(r#"{"op":"archive_project","project":"shop"}"#),
+        Target::Project { project: Some("shop".to_string()) }
+    );
+    assert_eq!(
+        peek_target(r#"{"op":"approve","project":"shop"}"#),
         Target::Project { project: Some("shop".to_string()) }
     );
     // Undeterminable: bad JSON, unknown op, non-object, comment with no task.

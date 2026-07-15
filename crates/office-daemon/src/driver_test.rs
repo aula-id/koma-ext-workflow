@@ -73,6 +73,7 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         assumptions_approved: false,
         self_resolved_assumptions: vec![],
         capture_nudge_count: 0,
+        assumption_rounds: 0,
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -448,7 +449,7 @@ fn config_set_applies_partial_update_including_keep_desks() {
             keep_desks: Some(true),
             crd_pass_grade: None,
             assumption_check: None,
-            assumption_trust: None,
+            assumption_mode: None,
         }),
         2_000,
     );
@@ -480,7 +481,7 @@ fn config_set_max_workers_is_clamped_to_the_project_ceiling() {
             keep_desks: None,
             crd_pass_grade: None,
             assumption_check: None,
-            assumption_trust: None,
+            assumption_mode: None,
         }),
         2_000,
     );
@@ -505,7 +506,7 @@ fn config_set_on_a_non_owned_project_is_dropped_not_applied() {
             keep_desks: Some(true),
             crd_pass_grade: None,
             assumption_check: None,
-            assumption_trust: None,
+            assumption_mode: None,
         }),
         2_000,
     );
@@ -867,6 +868,7 @@ fn office_activity_labels_every_invoke_purpose() {
         (InvokePurpose::AssumeCheckPrd, "fact-checking the PRD"),
         (InvokePurpose::AssumeCheckTrd, "fact-checking the TRD"),
         (InvokePurpose::AssumeCheckCrd, "fact-checking the CRD"),
+        (InvokePurpose::AssumeResolve, "resolving assumptions"),
         (InvokePurpose::Trd, "drafting the TRD"),
         (InvokePurpose::Crd, "drafting the CRD"),
         (InvokePurpose::Breakdown, "breaking down the plan"),
@@ -931,6 +933,39 @@ fn office_activity_none_when_nothing_live() {
     let pending: HashMap<u64, InvokeJob> = HashMap::new();
     let p = drafting("a");
     assert_eq!(office_activity(&pending, &p), None::<OfficeActivity>);
+}
+
+#[test]
+fn office_activity_waiting_on_user_when_pending_assumptions_and_nothing_else_live() {
+    // Feature 5: no invoke/research/audit is live but the drafting pipeline is STOPPED on the
+    // safeguard's pending assumptions -> a "waiting on you — N assumptions" label with a 0
+    // sentinel timestamp (the UI hides the elapsed suffix when since_ms == 0).
+    let pending: HashMap<u64, InvokeJob> = HashMap::new();
+    let mut p = drafting("a");
+    p.pending_assumptions = vec!["assumed Postgres".to_string(), "assumed React".to_string()];
+    let activity = office_activity(&pending, &p).expect("a waiting-on-user activity");
+    assert_eq!(activity.label, "waiting on you — 2 assumptions");
+    assert_eq!(activity.since_ms, 0);
+}
+
+#[test]
+fn office_activity_singular_assumption_label() {
+    let pending: HashMap<u64, InvokeJob> = HashMap::new();
+    let mut p = drafting("a");
+    p.pending_assumptions = vec!["assumed Postgres".to_string()];
+    let activity = office_activity(&pending, &p).expect("a waiting-on-user activity");
+    assert_eq!(activity.label, "waiting on you — 1 assumption");
+}
+
+#[test]
+fn office_activity_live_invoke_wins_over_waiting_on_user() {
+    // A live invoke still wins over the waiting state — the office is actively working again.
+    let mut pending: HashMap<u64, InvokeJob> = HashMap::new();
+    pending.insert(1, invoke_job(1, "a", InvokePurpose::Persona, 500));
+    let mut p = drafting("a");
+    p.pending_assumptions = vec!["assumed Postgres".to_string()];
+    let activity = office_activity(&pending, &p).expect("invoke activity wins");
+    assert_eq!(activity.label, "office is replying");
 }
 
 // ---------------------------------------------------------------------------

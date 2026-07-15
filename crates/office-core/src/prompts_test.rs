@@ -21,6 +21,7 @@ mod tests {
             assumptions_approved: false,
             self_resolved_assumptions: Vec::new(),
             capture_nudge_count: 0,
+            assumption_rounds: 0,
             office_transcript: Vec::new(),
             office_summary: String::new(),
             delivery_path: Some("/work/session/deliver".into()),
