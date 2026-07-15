@@ -445,6 +445,71 @@ fn config_set_on_a_non_owned_project_is_dropped_not_applied() {
 }
 
 // ---------------------------------------------------------------------------
+// 7b. manual project delete (Settings "danger zone", 10.2 project_archive)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn project_archive_kills_bindings_removes_project_and_deletes_state() {
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("agents.kill", json!({ "killed": true }));
+    let mut d = driver(store, host);
+
+    let t = task(
+        "auth/t1",
+        TaskState::OnProgress { binding: worker_binding(101, 1_000), attempt: 1 },
+    );
+    d.insert_for_test(project("auth", ProjectPhase::Running, vec![t]), 1_000);
+    assert!(d.holds_lease("auth"));
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::ProjectArchive { project: "auth".to_string() }),
+        2_000,
+    );
+
+    assert_eq!(call_count(&d.host, "agents.kill"), 1, "the in-flight binding is killed");
+    assert_eq!(
+        last_call(&d.host, "agents.kill").unwrap().get("agentId").and_then(Value::as_u64),
+        Some(101)
+    );
+
+    assert!(d.project("auth").is_none(), "the project is removed from memory");
+    assert!(
+        d.projects_for_test().iter().all(|p| p.id.0 != "auth"),
+        "removed from projects_for_test too"
+    );
+    assert!(d.store.load_project("auth").is_err(), "state.json is no longer loadable");
+    assert!(
+        d.store.registry().unwrap().iter().all(|r| r.project_id != "auth"),
+        "the registry row is removed"
+    );
+}
+
+#[test]
+fn project_archive_on_a_non_owned_project_is_dropped_project_still_present() {
+    let (store, _dir) = temp_store();
+    // "other" is in the store (registry + state.json) but this driver never acquires its
+    // lease (loaded via `driver()`, not `insert_for_test`/`bootstrap`), so it is owned by
+    // no one here — an archive request for it must be silently dropped, same as
+    // `config_set_on_a_non_owned_project_is_dropped_not_applied` above.
+    store
+        .save_project(&project("other", ProjectPhase::Running, vec![]))
+        .expect("seed other");
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    assert!(!d.holds_lease("other"), "we must not own 'other'");
+
+    d.handle(
+        handlers::Input::Command(handlers::Command::ProjectArchive { project: "other".to_string() }),
+        2_000,
+    );
+
+    assert_eq!(call_count(&d.host, "agents.kill"), 0, "no bindings are killed for a dropped archive");
+    assert!(d.project("other").is_some(), "a non-owned archive must be dropped, not applied");
+    assert!(d.store.load_project("other").is_ok(), "state.json must remain on disk");
+}
+
+// ---------------------------------------------------------------------------
 // 8. off-loop invoke pool (W9, ARCHITECTURE.md 5.1 / 6.2)
 // ---------------------------------------------------------------------------
 

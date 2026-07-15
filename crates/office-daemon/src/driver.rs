@@ -468,6 +468,9 @@ impl<H: Host> Driver<H> {
                     );
                 }
             }
+            // Manual project delete (Settings panel "danger zone"): lease-holder only,
+            // mirroring Interrupt/Resume/Unpark/ConfigSet above.
+            DCmd::ProjectArchive { project } => self.archive_project(&project, now_ms),
             // Remaining panel/tool surface not owned by W9; no-ops until their waves wire
             // them (status digests, board edits, project lifecycle).
             DCmd::Status { .. }
@@ -475,7 +478,6 @@ impl<H: Host> Driver<H> {
             | DCmd::CardMove { .. }
             | DCmd::EditTask { .. }
             | DCmd::EditDeps { .. }
-            | DCmd::ProjectArchive { .. }
             | DCmd::TaskDetail { .. } => {}
             // hello/state/prd_get are answered INLINE by the handler off the snapshot
             // cache (10.2 section 1.1) and never reach the driver; matched for totality.
@@ -944,6 +946,51 @@ impl<H: Host> Driver<H> {
             }
             n += 1;
         }
+    }
+
+    /// Manually delete a project (Settings panel "danger zone", 10.2 `project_archive`):
+    /// lease-holder only, silently dropped for a non-holder exactly like
+    /// `Interrupt`/`Resume`/`Unpark`/`ConfigSet` above. Best-effort kills every in-flight
+    /// worker/reviewer binding, deletes the project's desks working directory, releases the
+    /// lease, then removes the on-disk state (state.json + registry row, `Store::
+    /// archive_project`'s registry-row-before-dir-delete ordering) and the in-memory
+    /// project. NEVER touches `delivery_path` — delivered code stays exactly where it was
+    /// placed.
+    fn archive_project(&mut self, project: &str, now_ms: u64) {
+        let idx = match self.owned_project_by_id(project) {
+            Some(i) => i,
+            None => return,
+        };
+        let slug = self.projects[idx].project.id.0.clone();
+
+        // Best-effort: kill every in-flight worker/reviewer binding so nothing keeps
+        // running against a project that is about to stop existing.
+        let agent_ids: Vec<u64> = self.projects[idx]
+            .project
+            .tasks
+            .iter()
+            .filter_map(|t| binding_agent_id(&t.state))
+            .filter(|id| *id != 0)
+            .collect();
+        for agent_id in agent_ids {
+            self.host.call("agents.kill", json!({ "agentId": agent_id }));
+        }
+
+        // Best-effort: delete the desks working directory. NEVER touch delivery_path.
+        if let Some(ws) = self.projects[idx].project.workspace.clone() {
+            let desks_dir = ws.join("koma-workflow").join("desks").join(&slug);
+            let _ = std::fs::remove_dir_all(&desks_dir);
+        }
+
+        // Release the lease before the store deletes the state dir it lives under.
+        let lease_path = self.store.lease_path(&slug);
+        let _ = lease::release(&lease_path, &self.instance);
+
+        let _ = self.store.archive_project(&slug);
+
+        self.projects.remove(idx);
+        self.ctx_dirty = true;
+        self.push_board(now_ms, true);
     }
 
     // -- off-loop invoke pool (5.1) ----------------------------------------

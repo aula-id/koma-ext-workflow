@@ -432,16 +432,16 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
         other => return error(&format!("unknown panel op: {other}")),
     };
 
-    // `driver::handle_command` currently no-ops these four ops (board edits + project
-    // archive are not wired into the kernel yet; `config_set` IS wired, see
-    // `driver::handle_command`'s `DCmd::ConfigSet` arm). Telling the panel `{ok:true}`
-    // for a write that silently vanishes is worse than an honest error: the panel would
-    // show no toast and the very next snapshot push would revert the optimistic UI
-    // change with no explanation. Surface a real error until a later wave wires these
-    // through.
+    // `driver::handle_command` currently no-ops these three ops (board edits are not wired
+    // into the kernel yet; `config_set`/`project_archive` ARE wired, see
+    // `driver::handle_command`'s `DCmd::ConfigSet`/`DCmd::ProjectArchive` arms). Telling the
+    // panel `{ok:true}` for a write that silently vanishes is worse than an honest error:
+    // the panel would show no toast and the very next snapshot push would revert the
+    // optimistic UI change with no explanation. Surface a real error until a later wave
+    // wires these through.
     let unimplemented = matches!(
         command,
-        Command::CardMove { .. } | Command::EditTask { .. } | Command::EditDeps { .. } | Command::ProjectArchive { .. }
+        Command::CardMove { .. } | Command::EditTask { .. } | Command::EditDeps { .. }
     );
     send(tx, command);
     if unimplemented {

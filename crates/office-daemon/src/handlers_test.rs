@@ -407,7 +407,6 @@ fn panel_msg_unwired_write_ops_ack_with_error_not_false_success() {
         json!({ "op": "card_move", "task": "t1", "to": "todo" }),
         json!({ "op": "edit_task", "task": "t1", "priority": 5 }),
         json!({ "op": "edit_deps", "task": "t1", "deps": [] }),
-        json!({ "op": "project_archive", "project": "auth" }),
     ];
     for payload in cases {
         let op = payload.get("op").and_then(Value::as_str).unwrap().to_string();
@@ -437,6 +436,7 @@ fn panel_msg_wired_write_ops_still_ack_success() {
         json!({ "op": "unpark", "task": "t1" }),
         json!({ "op": "project_create", "name": "New" }),
         json!({ "op": "config_set", "project": "auth", "maxWorkers": 3, "keepDesks": true }),
+        json!({ "op": "project_archive", "project": "auth" }),
     ];
     for payload in cases {
         let (tx, _rx) = channel();

@@ -175,4 +175,42 @@ describe('Settings (real component, rendered)', () => {
     await submitForm();
     expect(container.textContent).toContain('Access denied');
   });
+
+  describe('danger zone: delete project', () => {
+    function deleteButton(): HTMLButtonElement {
+      return container.querySelector('[data-testid="settings-delete-project"]') as HTMLButtonElement;
+    }
+
+    it('renders the delete button only when a project is selected', () => {
+      useStore.setState({ snapshot: null, projects: [] });
+      act(() => {
+        root.render(React.createElement(Settings, { projectId: 'nonexistent' }));
+      });
+      expect(deleteButton()).toBeFalsy();
+
+      seedProject();
+      renderSettings();
+      expect(deleteButton()).toBeTruthy();
+    });
+
+    it('requires a second click (armed state) before sending project_archive', async () => {
+      seedProject();
+      renderSettings();
+
+      const btn = deleteButton();
+
+      // First click arms the button; nothing is sent yet.
+      act(() => {
+        btn.click();
+      });
+      expect(bridge.send).not.toHaveBeenCalled();
+
+      // Second click fires the confirmed action.
+      await act(async () => {
+        btn.click();
+        await Promise.resolve();
+      });
+      expect(bridge.send).toHaveBeenCalledWith({ op: 'project_archive', project: 'p1' });
+    });
+  });
 });

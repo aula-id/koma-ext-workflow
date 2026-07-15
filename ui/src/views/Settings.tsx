@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useStore, Project } from '../store';
 import { bridge } from '../bridge';
 import { themeManager, Theme } from '../theme';
+import { ConfirmButton } from '../components/ConfirmButton';
 
 interface SettingsProps {
   projectId?: string;
@@ -140,6 +141,27 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
       setError(err.message || 'Failed to save settings');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleDeleteProject = async () => {
+    if (!selectedProject) return;
+
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const result = await bridge.send({ op: 'project_archive', project: selectedProject.id });
+
+      if (result.error) {
+        setError(result.error);
+      } else {
+        setSelectedProject(null);
+        setSuccess('Project deleted');
+        setTimeout(() => setSuccess(null), 3000);
+      }
+    } catch (err: any) {
+      setError(err.message || 'Failed to delete project');
     }
   };
 
@@ -360,6 +382,21 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                 </div>
               </div>
             </form>
+
+            {/* Danger zone */}
+            <div className="wf-section">
+              <h2 className="wf-section-title">Danger zone</h2>
+              <p style={{ fontSize: '0.72rem', color: 'var(--wf-dim)', margin: '0 0 0.6rem' }}>
+                Deletes the board, PRD, comments, and desks for {selectedProject.name}. Delivered code in the
+                delivery path is not touched.
+              </p>
+              <ConfirmButton
+                label="delete project"
+                className="wf-btn wf-btn-danger"
+                testId="settings-delete-project"
+                onConfirm={handleDeleteProject}
+              />
+            </div>
           </>
         )}
       </div>
