@@ -340,7 +340,8 @@ target, each running `pack.sh` with `PACK_TARGET`/`PACK_PLATFORM` set:
 - `workflow-linux-x64.zip` (`x86_64-unknown-linux-gnu`, `ubuntu-latest`)
 - `workflow-linux-arm64.zip` (`aarch64-unknown-linux-gnu`, `ubuntu-24.04-arm`, native runner)
 
-Requires a repo secret `KOMA_DEPLOY_KEY`: a read-only SSH deploy key for `aula-id/koma` (the
-private `koma-extension` crate dependency), loaded via `webfactory/ssh-agent`.
+No secrets required: the `koma-extension` crate dependency is fetched anonymously over
+https (koma is open source). Store signing is deliberately NOT done in CI — release zips
+are unsigned; signing happens out-of-band at store-publish time.
 
 All 5 zips are unsigned — store-side signing, if any, happens out-of-band, not in this workflow.

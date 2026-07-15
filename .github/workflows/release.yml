@@ -45,19 +45,9 @@ jobs:
         uses: actions/checkout@v4
 
       # koma-extension (crates/office-daemon/Cargo.toml) is fetched over
-      # ssh://git@github.com/aula-id/koma.git, a private repo; .cargo/config.toml
-      # already sets git-fetch-with-cli so cargo shells out to the real git CLI
-      # below, which needs this key loaded and github.com trusted.
-      - name: Load koma deploy key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.KOMA_DEPLOY_KEY }}
-
-      - name: Trust github.com host key
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-
+      # https://github.com/aula-id/koma.git — koma is open source, so the
+      # anonymous clone needs no credentials (.cargo/config.toml's
+      # git-fetch-with-cli shells out to the runner's git).
       - name: Add rust target
         run: rustup target add ${{ matrix.target }}
 
