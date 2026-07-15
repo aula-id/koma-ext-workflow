@@ -64,11 +64,14 @@
   .station .tag {
     position: absolute;
     top: 148px;
-    left: 0;
-    width: 96px;
+    left: -20px;
+    width: 136px;
     text-align: center;
     font-size: 11px;
     color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .station .tag .dot {
     display: inline-block;
@@ -79,9 +82,9 @@
   }
   .station .task {
     position: absolute;
-    top: 164px;
-    left: -12px;
-    width: 120px;
+    top: 165px;
+    left: -20px;
+    width: 136px;
     text-align: center;
     font-size: 10px;
     color: var(--dim);
