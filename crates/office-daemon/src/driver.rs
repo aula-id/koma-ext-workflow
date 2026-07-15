@@ -1715,7 +1715,11 @@ impl<H: Host> Driver<H> {
         let event = match outcome {
             crate::git::MergeOutcome::Merged => kernel::HostEvent::DeskMerged { task },
             crate::git::MergeOutcome::Conflict(summary) => {
-                kernel::HostEvent::DeskMergeConflict { task, summary }
+                kernel::HostEvent::DeskMergeConflict { task, summary, is_conflict: true }
+            }
+            // item 4: a non-conflict merge failure — same bounce path, distinct wording.
+            crate::git::MergeOutcome::Failed(summary) => {
+                kernel::HostEvent::DeskMergeConflict { task, summary, is_conflict: false }
             }
         };
         self.step(idx, kernel::Input::Host(event), now_ms);

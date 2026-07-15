@@ -125,10 +125,65 @@ fn merge_conflict_is_reported_and_leaves_main_clean() {
             summary.contains("shared.txt"),
             "conflict summary names the file: {summary}"
         ),
-        MergeOutcome::Merged => panic!("expected a conflict"),
+        other => panic!("expected a conflict, got {other:?}"),
     }
     // Main is left clean (the aborted merge did not corrupt it): still the main-side content.
     assert_eq!(read(repo, "shared.txt"), "main-side change\n");
+}
+
+#[test]
+fn merge_non_conflict_failure_is_reported_as_failed_not_conflict() {
+    // item 4: a merge failure with NO conflicted files (branch doesn't exist) must not be reported
+    // as a Conflict — that would misleadingly tell the caller to "resolve the conflict".
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let g = git();
+    g.init_repo(repo).unwrap();
+
+    match g.merge(repo, "task/does-not-exist") {
+        MergeOutcome::Failed(summary) => assert!(!summary.is_empty(), "failure carries a reason"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[test]
+fn commit_and_merge_succeed_without_any_configured_identity() {
+    // item 2: an ADOPTED repo (raw `git init`, no local identity — unlike our `init_repo`) must
+    // still be committable/mergeable. HOME points at an empty tempdir so no real `~/.gitconfig`
+    // leaks an identity in either — without the explicit `-c user.email=.../user.name=...` on the
+    // commit-creating calls, this would fail with "committer identity unknown".
+    let empty_home = tempfile::tempdir().unwrap();
+    let saved_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", empty_home.path());
+
+    let result = std::panic::catch_unwind(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let g = git();
+        // Raw `git init`, NOT `g.init_repo` — no local user.email/user.name is configured.
+        std::process::Command::new("git").arg("-C").arg(repo).arg("init").output().unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .unwrap();
+        write(repo, "seed.txt", "seed\n");
+        g.commit_all(repo, "seed commit").expect("commit with no configured identity");
+
+        let deskdir = tempfile::tempdir().unwrap();
+        let desk = deskdir.path().join("t1");
+        g.add_worktree(repo, &desk, "task/t1").expect("worktree");
+        write(&desk, "added.rs", "// from t1\n");
+        g.commit_all(&desk, "workflow: task t1").expect("desk commit with no configured identity");
+        assert_eq!(g.merge(repo, "task/t1"), MergeOutcome::Merged, "merge with no configured identity");
+    });
+
+    match saved_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    result.expect("test body panicked");
 }
 
 #[test]

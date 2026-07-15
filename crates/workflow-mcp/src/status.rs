@@ -225,6 +225,7 @@ fn park_reason_label(reason: &ParkReason) -> String {
         ParkReason::WorkerBlocked(r) => format!("worker blocked: {r}"),
         ParkReason::SpawnFailed(r) => format!("spawn failed: {r}"),
         ParkReason::AuditFailed(r) => format!("audit failed: {r}"),
+        ParkReason::InstantDeath(r) => format!("chronic instant death: {r}"),
     }
 }
 

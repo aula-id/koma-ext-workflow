@@ -63,6 +63,9 @@ fn attention_lines(p: &Project) -> Vec<String> {
                 ParkReason::AuditFailed(r) => {
                     format!("audit failed: {}", truncate_bytes(r, CAP_ATTENTION_REASON))
                 }
+                ParkReason::InstantDeath(r) => {
+                    format!("chronic instant death: {}", truncate_bytes(r, CAP_ATTENTION_REASON))
+                }
             };
             out.push(format!("{} parked: {}", t.id.0, label));
         }

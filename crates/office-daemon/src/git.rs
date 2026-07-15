@@ -38,10 +38,25 @@ impl GitError {
 pub enum MergeOutcome {
     /// Merged cleanly (fast-forward or a merge commit).
     Merged,
-    /// The merge could not complete cleanly; carries a conflict/error summary. The working tree is
-    /// left clean (any partial merge is aborted) so main is never corrupted.
+    /// The merge could not complete cleanly because of a REAL content conflict — at least one file
+    /// came back from `diff --name-only --diff-filter=U`. Carries a summary naming the conflicting
+    /// files. The working tree is left clean (any partial merge is aborted) so main is never
+    /// corrupted.
     Conflict(String),
+    /// The merge failed for a reason OTHER than a content conflict (no conflicted files were found —
+    /// a dirty/locked repo, a missing branch, etc.). Carries the raw error. Distinguished from
+    /// `Conflict` (item 4) so the task's bounce note doesn't misleadingly tell the user to "resolve
+    /// the conflict" when there isn't one.
+    Failed(String),
 }
+
+/// Git identity stamped via explicit `-c` flags on every commit-creating invocation (item 2) — so a
+/// commit/merge never fails with "committer identity unknown" regardless of the repo's local config
+/// (an ADOPTED existing repo, unlike one `init_repo` creates, has none) or the environment's
+/// global/system git config (may be absent, e.g. a fresh CI box). Matches the identity `init_repo`
+/// also sets locally, so `git log` shows the same author either way.
+const COMMIT_EMAIL: &str = "office@koma-workflow.local";
+const COMMIT_NAME: &str = "Workflow Office";
 
 /// An injectable handle to the `git` binary. Cheap to clone.
 #[derive(Clone, Debug)]
@@ -58,7 +73,23 @@ impl Git {
 
     /// Run `git -C <cwd> <args...>`; `Ok(stdout)` on exit 0, else a classified [`GitError`].
     fn run(&self, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
+        self.exec(cwd, &[], args)
+    }
+
+    /// Run `git` with the office's committer identity stamped via `-c` flags (item 2), for the ops
+    /// that can create a commit (`commit_all`'s `commit`, `merge`'s `merge`) — so identity never
+    /// depends on the repo's local config or the environment's global/system config.
+    fn run_as_committer(&self, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
+        let email = format!("user.email={COMMIT_EMAIL}");
+        let name = format!("user.name={COMMIT_NAME}");
+        self.exec(cwd, &["-c", &email, "-c", &name], args)
+    }
+
+    /// Shared subprocess runner behind [`run`]/[`run_as_committer`]. `pre_args` are global `git`
+    /// options (e.g. `-c user.email=...`) that must precede `-C`/the subcommand on the command line.
+    fn exec(&self, cwd: &Path, pre_args: &[&str], args: &[&str]) -> Result<String, GitError> {
         let out = Command::new(&self.bin)
+            .args(pre_args)
             .arg("-C")
             .arg(cwd)
             .args(args)
@@ -133,7 +164,8 @@ impl Git {
         if self.run(desk, &["status", "--porcelain"])?.trim().is_empty() {
             return Ok(()); // nothing staged: an empty delivery, not an error
         }
-        self.run(desk, &["commit", "-m", msg])?;
+        // item 2: explicit identity so an adopted repo (no local config) still commits.
+        self.run_as_committer(desk, &["commit", "-m", msg])?;
         Ok(())
     }
 
@@ -149,11 +181,14 @@ impl Git {
         self.run(desk, &["diff", &range, "--stat"]).unwrap_or_default()
     }
 
-    /// Merge `branch` into the repo's main branch, fast-forward preferred (item 1). A clean merge
-    /// -> [`MergeOutcome::Merged`]; anything else (conflict or error) aborts any partial merge and
-    /// returns [`MergeOutcome::Conflict`] with a summary of the conflicting files.
+    /// Merge `branch` into the repo's main branch, fast-forward preferred (item 1). A clean merge ->
+    /// [`MergeOutcome::Merged`]; a REAL content conflict (conflicted files found) ->
+    /// [`MergeOutcome::Conflict`] with a summary of them; any other failure ->
+    /// [`MergeOutcome::Failed`] with the raw error (item 4) — not mislabeled as a conflict.
     pub fn merge(&self, repo: &Path, branch: &str) -> MergeOutcome {
-        match self.run(repo, &["merge", "--no-edit", branch]) {
+        // item 2: explicit identity so an adopted repo (no local config) can still make the merge
+        // commit.
+        match self.run_as_committer(repo, &["merge", "--no-edit", branch]) {
             Ok(_) => MergeOutcome::Merged,
             Err(e) => {
                 let conflicts = self
@@ -163,12 +198,11 @@ impl Git {
                 // progress, e.g. a non-conflict error).
                 let _ = self.run(repo, &["merge", "--abort"]);
                 let files: Vec<&str> = conflicts.split_whitespace().collect();
-                let summary = if files.is_empty() {
-                    e.reason()
+                if files.is_empty() {
+                    MergeOutcome::Failed(e.reason())
                 } else {
-                    format!("conflict in {}", files.join(", "))
-                };
-                MergeOutcome::Conflict(summary)
+                    MergeOutcome::Conflict(format!("conflict in {}", files.join(", ")))
+                }
             }
         }
     }

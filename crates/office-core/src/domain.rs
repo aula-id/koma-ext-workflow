@@ -99,6 +99,10 @@ pub enum ParkReason {
     /// failures so the halt/attention lines can explain it. The user fixes manually and
     /// unparks, or lowers the threshold in settings.
     AuditFailed(String),
+    /// The task's agent died < 5s after spawn (an "instant death") three times in a row with no
+    /// non-instant run in between (item 3) — a blind retry loop would just replay the crash forever,
+    /// so the office parks it instead. Carries the last death reason.
+    InstantDeath(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

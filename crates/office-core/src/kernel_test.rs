@@ -2945,6 +2945,7 @@ fn worktree_merge_conflict_bounces_with_the_conflict_summary() {
         Input::Host(HostEvent::DeskMergeConflict {
             task: TaskId("t1".into()),
             summary: "conflict in shared.rs".into(),
+            is_conflict: true,
         }),
         2000,
         0,
@@ -2956,6 +2957,35 @@ fn worktree_merge_conflict_bounces_with_the_conflict_summary() {
     assert!(after.last_review.as_deref().unwrap().contains("merge conflict"));
     assert!(after.last_review.as_deref().unwrap().contains("shared.rs"));
     assert_eq!(next_attempt(after), 2);
+}
+
+#[test]
+fn worktree_merge_failure_non_conflict_bounces_with_failed_wording() {
+    // item 4 (adversarial review finding 4): a non-conflict merge failure (`is_conflict: false`)
+    // must NOT say "merge conflict" — that misleads the user into thinking there's something to
+    // resolve when there isn't; it should say the task was just re-queued.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.awaiting_merge = true;
+    let mut p = worktree_project(vec![t]);
+    p.config.bounce_budget = 3;
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::DeskMergeConflict {
+            task: TaskId("t1".into()),
+            summary: "repository is locked".into(),
+            is_conflict: false,
+        }),
+        2000,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert!(matches!(after.state, TaskState::Todo));
+    let note = after.last_review.as_deref().unwrap();
+    assert!(note.contains("merge failed"), "note: {note}");
+    assert!(note.contains("repository is locked"), "note: {note}");
+    assert!(!note.contains("conflict"), "must not call a non-conflict failure a conflict: {note}");
 }
 
 #[test]
@@ -3046,6 +3076,185 @@ fn daemon_restart_death_pauses_without_burning_the_attempt() {
     assert_eq!(next_attempt(t), 2, "attempt preserved (not burned)");
     assert_eq!(t.dispatch_after_ms, 0, "no backoff on a daemon-restart pause");
     assert!(t.history.iter().any(|e| e.event == "paused:daemon-restart"));
+}
+
+#[test]
+fn reviewer_instant_death_preserves_diff_stat_and_redispatches() {
+    // adversarial review finding 1: a REVIEWER death must NOT clear diff_stat — the reviewer never
+    // touches the worktree, and worktree-mode review dispatch (`pending_reviews_sorted`) gates on
+    // `diff_stat.is_some()`. Clearing it here would permanently wedge the task, since the worker's
+    // commit step is the only other writer and a reviewer-only retry never re-runs it.
+    let mut t = task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.diff_stat = Some("1 file changed".to_string());
+    let mut p = worktree_project(vec![t]);
+
+    // Reviewer dies instantly (< 5s after spawn).
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 3, status: "error".into(), error: Some("oom".into()) }),
+        500,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert_eq!(after.diff_stat.as_deref(), Some("1 file changed"), "diff_stat survives a reviewer death");
+    assert!(matches!(after.state, TaskState::Review { binding: None, .. }));
+
+    // Once the instant-death backoff elapses, the reviewer re-dispatches — proving the task isn't
+    // wedged (pending_reviews_sorted would filter it out forever if diff_stat had been cleared).
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 500 + 10_000, 4);
+    assert_eq!(spawn_agents(&fx), vec!["office-reviewer"], "reviewer re-dispatches");
+}
+
+#[test]
+fn reviewer_daemon_restart_preserves_diff_stat() {
+    // adversarial review finding 1, daemon-restart variant: `pause_for_daemon_restart`'s Review arm
+    // must also not clear diff_stat.
+    let mut t = task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[]);
+    t.diff_stat = Some("1 file changed".to_string());
+    let mut p = worktree_project(vec![t]);
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone {
+            agent_id: 3,
+            status: "killed".into(),
+            error: Some("agent lost: daemon restart in progress".into()),
+        }),
+        500,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert_eq!(after.diff_stat.as_deref(), Some("1 file changed"), "diff_stat survives a reviewer daemon-restart pause");
+    assert!(matches!(after.state, TaskState::Review { binding: None, .. }));
+}
+
+#[test]
+fn worker_instant_death_still_clears_diff_stat() {
+    // Sanity counterpart to the two tests above: a WORKER death (the one binding kind that actually
+    // touches the worktree) must still clear diff_stat so a fresh worktree recomputes it.
+    let mut t = task("t1", TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 }, 0, &[]);
+    t.diff_stat = Some("stale".to_string());
+    let mut p = worktree_project(vec![t]);
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 7, status: "error".into(), error: None }),
+        500,
+        0,
+    );
+    assert_eq!(find_task(&p, "t1").diff_stat, None, "worker death still clears diff_stat");
+}
+
+#[test]
+fn three_consecutive_instant_deaths_park_with_chronic_reason() {
+    // adversarial review finding 3: an instant-death retry loop had no ceiling before this fix —
+    // mirroring the SpawnFailed pattern, three in a row now parks the task with the last death
+    // reason instead of retrying forever.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(1, 0), attempt: 1 }, 0, &[])],
+    );
+
+    // Death 1 (instant): re-queued, not parked yet.
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 1, status: "error".into(), error: Some("crash A".into()) }),
+        500,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo));
+
+    // Death 2 (instant): still re-queued.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(2, 1_000), attempt: 2 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 2, status: "error".into(), error: Some("crash B".into()) }),
+        1_400,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo), "2 instant deaths still retries");
+
+    // Death 3 (instant): parks with the chronic-death reason.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(3, 2_000), attempt: 3 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 3, status: "error".into(), error: Some("crash C".into()) }),
+        2_400,
+        0,
+    );
+    match &find_task(&p, "t1").state {
+        TaskState::Parked { reason: ParkReason::InstantDeath(r), .. } => {
+            assert!(r.contains("crash C"), "carries the last death reason: {r}")
+        }
+        other => panic!("expected Parked(InstantDeath), got {other:?}"),
+    }
+    assert_eq!(
+        find_task(&p, "t1").history.iter().filter(|e| e.event.starts_with("died-at-step-0")).count(),
+        3,
+        "three instant-death markers recorded"
+    );
+}
+
+#[test]
+fn instant_death_streak_resets_after_a_long_lived_attempt() {
+    // adversarial review finding 3: 2 instant deaths, then an attempt that runs a while before
+    // dying (non-instant), resets the consecutive streak — a further 2 instant deaths afterward
+    // must NOT park yet (it would take 3 more).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(1, 0), attempt: 1 }, 0, &[])],
+    );
+
+    // 2 instant deaths.
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 1, status: "error".into(), error: Some("crash A".into()) }),
+        500,
+        0,
+    );
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(2, 1_000), attempt: 2 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 2, status: "error".into(), error: Some("crash B".into()) }),
+        1_400,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo));
+
+    // Attempt 3 runs a WHILE (spawned at 2_000, dies at 20_000 => 18s alive, past the 5s window)
+    // then dies -> non-instant, resets the streak.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(3, 2_000), attempt: 3 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 3, status: "error".into(), error: Some("timeout".into()) }),
+        20_000,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo));
+    assert!(
+        find_task(&p, "t1").history.iter().any(|e| e.event.starts_with("died-after-run")),
+        "non-instant death recorded distinctly from an instant one"
+    );
+
+    // 2 MORE instant deaths after the reset must still NOT park (streak restarted at 0).
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(4, 20_500), attempt: 4 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 4, status: "error".into(), error: Some("crash C".into()) }),
+        20_900,
+        0,
+    );
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(5, 21_000), attempt: 5 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 5, status: "error".into(), error: Some("crash D".into()) }),
+        21_400,
+        0,
+    );
+    assert!(
+        matches!(find_task(&p, "t1").state, TaskState::Todo),
+        "streak reset by the long-lived attempt: 2 instant deaths after it still doesn't park"
+    );
 }
 
 /// Mutable task lookup for the worktree/backoff tests.

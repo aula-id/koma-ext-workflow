@@ -249,10 +249,17 @@ pub enum HostEvent {
     /// Worktree desks (item 1): the driver merged a task's branch cleanly into main (in response
     /// to `Effect::MergeDesk`). The task completes (Done) and its worktree is reclaimed.
     DeskMerged { task: TaskId },
-    /// Worktree desks (item 1): the driver's merge of a task's branch hit a conflict (or failed).
-    /// `summary` is the conflict/error description; the task bounces with it as the review note and
-    /// a retry gets a fresh worktree branched off the now-advanced main.
-    DeskMergeConflict { task: TaskId, summary: String },
+    /// Worktree desks (item 1): the driver's merge of a task's branch hit a conflict, or failed for
+    /// some other reason. `summary` is the conflict/error description; `is_conflict` (item 4)
+    /// distinguishes a REAL content conflict (wording tells the user to resolve it) from any other
+    /// merge failure (wording just says the task was re-queued). Either way the task bounces with the
+    /// summary as the review note and a retry gets a fresh worktree branched off the now-advanced
+    /// main.
+    DeskMergeConflict {
+        task: TaskId,
+        summary: String,
+        is_conflict: bool,
+    },
 }
 
 /// Side effects for the driver to execute. `InvokeModel`/`PublishContext` are part
@@ -339,7 +346,8 @@ pub enum Effect {
     /// Worktree desks (item 1/2): merge a task's `task/<slug>` branch into the delivery repo's
     /// main branch after review PASS. The driver runs the git merge (serialized per repo,
     /// fast-forward preferred) and feeds back `HostEvent::DeskMerged` (clean) or
-    /// `HostEvent::DeskMergeConflict` (conflict -> the task bounces with the conflict summary).
+    /// `HostEvent::DeskMergeConflict` (conflict or other failure -> the task bounces with the
+    /// summary, worded per `is_conflict`, item 4).
     MergeDesk {
         task: TaskId,
         /// The delivery path — the git repo whose main branch receives the merge.
@@ -2180,8 +2188,8 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
             on_comment_delivered(p, &task, comment_id, now_ms, ctx)
         }
         HostEvent::DeskMerged { task } => on_desk_merged(p, &task, now_ms, ctx),
-        HostEvent::DeskMergeConflict { task, summary } => {
-            on_desk_merge_conflict(p, &task, summary, now_ms, ctx)
+        HostEvent::DeskMergeConflict { task, summary, is_conflict } => {
+            on_desk_merge_conflict(p, &task, summary, is_conflict, now_ms, ctx)
         }
     }
 }
@@ -2280,9 +2288,9 @@ fn diagnose_and_requeue(p: &mut Project, idx: usize, status: &str, error: Option
 
     let alive = spawned_ago(&p.tasks[idx].state, now_ms);
     let instant = matches!(alive, Some(ms) if ms < INSTANT_DEATH_MS);
+    let attempt = current_attempt(&p.tasks[idx].state);
 
     if instant {
-        let attempt = current_attempt(&p.tasks[idx].state);
         // `prior` counts instant deaths already recorded, so the FIRST instant death backs off 10s
         // (going into the 2nd attempt) and the second 60s (going into the 3rd), matching the spec.
         let prior = instant_death_count(&p.tasks[idx]);
@@ -2294,12 +2302,50 @@ fn diagnose_and_requeue(p: &mut Project, idx: usize, status: &str, error: Option
             format!("attempt {attempt} died at step 0: {}", trace_preview(&reason, 80)),
             ctx,
         );
+        ctx.dirty = true;
+
+        // item 3: chronic instant death — 3 in a row (this one included) parks the task instead of
+        // retrying forever, mirroring the SpawnFailed pattern (kernel.rs `on_spawn_failed`).
+        // `instant_death_streak` counts CONSECUTIVE instant deaths and resets on a non-instant run,
+        // unlike `prior`/`instant_death_count` above, which is a lifetime tally that only escalates
+        // the backoff and never resets.
+        if instant_death_streak(&p.tasks[idx]) >= 3 {
+            // Same reasoning as the diff_stat gate below: a reviewer death never touched the
+            // worktree, so only reclaim the desk for a chronically-dying WORKER.
+            if who == "worker" {
+                maybe_remove_worktree(p, idx, ctx);
+            }
+            p.tasks[idx].state = TaskState::Parked {
+                reason: ParkReason::InstantDeath(reason.clone()),
+                attempt,
+            };
+            trace(
+                p,
+                now_ms,
+                "death",
+                format!(
+                    "{} parked (chronic instant death): {}",
+                    short_task(&p.tasks[idx].id),
+                    trace_preview(&reason, 80)
+                ),
+                ctx,
+            );
+            check_halt(p, now_ms, ctx);
+            return;
+        }
+
         let delay = instant_death_backoff_ms(prior);
         // Re-queue FIRST (moves the task to Todo / Review{None}), then stamp the cooldown on it so
         // the next dispatch scan defers the retry.
         requeue_failed(p, idx, now_ms, "worker-error", ctx);
         p.tasks[idx].dispatch_after_ms = now_ms.saturating_add(delay);
-        p.tasks[idx].diff_stat = None; // a fresh worktree recomputes it on the next commit
+        // item 1: only a WORKER death touches the worktree — a reviewer never writes to it. Clearing
+        // diff_stat on a reviewer death would permanently wedge the task: worktree-mode review
+        // dispatch (`pending_reviews_sorted`) gates on `diff_stat.is_some()`, and the only writer is
+        // the worker's commit step (driver.rs `maybe_commit_worktree`), which a reviewer never runs.
+        if who == "worker" {
+            p.tasks[idx].diff_stat = None; // a fresh worktree recomputes it on the next commit
+        }
         trace(
             p,
             now_ms,
@@ -2308,9 +2354,16 @@ fn diagnose_and_requeue(p: &mut Project, idx: usize, status: &str, error: Option
             ctx,
         );
     } else {
+        // item 3: an explicit "ran a while" marker so `instant_death_streak` can find the reset
+        // boundary — distinct from the requeue's own "worker-error" tag below, which both the
+        // instant and non-instant paths share and so can't be used to tell them apart.
+        record(&mut p.tasks[idx], now_ms, format!("died-after-run:{reason}"));
         requeue_failed(p, idx, now_ms, "worker-error", ctx);
         p.tasks[idx].dispatch_after_ms = 0; // ran a while; retry immediately as before
-        p.tasks[idx].diff_stat = None;
+        // item 1: see the instant-death branch above — only a worker death clears diff_stat.
+        if who == "worker" {
+            p.tasks[idx].diff_stat = None;
+        }
     }
 }
 
@@ -2327,8 +2380,30 @@ fn instant_death_backoff_ms(prior_instant_deaths: u32) -> u64 {
 /// Count of `died-at-step-0` markers already in a task's history (item 4) — the instant-death
 /// tally that escalates the backoff. Distinct from `spawn_failure_streak`: a spawn succeeds each
 /// retry (recording `spawned:`), so this counts the deaths themselves, not a since-last-spawn run.
+/// A LIFETIME tally that never resets — for the CONSECUTIVE streak used to park chronic instant
+/// deaths (item 3), see [`instant_death_streak`] instead.
 fn instant_death_count(t: &Task) -> u32 {
     t.history.iter().filter(|e| e.event.starts_with("died-at-step-0")).count() as u32
+}
+
+/// Consecutive instant-death streak, most-recent-first (item 3, chronic-death parking): the number
+/// of instant deaths in a row since the task last proved it isn't chronically instant-dying — a
+/// non-instant death (`died-after-run`), a spawn failure, a runtime-ceiling kill, a daemon-restart
+/// pause, or a normal report/review outcome all reset it. Bookkeeping markers that decorate every
+/// death alike (`next-attempt:`, `spawned:`, the requeue's own `worker-error` tag) are transparent:
+/// they neither count nor break the streak.
+fn instant_death_streak(t: &Task) -> u32 {
+    let mut count = 0;
+    for e in t.history.iter().rev() {
+        if e.event.starts_with("died-at-step-0") {
+            count += 1;
+        } else if e.event.starts_with("next-attempt:") || e.event.starts_with("spawned:") || e.event.starts_with("worker-error") {
+            continue;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 /// Whether a death reason names a daemon restart (item 4): the host tore the agent down because the
@@ -2374,6 +2449,11 @@ fn pause_for_daemon_restart(p: &mut Project, idx: usize, now_ms: u64, ctx: &mut 
             // Preserve the attempt (re-stamp the SAME number, never +1).
             set_next_attempt(&mut p.tasks[idx], now_ms, attempt);
             p.tasks[idx].state = TaskState::Todo;
+            // item 1: only a WORKER binding ever touches the worktree, so only a worker's restart
+            // clears diff_stat. A reviewer restarting into Review{None} keeps its diff_stat — clearing
+            // it here would permanently wedge the task, since `pending_reviews_sorted` gates
+            // worktree-mode review dispatch on `diff_stat.is_some()` and nothing else ever sets it.
+            p.tasks[idx].diff_stat = None; // a fresh worktree recomputes it on the next commit
         }
         TaskState::Review { attempt, .. } => {
             let attempt = *attempt;
@@ -2382,7 +2462,6 @@ fn pause_for_daemon_restart(p: &mut Project, idx: usize, now_ms: u64, ctx: &mut 
         _ => {}
     }
     p.tasks[idx].dispatch_after_ms = 0;
-    p.tasks[idx].diff_stat = None;
     ctx.dirty = true;
 }
 
@@ -2601,9 +2680,17 @@ fn on_desk_merged(p: &mut Project, task: &TaskId, now_ms: u64, ctx: &mut Ctx) {
     ctx.dirty = true;
 }
 
-/// A task's worktree hit a merge conflict (item 1): clear the gate and bounce it with the conflict
-/// summary as the review note; a retry rebranches off the now-advanced main.
-fn on_desk_merge_conflict(p: &mut Project, task: &TaskId, summary: String, now_ms: u64, ctx: &mut Ctx) {
+/// A task's worktree merge did not complete (item 1): clear the gate and bounce it; a retry
+/// rebranches off the now-advanced main. `is_conflict` (item 4) picks the wording: a REAL content
+/// conflict tells the user to resolve it, any other merge failure just says the task was re-queued.
+fn on_desk_merge_conflict(
+    p: &mut Project,
+    task: &TaskId,
+    summary: String,
+    is_conflict: bool,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
     let idx = match find_task(p, task) {
         Some(i) => i,
         None => return,
@@ -2614,8 +2701,14 @@ fn on_desk_merge_conflict(p: &mut Project, task: &TaskId, summary: String, now_m
         // The task should still be in Review{None} (awaiting merge); if not, nothing to bounce.
         _ => return,
     };
-    trace(p, now_ms, "desk", format!("{} merge conflict — bouncing", short_task(task)), ctx);
-    bounce_task(p, idx, attempt, format!("merge conflict — resolve then re-deliver: {summary}"), now_ms, ctx);
+    let note = if is_conflict {
+        format!("merge conflict — resolve then re-deliver: {summary}")
+    } else {
+        format!("merge failed ({summary}) — task re-queued")
+    };
+    let trace_word = if is_conflict { "conflict" } else { "failed" };
+    trace(p, now_ms, "desk", format!("{} merge {trace_word} — bouncing", short_task(task)), ctx);
+    bounce_task(p, idx, attempt, note, now_ms, ctx);
     ctx.dirty = true;
 }
 
