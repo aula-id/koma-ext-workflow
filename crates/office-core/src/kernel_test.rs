@@ -1497,6 +1497,16 @@ fn prd_fence_runs_assume_check_then_spawns_research_on_clean() {
     assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd);
     assert!(p.research.is_none(), "no research binding until the check clears");
 
+    // REGRESSION: the assume-check must NEVER run in json mode — its prompt demands the
+    // ASSUME-CHECK text block, and response_format json on chat-completions dialects
+    // 400s or yields unparseable JSON, silently fail-opening the safeguard.
+    match invoke_effects(&fx)[0] {
+        Effect::InvokeModel { format, .. } => {
+            assert!(format.is_none(), "assume-check invokes must not force json mode")
+        }
+        other => panic!("expected InvokeModel, got {other:?}"),
+    }
+
     // A clean check clears pending_assumptions and spawns research (the deferred stage).
     let fx2 = step(
         &mut p,

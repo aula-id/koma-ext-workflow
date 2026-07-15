@@ -1041,23 +1041,27 @@ fn emit_invoke(ctx: &mut Ctx, purpose: InvokePurpose, role: &str, system: String
     });
 }
 
-/// The `models.invoke` output format for a purpose (feature 5). `Some("json")` for the
-/// structured-output invokes — the breakdown family (a JSON plan) and the assume-check gate —
-/// which the host maps to a chat-completions `response_format: json_object` (other dialects
-/// ignore it). `None` for the prose/markdown invokes (persona, TRD, CRD, fold). Note: the
-/// assume-check prompt still emits its `ASSUME-CHECK` text block, and the safeguard fails OPEN
-/// on an unparseable result, so a dialect that honors json mode there degrades safely.
+/// The `models.invoke` output format for a purpose (feature 5). `Some("json")` ONLY for the
+/// breakdown family, whose prompts genuinely demand a JSON plan — the host maps it to a
+/// chat-completions `response_format: json_object` (other dialects ignore it).
+///
+/// The assume-check gate is deliberately NOT in the json set: its prompt asks for the
+/// `ASSUME-CHECK` TEXT block, and forcing json mode there makes chat-completions dialects
+/// either 400 (OpenAI requires the word "json" in the prompt) or emit a JSON object the
+/// tolerant text parser rejects — and since the safeguard fails OPEN on an unparseable
+/// result, json mode would silently disable the safeguard on the most common dialects.
 fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
     match purpose {
-        InvokePurpose::Breakdown
-        | InvokePurpose::BreakdownReask
-        | InvokePurpose::BreakdownCompact
+        InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {
+            Some("json")
+        }
+        InvokePurpose::Persona
+        | InvokePurpose::Trd
+        | InvokePurpose::Crd
+        | InvokePurpose::Fold
         | InvokePurpose::AssumeCheckPrd
         | InvokePurpose::AssumeCheckTrd
-        | InvokePurpose::AssumeCheckCrd => Some("json"),
-        InvokePurpose::Persona | InvokePurpose::Trd | InvokePurpose::Crd | InvokePurpose::Fold => {
-            None
-        }
+        | InvokePurpose::AssumeCheckCrd => None,
     }
 }
 
