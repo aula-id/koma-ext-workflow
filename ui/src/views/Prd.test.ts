@@ -44,3 +44,39 @@ describe('renderMarkdownSafe', () => {
     expect(renderMarkdownSafe('')).toBe('');
   });
 });
+
+describe('renderMarkdownSafe: tables, rules, ordered lists', () => {
+  it('renders a GFM table with escaped inline content', () => {
+    const md = '| Layer | Choice |\n|---|---|\n| UI | Tailwind **v4** |\n| DB | <script>x</script> |';
+    const html = renderMarkdownSafe(md);
+    expect(html).toContain('<table><thead><tr><th>Layer</th><th>Choice</th></tr></thead>');
+    expect(html).toContain('<td>UI</td>');
+    expect(html).toContain('<strong>v4</strong>');
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).not.toContain('<script>');
+  });
+
+  it('pads short rows to the header width instead of collapsing columns', () => {
+    const html = renderMarkdownSafe('| A | B |\n|---|---|\n| only |');
+    expect(html).toContain('<td>only</td><td></td>');
+  });
+
+  it('renders --- as a horizontal rule, not a paragraph', () => {
+    const html = renderMarkdownSafe('above\n\n---\n\nbelow');
+    expect(html).toContain('<hr />');
+    expect(html).not.toContain('<p>---</p>');
+  });
+
+  it('renders ordered lists and keeps ul/ol separate', () => {
+    const html = renderMarkdownSafe('1. first\n2. second\n\n- bullet');
+    expect(html).toContain('<ol>');
+    expect(html).toContain('<li>first</li>');
+    expect(html).toContain('<ul>');
+  });
+
+  it('a lone pipe line without a separator row stays a paragraph', () => {
+    const html = renderMarkdownSafe('a | b | c');
+    expect(html).toContain('<p>a | b | c</p>');
+    expect(html).not.toContain('<table>');
+  });
+});

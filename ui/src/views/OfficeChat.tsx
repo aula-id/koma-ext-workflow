@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { OutboundNoticeView, Project } from './Board';
+import { renderMarkdownSafe } from './Prd';
 
 /**
  * Folding indicator (ARCHITECTURE.md 6.2): the panel has no visibility into the
@@ -114,7 +115,14 @@ export const OfficeChat: React.FC<OfficeChatProps> = ({ project }) => {
                 >
                   {isUser ? 'You' : 'Office'}
                 </div>
-                <div style={{ fontSize: '0.8rem', color: 'var(--wf-fg)', whiteSpace: 'pre-wrap' }}>{m.text}</div>
+                {/* office messages carry markdown (PRD drafts, tables, lists) —
+                    render through the same escape-first sanitized renderer as
+                    the PRD viewer, scaled down via .wf-md-mini */}
+                <div
+                  className="wf-prd-body wf-md-mini"
+                  // eslint-disable-next-line react/no-danger
+                  dangerouslySetInnerHTML={{ __html: renderMarkdownSafe(m.text) }}
+                />
               </motion.div>
             );
           })}

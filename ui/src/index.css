@@ -253,3 +253,64 @@ button:disabled {
 .wf-prd-body a {
   color: var(--wf-accent-blue);
 }
+
+/* GFM tables (PRD + office chat): koma-flat — hairline rules, small-caps head */
+.wf-prd-body table {
+  border-collapse: collapse;
+  margin: 0 0 14px;
+  width: 100%;
+  font-size: 0.8rem;
+}
+.wf-prd-body th {
+  text-align: left;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--wf-dim);
+  font-weight: 600;
+  padding: 0.3rem 0.6rem 0.3rem 0;
+  border-bottom: 1px solid var(--wf-head);
+}
+.wf-prd-body td {
+  padding: 0.3rem 0.6rem 0.3rem 0;
+  border-bottom: 1px solid var(--wf-border);
+  vertical-align: top;
+}
+.wf-prd-body hr {
+  border: none;
+  border-top: 1px solid var(--wf-border);
+  margin: 16px 0;
+}
+.wf-prd-body ol {
+  margin: 0 0 14px;
+  padding-left: 1.3rem;
+}
+
+/* Compact variant for the office-chat mirror bubbles */
+.wf-md-mini {
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.wf-md-mini h1,
+.wf-md-mini h2 {
+  font-size: 0.9rem;
+  margin: 8px 0 4px;
+  border: none;
+  padding: 0;
+}
+.wf-md-mini h3,
+.wf-md-mini h4 {
+  font-size: 0.85rem;
+  margin: 6px 0 3px;
+}
+.wf-md-mini p,
+.wf-md-mini ul,
+.wf-md-mini ol,
+.wf-md-mini table,
+.wf-md-mini pre {
+  margin-bottom: 6px;
+}
+.wf-md-mini table {
+  display: block;
+  overflow-x: auto;
+}
