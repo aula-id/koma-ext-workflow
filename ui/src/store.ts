@@ -14,6 +14,12 @@ export interface ProjectConfig {
   /** How the safeguard handles flagged assumptions (autonomous-safeguard pivot): `'auto'`
    * (autonomous — only critical items stop for the human) | `'ask'` (freeze on every item). */
   assumptionMode?: string;
+  /** The research policy (design-speedup item 4): `'auto'` (research only unfamiliar stacks) |
+   * `'always'` | `'never'`. */
+  researchMode?: string;
+  /** Doc-drafting model override (design-speedup item 4); `null`/absent resolves the drafting
+   * role's default model. */
+  drafterModel?: string | null;
 }
 
 /** Project lifecycle phase, per docs/PANEL_PROTOCOL.md 2.1 and office-core

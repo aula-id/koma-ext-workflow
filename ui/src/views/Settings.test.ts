@@ -219,15 +219,21 @@ describe('Settings (real component, rendered)', () => {
     expect(bridge.send).toHaveBeenCalledWith(expect.objectContaining({ maxWorkers: 4 }));
   });
 
-  it('never submits per-project model overrides — models are bound in the koma sub-agent sidebar', async () => {
+  it('never submits per-project worker/reviewer model overrides — those are bound in the koma sub-agent sidebar', async () => {
     // Product decision (2026-07-15): worker/reviewer model fields were removed
     // from Settings entirely; the contributed sub-agents' models are bound in
-    // koma's sidebar. config_set must not carry model keys AT ALL (not even
-    // undefined), and no free-text model inputs may render.
+    // koma's sidebar. config_set must not carry those model keys AT ALL (not
+    // even undefined).
+    // UPDATED (design-speedup item 4, 2026-07-15): this used to also assert zero
+    // free-text inputs render at all, back when no per-project model field existed.
+    // `drafterModel` (a *different* concept — a doc-drafting invoke override, not a
+    // worker/reviewer binding) is now a legitimate free-text field; the assertion is
+    // narrowed to exactly the one input it expects instead of zero.
     seedProject({ workerModel: 'claude-sonnet', reviewerModel: 'claude-opus' });
     renderSettings();
 
-    expect(container.querySelectorAll('input[type="text"]').length).toBe(0);
+    expect(container.querySelectorAll('input[type="text"]').length).toBe(1);
+    expect(container.querySelector('[data-testid="settings-drafter-model"]')).toBeTruthy();
 
     await submitForm();
 
@@ -235,6 +241,64 @@ describe('Settings (real component, rendered)', () => {
     expect(payload.op).toBe('config_set');
     expect('workerModel' in payload).toBe(false);
     expect('reviewerModel' in payload).toBe(false);
+  });
+
+  it('reflects researchMode on the selector and submits the changed value (design-speedup item 4)', async () => {
+    seedProject({ researchMode: 'auto' });
+    renderSettings();
+
+    const select = container.querySelector('[data-testid="settings-research-mode"]') as HTMLSelectElement;
+    expect(select).toBeTruthy();
+    expect(select.value).toBe('auto');
+
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')!.set!;
+    act(() => {
+      setter.call(select, 'always');
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    await submitForm();
+
+    expect(bridge.send).toHaveBeenCalledWith(
+      expect.objectContaining({ op: 'config_set', project: 'p1', researchMode: 'always' }),
+    );
+  });
+
+  it('defaults the researchMode selector to auto when the config omits it', () => {
+    seedProject();
+    renderSettings();
+    const select = container.querySelector('[data-testid="settings-research-mode"]') as HTMLSelectElement;
+    expect(select.value).toBe('auto');
+  });
+
+  it('reflects drafterModel on the text input and round-trips an edited value through config_set', async () => {
+    seedProject({ drafterModel: 'claude-opus' });
+    renderSettings();
+
+    const input = container.querySelector('[data-testid="settings-drafter-model"]') as HTMLInputElement;
+    expect(input.value).toBe('claude-opus');
+    setInputValue(input, 'gpt-5');
+
+    await submitForm();
+
+    expect(bridge.send).toHaveBeenCalledWith(
+      expect.objectContaining({ op: 'config_set', project: 'p1', drafterModel: 'gpt-5' }),
+    );
+  });
+
+  it('submits an empty drafterModel (clears the override back to the role default) rather than omitting the field', async () => {
+    seedProject({ drafterModel: 'claude-opus' });
+    renderSettings();
+
+    const input = container.querySelector('[data-testid="settings-drafter-model"]') as HTMLInputElement;
+    setInputValue(input, '');
+
+    await submitForm();
+
+    const payload = vi.mocked(bridge.send).mock.calls.at(-1)![0] as Record<string, unknown>;
+    expect(payload.op).toBe('config_set');
+    expect(payload.drafterModel).toBe('');
+    expect('drafterModel' in payload).toBe(true);
   });
 
   it('shows a success message on a clean save and an access-denied message on a grant-denied error', async () => {

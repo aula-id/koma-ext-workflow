@@ -51,6 +51,8 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     crdPassGrade: 98,
     assumptionCheck: true,
     assumptionMode: 'auto',
+    researchMode: 'auto',
+    drafterModel: '',
   });
 
   useEffect(() => {
@@ -86,6 +88,10 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
       crdPassGrade: project.config?.crdPassGrade ?? 98,
       assumptionCheck: project.config?.assumptionCheck ?? true,
       assumptionMode: project.config?.assumptionMode ?? 'auto',
+      researchMode: project.config?.researchMode ?? 'auto',
+      // `??` not `||`: an empty string (the "no override" wire value) is a legitimate value here,
+      // not something to coerce away — it's the same string that round-trips back on save.
+      drafterModel: project.config?.drafterModel ?? '',
     });
   };
 
@@ -129,6 +135,15 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     setFormData({ ...formData, assumptionMode: e.target.value === 'ask' ? 'ask' : 'auto' });
   };
 
+  const handleResearchModeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const v = e.target.value;
+    setFormData({ ...formData, researchMode: v === 'always' || v === 'never' ? v : 'auto' });
+  };
+
+  const handleDrafterModelChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setFormData({ ...formData, drafterModel: e.target.value });
+  };
+
   const handleThemeChange = (newTheme: Theme) => {
     themeManager.setTheme(newTheme);
     setTheme(newTheme);
@@ -153,6 +168,11 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
         crdPassGrade: formData.crdPassGrade,
         assumptionCheck: formData.assumptionCheck,
         assumptionMode: formData.assumptionMode,
+        researchMode: formData.researchMode,
+        // Always sent, even empty: the daemon treats an empty string as "clear the override back
+        // to the role's default" (handlers.rs config_set / kernel.rs ConfigSet), not "leave
+        // unchanged" — omitting the field entirely is what means "leave unchanged".
+        drafterModel: formData.drafterModel,
       };
 
       const result = await bridge.send(payload);
@@ -462,6 +482,44 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                       <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
                         auto: resolve non-critical assumptions autonomously, only stop for critical ones;
                         ask: stop on every flagged assumption
+                      </span>
+                    </span>
+                  </label>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                    <select
+                      value={formData.researchMode}
+                      onChange={handleResearchModeChange}
+                      data-testid="settings-research-mode"
+                      style={{ width: 120 }}
+                    >
+                      <option value="auto">auto</option>
+                      <option value="always">always</option>
+                      <option value="never">never</option>
+                    </select>
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Research policy</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        auto: research only unfamiliar stacks; always: research every project;
+                        never: skip research entirely
+                      </span>
+                    </span>
+                  </label>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                    <input
+                      type="text"
+                      value={formData.drafterModel}
+                      onChange={handleDrafterModelChange}
+                      data-testid="settings-drafter-model"
+                      placeholder="default"
+                      style={{ width: 160 }}
+                    />
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Drafting model override</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        overrides the model used for PRD/TRD/CRD drafting invokes; empty resolves the
+                        role&apos;s default model
                       </span>
                     </span>
                   </label>
