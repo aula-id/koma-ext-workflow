@@ -353,7 +353,23 @@ fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_m
     match office::authorize(p, delivery_path, allow_outside) {
         Ok(()) => ctx.dirty = true,
         Err(e) => {
-            let notice = format!("authorization refused: {:?}; project stays in Ready", e);
+            // Report the ACTUAL phase — the old text hardcoded "stays in Ready"
+            // even while Drafting, which sent the main agent chasing a phase that
+            // did not exist (live-test 2026-07-15).
+            let phase = match &p.phase {
+                ProjectPhase::Drafting => "Drafting",
+                ProjectPhase::Ready => "Ready",
+                ProjectPhase::Running { .. } => "Running",
+                ProjectPhase::Interrupted { .. } => "Interrupted",
+                ProjectPhase::Halted { .. } => "Halted",
+                ProjectPhase::Done { .. } => "Done",
+            };
+            let hint = if matches!(p.phase, ProjectPhase::Drafting) {
+                " — the breakdown has not landed yet; wait for the board-is-ready notice before authorizing"
+            } else {
+                ""
+            };
+            let notice = format!("authorization refused: {:?}; project is in {}{}", e, phase, hint);
             queue_notice(p, now_ms, notice, ctx);
             ctx.dirty = true;
         }
@@ -390,7 +406,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                         p,
                         now_ms,
                         format!(
-                            "office[{}]: PRD drafted (full text in the Workflow panel). Breaking it down into epics/stories/tasks now — authorize with a delivery path to start the line.",
+                            "office[{}]: PRD drafted (full text in the Workflow panel). Breaking it down into epics/stories/tasks now — I will report when the board is ready; do not authorize yet.",
                             p.id.0
                         ),
                         ctx,
@@ -433,6 +449,25 @@ fn handle_breakdown_result(p: &mut Project, outcome: Result<String, String>, is_
     match office::parse_breakdown(&text) {
         Ok(breakdown) => {
             office::apply_breakdown(p, breakdown);
+            // THE authorize invitation lives HERE, after tasks really exist —
+            // never at PRD capture (live-test 2026-07-15: an early nudge sent the
+            // main agent into authorize/WrongPhase retry loops while the
+            // breakdown was still generating).
+            let epics = p.epics.len();
+            let tasks = p.tasks.len();
+            queue_notice(
+                p,
+                now_ms,
+                format!(
+                    "office[{}]: board is ready — {} task{} across {} epic{}. Authorize with a delivery path (workflow_authorize) to start the production line.",
+                    p.id.0,
+                    tasks,
+                    if tasks == 1 { "" } else { "s" },
+                    epics,
+                    if epics == 1 { "" } else { "s" }
+                ),
+                ctx,
+            );
             ctx.dirty = true;
         }
         Err(e) => {
