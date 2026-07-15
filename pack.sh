@@ -81,6 +81,10 @@ cp "$mcp_binary_src" "$stage_dir/bin/workflow-mcp$BIN_EXT"
 cp -r "ui/dist" "$stage_dir/ui"
 
 # Create zip from the staging directory contents
+# ALWAYS build a fresh archive: `zip -r` against an existing file UPDATES it in
+# place, and a stale/corrupt leftover zip (e.g. from an older pack run) makes the
+# result unpredictable across machines.
+rm -f "$SCRIPT_DIR/dist/workflow.zip"
 (cd "$stage_dir" && zip -q -r "$SCRIPT_DIR/dist/workflow.zip" manifest.json bin/ ui/)
 
 # Clean up temp directory
@@ -93,11 +97,15 @@ if [ -f "$zip_path" ]; then
 
   # Verify both binaries made it into the zip before declaring success.
   if ! unzip -l "$zip_path" | grep -q "bin/office-daemon"; then
-    echo "Error: bin/office-daemon missing from $zip_path"
+    echo "Error: bin/office-daemon$BIN_EXT missing from $zip_path"
+    echo "--- actual zip contents ---"
+    unzip -l "$zip_path" || true
     exit 1
   fi
   if ! unzip -l "$zip_path" | grep -q "bin/workflow-mcp"; then
-    echo "Error: bin/workflow-mcp missing from $zip_path"
+    echo "Error: bin/workflow-mcp$BIN_EXT missing from $zip_path"
+    echo "--- actual zip contents ---"
+    unzip -l "$zip_path" || true
     exit 1
   fi
 
