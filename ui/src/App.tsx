@@ -7,7 +7,7 @@ import { useStore } from './store';
 import { themeManager } from './theme';
 
 type ViewType = 'dashboard' | 'board' | 'settings';
-type BoardTab = 'office' | 'board' | 'drilldown' | 'depmap' | 'prd';
+type BoardTab = 'office' | 'board' | 'drilldown' | 'depmap' | 'prd' | 'trace';
 
 interface DeepLink {
   view: ViewType;
@@ -35,6 +35,8 @@ function parseDeepLink(raw: string | null): DeepLink {
       return { view: 'board', boardTab: 'board', wantsTask: true };
     case 'office':
       return { view: 'board', boardTab: 'prd' };
+    case 'trace':
+      return { view: 'board', boardTab: 'trace' };
     case 'settings':
       return { view: 'settings' };
     default:

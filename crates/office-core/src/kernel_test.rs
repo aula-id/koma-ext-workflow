@@ -57,6 +57,8 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         tasks,
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
+        trace: Vec::new(),
+        interrupted_from: None,
         seq: 0,
     }
 }
@@ -2056,4 +2058,131 @@ fn same_inputs_same_effects() {
     let fx2 = step(&mut p2, Input::Host(HostEvent::Tick), 1000, 4);
     assert_eq!(fx1, fx2);
     assert_eq!(p1, p2);
+}
+
+// ---------------------------------------------------------------------------
+// Tracelog (feature: machine diary) + interrupt-from-drafting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trace_ring_caps_at_200_dropping_oldest() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // Each office message emits at least two trace events (the received line + the invoke it
+    // triggers), so 200 messages drives the ring well past its 200-entry cap.
+    for i in 0..200u64 {
+        step(
+            &mut p,
+            Input::Command(Command::OfficeMessage { text: format!("msg {i}") }),
+            1000 + i,
+            4,
+        );
+    }
+    assert_eq!(p.trace.len(), 200, "the ring is capped at 200 entries");
+    assert!(
+        !p.trace.iter().any(|e| e.summary == "message received: msg 0"),
+        "the oldest entries were dropped"
+    );
+    assert!(
+        p.trace.iter().any(|e| e.summary == "message received: msg 199"),
+        "the newest entry is retained (newest-last)"
+    );
+}
+
+#[test]
+fn trace_records_capture_gate_and_research() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // Gate ON (default): a ```prd fence traces the doc capture (byte count, never body) and the
+    // safeguard gate check.
+    let reply = "ok\n```prd\n# App\nBuild it.\n```";
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.to_string())), 1000, 4);
+    assert!(
+        p.trace.iter().any(|e| e.kind == "capture" && e.summary.starts_with("PRD captured")),
+        "PRD capture is traced: {:?}",
+        p.trace
+    );
+    assert!(
+        p.trace.iter().any(|e| e.kind == "gate" && e.summary.contains("checking PRD")),
+        "the gate check is traced"
+    );
+
+    // A clean verdict proceeds to research — both the clean gate and the research spawn are traced.
+    step(
+        &mut p,
+        invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())),
+        1100,
+        4,
+    );
+    assert!(p.trace.iter().any(|e| e.kind == "gate" && e.summary.contains("PRD clean")));
+    assert!(p.trace.iter().any(|e| e.kind == "research" && e.summary.starts_with("spawned")));
+}
+
+#[test]
+fn trace_records_gate_stop_on_assumptions() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed Postgres\n- assumed React\n";
+    step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
+    assert!(
+        p.trace
+            .iter()
+            .any(|e| e.kind == "gate" && e.summary.contains("STOPPED") && e.summary.contains("2 assumption")),
+        "the gate stop records the flagged count: {:?}",
+        p.trace
+    );
+}
+
+#[test]
+fn drafting_interrupt_kills_analyst_and_resume_returns_to_drafting() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // A live research analyst is in flight; interrupting Drafting must cut it off.
+    p.research = Some(researcher_binding(77, 500));
+    let fx = step(&mut p, Input::Command(Command::Interrupt { hard: true }), 1000, 4);
+
+    assert!(matches!(p.phase, ProjectPhase::Interrupted));
+    assert_eq!(
+        p.interrupted_from,
+        Some(ProjectPhase::Drafting),
+        "the pre-interrupt phase is remembered for resume"
+    );
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 77 })),
+        "the research analyst is killed"
+    );
+    assert!(p.research.is_none(), "the research binding is cleared so a late result no-ops");
+    assert!(p
+        .trace
+        .iter()
+        .any(|e| e.kind == "phase" && e.summary.contains("hard interrupt from drafting")));
+
+    // Resume returns to Drafting (not forward to Running) and clears the memo.
+    step(&mut p, Input::Command(Command::Resume), 1100, 4);
+    assert!(matches!(p.phase, ProjectPhase::Drafting), "a drafting-interrupt resumes back to Drafting");
+    assert_eq!(p.interrupted_from, None, "the memo is cleared once resumed");
+    assert!(p
+        .trace
+        .iter()
+        .any(|e| e.kind == "phase" && e.summary.contains("resumed to drafting")));
+}
+
+#[test]
+fn invoke_result_is_ignored_while_interrupted() {
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    p.prd_markdown = String::new();
+    p.interrupted_from = Some(ProjectPhase::Drafting);
+    // A persona reply that WOULD capture a PRD arrives after the interrupt: it must NOT advance
+    // the drafting pipeline (the phase is the guard against stale in-flight invokes).
+    let reply = "ok\n```prd\n# App\nBuild it.\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.to_string())), 1000, 4);
+
+    assert!(p.prd_markdown.is_empty(), "a stale persona result does not capture a PRD while interrupted");
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })),
+        "no pipeline effect from a stale result"
+    );
+    assert!(
+        p.trace
+            .iter()
+            .any(|e| e.kind == "invoke" && e.summary.contains("ignored") && e.summary.contains("interrupted")),
+        "the ignored result is recorded on the diary"
+    );
 }

@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::{
     AgentBinding, AgentKind, ChatAuthor, ChatMsg, Comment, CommentAuthor, CommentId, ParkReason,
-    Project, ProjectPhase, Receipt, Task, TaskEvent, TaskId, TaskState,
+    Project, ProjectPhase, Receipt, Task, TaskEvent, TaskId, TaskState, TraceEvent,
 };
 use crate::graph::{self, ready_set};
 use crate::machine::{step_project, ProjectTransition};
@@ -339,13 +339,18 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
             if hard {
                 hard_interrupt(p, now_ms, ctx);
             } else {
-                soft_interrupt(p, ctx);
+                soft_interrupt(p, now_ms, ctx);
             }
         }
         Command::Resume => {
-            if let Ok(ph) = step_project(&p.phase, ProjectTransition::Resume) {
+            // The resume target is remembered on `interrupted_from` (set at interrupt time): a
+            // Drafting-interrupt resumes back to Drafting, everything else to Running. The machine
+            // owns the actual edge; the kernel only supplies the recalled flag.
+            let to_drafting = matches!(p.interrupted_from, Some(ProjectPhase::Drafting));
+            if let Ok(ph) = step_project(&p.phase, ProjectTransition::Resume { to_drafting }) {
+                trace(p, now_ms, "phase", format!("resumed to {}", phase_label(&ph)), ctx);
                 p.phase = ph;
-                ctx.dirty = true;
+                p.interrupted_from = None;
             }
         }
         Command::Unpark { task } => {
@@ -402,7 +407,7 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
             }
         }
         Command::OfficeMessage { text } => office_message(p, text, now_ms, ctx),
-        Command::RequestBreakdown => request_breakdown(p, ctx),
+        Command::RequestBreakdown => request_breakdown(p, now_ms, ctx),
         Command::Authorize {
             delivery_path,
             allow_outside_workspace,
@@ -528,8 +533,9 @@ fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
     if !p.pending_assumptions.is_empty() && is_approval_intent(&text) {
         p.assumptions_approved = true;
         p.pending_assumptions.clear();
-        // The queued notice is the durable, persisted trace (outbox row + chat.prompt effect);
-        // the kernel is pure, so this is the only trace channel available to it.
+        // The queued notice is the durable user-facing signal (outbox row + chat.prompt effect);
+        // the trace ring records the same event on the machine diary.
+        trace(p, now_ms, "gate", "approval detected — safeguard gate closed for this project", ctx);
         queue_notice(
             p,
             now_ms,
@@ -538,6 +544,8 @@ fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
         );
     }
 
+    // Trace BEFORE the move: the preview is the first ~80 chars, never the whole message.
+    trace(p, now_ms, "office", format!("message received: {}", trace_preview(&text, 80)), ctx);
     p.office_transcript.push(ChatMsg {
         who: ChatAuthor::User,
         text,
@@ -546,16 +554,19 @@ fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
 
     if office::should_fold(p, "") {
         let (system, prompt) = office::build_fold(p);
+        trace(p, now_ms, "invoke", "fold (summarize transcript)", ctx);
         emit_invoke(ctx, InvokePurpose::Fold, &p.config.office_role, system, prompt);
     } else {
         let (system, prompt) = office::build_invoke(p, "");
+        trace(p, now_ms, "invoke", "persona reply", ctx);
         emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
     }
 }
 
 /// Issue the breakdown invoke for the current PRD (6.3.2).
-fn request_breakdown(p: &mut Project, ctx: &mut Ctx) {
+fn request_breakdown(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     let (system, prompt) = office::build_breakdown_prompt(p, None, false);
+    trace(p, now_ms, "breakdown", "requested", ctx);
     emit_invoke(ctx, InvokePurpose::Breakdown, &p.config.office_role, system, prompt);
 }
 
@@ -585,6 +596,7 @@ fn start_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         // binding's PRESENCE, not a persona label, so no per-task persona applies.
         persona: String::new(),
     });
+    trace(p, now_ms, "research", "spawned — analyzing the stack", ctx);
 }
 
 /// The driver recorded the real research agent id onto the provisional binding (6.2b).
@@ -602,13 +614,14 @@ fn on_research_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: 
 fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
     p.research_notes = office::extract_research(&text);
     p.research = None;
+    trace(p, now_ms, "research", format!("done — {} bytes of notes", p.research_notes.len()), ctx);
     queue_notice(
         p,
         now_ms,
         format!("office[{}]: research done — drafting the TRD.", p.id.0),
         ctx,
     );
-    start_trd_invoke(p, ctx);
+    start_trd_invoke(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
@@ -617,6 +630,7 @@ fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx)
 /// Never wedges Drafting.
 fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
     p.research = None;
+    trace(p, now_ms, "research", format!("degraded: {}", trace_preview(&reason, 80)), ctx);
     queue_notice(
         p,
         now_ms,
@@ -626,14 +640,15 @@ fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx)
         ),
         ctx,
     );
-    start_trd_invoke(p, ctx);
+    start_trd_invoke(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
 /// Issue the TRD authoring invoke (6.2b): PRD (+ research notes when present) -> a ```trd
 /// fenced markdown document. Off-loop like every other invoke.
-fn start_trd_invoke(p: &mut Project, ctx: &mut Ctx) {
+fn start_trd_invoke(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     let (system, prompt) = office::build_trd_prompt(p);
+    trace(p, now_ms, "invoke", "TRD authoring", ctx);
     emit_invoke(ctx, InvokePurpose::Trd, &p.config.office_role, system, prompt);
 }
 
@@ -646,6 +661,7 @@ fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
         Ok(text) => match office::extract_fenced(&text, "trd") {
             Some(trd) => {
                 p.trd_markdown = trd;
+                trace(p, now_ms, "capture", format!("TRD drafted ({} bytes)", p.trd_markdown.len()), ctx);
                 queue_notice(
                     p,
                     now_ms,
@@ -681,14 +697,15 @@ fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
         ),
     }
     // No TRD captured -> nothing to safeguard-check; proceed straight to the CRD invoke.
-    start_crd_invoke(p, ctx);
+    start_crd_invoke(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
 /// Issue the CRD authoring invoke (6.2c): PRD (+ TRD when present) -> a ```crd fenced Clean-build
 /// Requirement Document. Off-loop, on the office role, like the TRD invoke.
-fn start_crd_invoke(p: &mut Project, ctx: &mut Ctx) {
+fn start_crd_invoke(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     let (system, prompt) = office::build_crd_prompt(p);
+    trace(p, now_ms, "invoke", "CRD authoring", ctx);
     emit_invoke(ctx, InvokePurpose::Crd, &p.config.office_role, system, prompt);
 }
 
@@ -700,6 +717,7 @@ fn handle_crd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
         Ok(text) => match office::extract_fenced(&text, "crd") {
             Some(crd) => {
                 p.crd_markdown = crd;
+                trace(p, now_ms, "capture", format!("CRD drafted ({} bytes)", p.crd_markdown.len()), ctx);
                 queue_notice(
                     p,
                     now_ms,
@@ -735,7 +753,7 @@ fn handle_crd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
         ),
     }
     // No CRD captured -> nothing to safeguard-check and no audit later; break down anyway.
-    request_breakdown(p, ctx);
+    request_breakdown(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
@@ -759,8 +777,8 @@ enum Deferred {
 fn run_deferred(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
     match deferred {
         Deferred::Research => start_research(p, now_ms, ctx),
-        Deferred::Crd => start_crd_invoke(p, ctx),
-        Deferred::Breakdown => request_breakdown(p, ctx),
+        Deferred::Crd => start_crd_invoke(p, now_ms, ctx),
+        Deferred::Breakdown => request_breakdown(p, now_ms, ctx),
     }
 }
 
@@ -781,10 +799,13 @@ fn gate_doc(
     ctx: &mut Ctx,
 ) {
     if p.assumptions_approved || !p.config.assumption_check {
+        let why = if p.assumptions_approved { "already approved" } else { "gate off" };
+        trace(p, now_ms, "gate", format!("{label} gate skipped ({why})"), ctx);
         run_deferred(p, deferred, now_ms, ctx);
         return;
     }
     let (system, prompt) = office::build_assume_check_prompt(p, label, body);
+    trace(p, now_ms, "gate", format!("checking {label} for assumptions"), ctx);
     emit_invoke(ctx, purpose, &p.config.safeguard_role, system, prompt);
 }
 
@@ -805,6 +826,7 @@ fn handle_assume_check_result(
 ) {
     match outcome {
         Err(e) => {
+            trace(p, now_ms, "gate", format!("{doc_label} check errored — failing open"), ctx);
             queue_notice(
                 p,
                 now_ms,
@@ -825,6 +847,7 @@ fn handle_assume_check_result(
                     // (capped) and take the SAME proceed path as a clean verdict.
                     record_self_resolved(p, &check.items);
                     let reason = if p.config.assumption_trust { "trust" } else { "approved" };
+                    trace(p, now_ms, "gate", format!("{doc_label} self-resolved {n} assumption(s) ({reason})"), ctx);
                     queue_notice(
                         p,
                         now_ms,
@@ -855,11 +878,13 @@ fn handle_assume_check_result(
                         ctx,
                     );
                     p.pending_assumptions = check.items;
+                    trace(p, now_ms, "gate", format!("{doc_label} STOPPED — {n} assumption(s) flagged"), ctx);
                     // STOP: the doc is stored/visible; the user must act before the pipeline proceeds.
                 }
             }
             _ => {
                 // Clean, or an unparseable/inconclusive block -> fail open and proceed.
+                trace(p, now_ms, "gate", format!("{doc_label} clean — proceeding"), ctx);
                 p.pending_assumptions.clear();
                 run_deferred(p, deferred, now_ms, ctx);
             }
@@ -904,8 +929,12 @@ fn clip_assumptions(items: &[String]) -> String {
 /// path; `delivery_valid` is its verdict, and `office::authorize` re-checks the shape
 /// before transitioning `Ready -> Running`.
 fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_ms: u64, ctx: &mut Ctx) {
+    let path_str = delivery_path.display().to_string();
     match office::authorize(p, delivery_path, allow_outside) {
-        Ok(()) => ctx.dirty = true,
+        Ok(()) => {
+            trace(p, now_ms, "authorize", format!("granted — {}", trace_preview(&path_str, 80)), ctx);
+            ctx.dirty = true;
+        }
         Err(e) => {
             // Report the ACTUAL phase — the old text hardcoded "stays in Ready"
             // even while Drafting, which sent the main agent chasing a phase that
@@ -924,6 +953,7 @@ fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_m
                 ""
             };
             let notice = format!("authorization refused: {:?}; project is in {}{}", e, phase, hint);
+            trace(p, now_ms, "authorize", format!("refused ({e:?}) — project in {phase}"), ctx);
             queue_notice(p, now_ms, notice, ctx);
             ctx.dirty = true;
         }
@@ -933,6 +963,15 @@ fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_m
 /// Apply an off-loop invoke result (5.1). Purpose-tagged so no persistent per-request
 /// bookkeeping is needed — the kernel reacts to the result as an ordinary command.
 fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    // Interrupt-from-drafting (feature): a persona/fold/breakdown/TRD/CRD/assume-check result that
+    // was already in flight when the user interrupted must NOT advance the pipeline. The phase is
+    // the guard — a stale result simply no-ops against Interrupted rather than needing a per-invoke
+    // epoch. (In-flight WORKER results arrive as `HostEvent::Result`, not here, so a soft drain
+    // still completes its running agents.)
+    if matches!(p.phase, ProjectPhase::Interrupted) {
+        trace(p, now_ms, "invoke", format!("ignored {:?} result — project interrupted", purpose), ctx);
+        return;
+    }
     match purpose {
         InvokePurpose::Persona => {
             let reply = match outcome {
@@ -959,6 +998,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 if let Some(prd) = office::extract_prd(&reply) {
                     p.prd_markdown = prd;
                     p.capture_nudge_count = 0; // a successful capture resets the nudge cap
+                    trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
                     queue_notice(
                         p,
                         now_ms,
@@ -975,6 +1015,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 }
                 if let Some(trd) = office::extract_fenced(&reply, "trd") {
                     p.trd_markdown = trd;
+                    trace(p, now_ms, "capture", format!("TRD captured via chat ({} bytes)", p.trd_markdown.len()), ctx);
                     queue_notice(p, now_ms, format!("office[{}]: TRD updated (panel).", p.id.0), ctx);
                     let body = p.trd_markdown.clone();
                     gate_doc(p, InvokePurpose::AssumeCheckTrd, "TRD", &body, Deferred::Crd, now_ms, ctx);
@@ -983,6 +1024,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 }
                 if let Some(crd) = office::extract_fenced(&reply, "crd") {
                     p.crd_markdown = crd;
+                    trace(p, now_ms, "capture", format!("CRD captured via chat ({} bytes)", p.crd_markdown.len()), ctx);
                     queue_notice(p, now_ms, format!("office[{}]: CRD updated (panel).", p.id.0), ctx);
                     let body = p.crd_markdown.clone();
                     gate_doc(p, InvokePurpose::AssumeCheckCrd, "CRD", &body, Deferred::Breakdown, now_ms, ctx);
@@ -997,6 +1039,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             if matches!(p.phase, ProjectPhase::Ready) {
                 if let Some(trd) = office::extract_fenced(&reply, "trd") {
                     p.trd_markdown = trd;
+                    trace(p, now_ms, "capture", format!("TRD updated in Ready ({} bytes)", p.trd_markdown.len()), ctx);
                     queue_notice(
                         p,
                         now_ms,
@@ -1024,6 +1067,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 && p.capture_nudge_count < MAX_CAPTURE_NUDGES
             {
                 p.capture_nudge_count += 1;
+                trace(p, now_ms, "nudge", format!("PRD capture-miss nudge #{}", p.capture_nudge_count), ctx);
                 let (mut system, prompt) = office::build_invoke(p, "");
                 system.push_str(PRD_NUDGE_INSTRUCTION);
                 emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
@@ -1155,6 +1199,7 @@ fn land_breakdown(p: &mut Project, breakdown: office::Breakdown, now_ms: u64, ct
     office::apply_breakdown(p, breakdown);
     let epics = p.epics.len();
     let tasks = p.tasks.len();
+    trace(p, now_ms, "breakdown", format!("accepted — {tasks} task(s), {epics} epic(s)"), ctx);
     queue_notice(
         p,
         now_ms,
@@ -1237,9 +1282,19 @@ fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
 /// in-flight tasks. Workers -> Todo (attempt preserved, not a bounce); reviewers ->
 /// Review{None} (reviewer respawns on resume). Desks are retained (5.5).
 fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let from = p.phase.clone();
     if let Ok(ph) = step_project(&p.phase, ProjectTransition::Interrupt) {
+        // Remember where we came from so resume returns to the right phase (a Drafting-interrupt
+        // resumes back to Drafting, not forward to Running).
+        p.interrupted_from = Some(from.clone());
         p.phase = ph;
+        trace(p, now_ms, "phase", format!("hard interrupt from {}", phase_label(&from)), ctx);
     }
+    // Cut off the project-level drafting/completion analysts (research 6.2b, audit 6.2c). They
+    // are NOT task bindings, so the normalization loop below never touches them; a dangling
+    // researcher/auditor would keep burning tokens against an interrupted project (feature:
+    // interrupt-from-drafting).
+    kill_project_bindings(p, now_ms, ctx);
     for t in p.tasks.iter_mut() {
         match &t.state {
             TaskState::OnProgress { binding, attempt } => {
@@ -1277,11 +1332,35 @@ fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 
 /// Soft drain: stop dispatching new work; leave in-flight agents alone. Phase moves
 /// to Interrupted immediately, which halts the dispatch scan, but completion events
-/// keep flowing so running agents finish and their results are processed (5.5).
-fn soft_interrupt(p: &mut Project, ctx: &mut Ctx) {
+/// keep flowing so running agents finish and their results are processed (5.5). Unlike
+/// [`hard_interrupt`] it does NOT kill the analyst bindings — a drain lets in-flight work
+/// finish — but it still records `interrupted_from` so resume returns to the right phase.
+fn soft_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let from = p.phase.clone();
     if let Ok(ph) = step_project(&p.phase, ProjectTransition::Interrupt) {
+        p.interrupted_from = Some(from.clone());
         p.phase = ph;
-        ctx.dirty = true;
+        trace(p, now_ms, "phase", format!("soft drain from {}", phase_label(&from)), ctx);
+    }
+}
+
+/// Kill the project-level analyst bindings (research 6.2b / audit 6.2c) on a hard interrupt
+/// (feature: interrupt-from-drafting). Project-level, not task bindings, so the task-normalization
+/// loop never touches them. A real (non-provisional) id gets a `Kill` effect; the binding is
+/// cleared either way so a late `agents.done`/result no-ops (`research_bound_to`/`audit_bound_to`
+/// stop matching once the binding is gone).
+fn kill_project_bindings(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if let Some(b) = p.research.take() {
+        if b.ext_agent_id != PROVISIONAL {
+            ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
+        }
+        trace(p, now_ms, "research", "killed on interrupt", ctx);
+    }
+    if let Some(b) = p.audit.take() {
+        if b.ext_agent_id != PROVISIONAL {
+            ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
+        }
+        trace(p, now_ms, "audit", "killed on interrupt", ctx);
     }
 }
 
@@ -1434,6 +1513,9 @@ fn on_worker_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ctx:
                 binding: None,
                 attempt,
             };
+            let word = if rep.status == ReportStatus::Complete { "complete" } else { "unparseable" };
+            let label = format!("{} → review ({word})", short_task(&p.tasks[idx].id));
+            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
         }
         ReportStatus::Blocked => {
@@ -1443,6 +1525,8 @@ fn on_worker_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ctx:
                 reason: ParkReason::WorkerBlocked(reason),
                 attempt,
             };
+            let label = format!("{} → parked (worker blocked)", short_task(&p.tasks[idx].id));
+            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
             check_halt(p, now_ms, ctx);
         }
@@ -1464,6 +1548,8 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
             p.tasks[idx].last_review = rev.reasons.or(Some(text));
             record(&mut p.tasks[idx], now_ms, "review:pass");
             p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
+            let label = format!("{} → done (review pass)", short_task(&p.tasks[idx].id));
+            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
             maybe_complete_project(p, now_ms, ctx);
             check_halt(p, now_ms, ctx);
@@ -1484,10 +1570,14 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
                     reason: ParkReason::ReviewBounceBudget,
                     attempt,
                 };
+                let label = format!("{} → parked (bounce budget)", short_task(&p.tasks[idx].id));
+                trace(p, now_ms, "task", label, ctx);
                 check_halt(p, now_ms, ctx);
             } else {
                 set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
                 p.tasks[idx].state = TaskState::Todo;
+                let label = format!("{} → todo (review bounce {})", short_task(&p.tasks[idx].id), p.tasks[idx].bounces);
+                trace(p, now_ms, "task", label, ctx);
             }
         }
     }
@@ -1708,6 +1798,8 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
         now_ms,
         format!("dispatch worker attempt {}", attempt),
     );
+    let label = format!("{} → worker dispatched (attempt {attempt})", short_task(tid));
+    trace(p, now_ms, "task", label, ctx);
     ctx.dirty = true;
 }
 
@@ -1742,6 +1834,8 @@ fn spawn_reviewer(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, n
         attempt,
     };
     record(&mut p.tasks[idx], now_ms, "dispatch reviewer");
+    let label = format!("{} → reviewer dispatched", short_task(tid));
+    trace(p, now_ms, "task", label, ctx);
     ctx.dirty = true;
 }
 
@@ -1787,6 +1881,7 @@ fn check_halt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         );
         if let Ok(ph) = step_project(&p.phase, ProjectTransition::Halt { reason: msg.clone() }) {
             p.phase = ph;
+            trace(p, now_ms, "phase", format!("halted — {}", trace_preview(&msg, 80)), ctx);
         }
         queue_notice(p, now_ms, msg, ctx);
         ctx.dirty = true;
@@ -1812,6 +1907,7 @@ fn maybe_complete_project(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         return;
     }
     complete_project(p, now_ms);
+    trace(p, now_ms, "phase", "project complete — all tasks done", ctx);
 }
 
 /// Transition Running -> Done (the terminal completion). Pure phase step; the caller owns the
@@ -1857,6 +1953,7 @@ fn start_audit(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         // binding's PRESENCE, not a persona label.
         persona: String::new(),
     });
+    trace(p, now_ms, "audit", "spawned — clean-build audit", ctx);
     queue_notice(
         p,
         now_ms,
@@ -1884,6 +1981,7 @@ fn on_audit_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: &mu
 fn audit_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
     p.audit = None;
     complete_project(p, now_ms);
+    trace(p, now_ms, "audit", format!("degraded: {}", trace_preview(&reason, 80)), ctx);
     queue_notice(
         p,
         now_ms,
@@ -1906,6 +2004,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
         Some(g) => g,
         None => {
             complete_project(p, now_ms);
+            trace(p, now_ms, "audit", "inconclusive (no grade) — completing", ctx);
             queue_notice(
                 p,
                 now_ms,
@@ -1923,6 +2022,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
 
     if grade >= p.config.crd_pass_grade {
         complete_project(p, now_ms);
+        trace(p, now_ms, "audit", format!("passed — grade {grade}"), ctx);
         queue_notice(
             p,
             now_ms,
@@ -1941,6 +2041,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
         p.audit_rounds += 1;
         let round = p.audit_rounds;
         add_remediation_task(p, round, &report.failures, false, now_ms);
+        trace(p, now_ms, "audit", format!("grade {} < {} — remediation round {}", grade, p.config.crd_pass_grade, round), ctx);
         queue_notice(
             p,
             now_ms,
@@ -1952,6 +2053,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
         );
     } else {
         add_remediation_task(p, p.audit_rounds + 1, &report.failures, true, now_ms);
+        trace(p, now_ms, "audit", format!("still failing (grade {grade}) — parked remediation"), ctx);
         queue_notice(
             p,
             now_ms,
@@ -2061,6 +2163,58 @@ fn queue_notice(p: &mut Project, _now_ms: u64, text: String, ctx: &mut Ctx) {
         notice_id: id,
         text,
     });
+}
+
+/// The machine-diary ring cap (feature: tracelog). Newest-last; the oldest entries drop once the
+/// ring exceeds this, so a long-running project can never balloon `state.json`.
+const TRACE_CAP: usize = 200;
+
+/// Append a machine-diary trace event (feature: tracelog) — what the office machine just DID, one
+/// line, never document content. Every trace is a persisted state change, so it marks the tick
+/// dirty (flushing the trailing `Persist` + `PanelPush` that carries the ring to the panel). The
+/// ring is capped at [`TRACE_CAP`] with the oldest entries dropped.
+fn trace(p: &mut Project, now_ms: u64, kind: &str, summary: impl Into<String>, ctx: &mut Ctx) {
+    p.trace.push(TraceEvent {
+        ts: now_ms as i64,
+        kind: kind.to_string(),
+        summary: summary.into(),
+    });
+    let len = p.trace.len();
+    if len > TRACE_CAP {
+        p.trace.drain(0..len - TRACE_CAP);
+    }
+    ctx.dirty = true;
+}
+
+/// Clip free text to a short, single-line trace preview (feature: tracelog): collapse whitespace
+/// runs to single spaces, then truncate to `max` characters with an ellipsis. Char-count based,
+/// so it never splits a UTF-8 boundary and never leaks a multi-line document body into a summary.
+fn trace_preview(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let clipped: String = flat.chars().take(max).collect();
+    format!("{clipped}…")
+}
+
+/// Lowercase phase label for trace summaries (feature: tracelog).
+fn phase_label(phase: &ProjectPhase) -> &'static str {
+    match phase {
+        ProjectPhase::Drafting => "drafting",
+        ProjectPhase::Ready => "ready",
+        ProjectPhase::Running => "running",
+        ProjectPhase::Interrupted => "interrupted",
+        ProjectPhase::Halted { .. } => "halted",
+        ProjectPhase::Done { .. } => "done",
+    }
+}
+
+/// The short (last-segment) task slug for a trace summary (feature: tracelog): a `TaskId` is the
+/// full hierarchical `<project>/<epic>/<story>/<task>`, so the final segment reads cleanly in a
+/// one-line diary entry without the nested path noise.
+fn short_task(tid: &TaskId) -> &str {
+    tid.0.rsplit('/').next().unwrap_or(&tid.0)
 }
 
 /// Flip acked comments Delivered -> Read. A comment still Pending (never delivered)

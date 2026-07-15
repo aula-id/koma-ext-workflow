@@ -33,6 +33,8 @@ fn project(phase: ProjectPhase) -> Project {
         tasks: vec![],
         config: ProjectConfig::default_config(),
         outbox: vec![],
+        trace: vec![],
+        interrupted_from: None,
         seq: 1,
     }
 }

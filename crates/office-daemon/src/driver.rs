@@ -1059,6 +1059,8 @@ impl<H: Host> Driver<H> {
             tasks: Vec::new(),
             config: office_core::ProjectConfig::default_config(),
             outbox: Vec::new(),
+            trace: Vec::new(),
+            interrupted_from: None,
             seq: 0,
         };
         if self.store.create_project(&project).is_err() {

@@ -58,6 +58,8 @@ mod tests {
             tasks,
             config: ProjectConfig::default_config(),
             outbox: Vec::new(),
+            trace: Vec::new(),
+            interrupted_from: None,
             seq,
         }
     }

@@ -206,7 +206,7 @@ mod tests {
             ProjectPhase::Interrupted
         );
         assert_eq!(
-            step_project(&ProjectPhase::Interrupted, ProjectTransition::Resume).unwrap(),
+            step_project(&ProjectPhase::Interrupted, ProjectTransition::Resume { to_drafting: false }).unwrap(),
             ProjectPhase::Running
         );
         assert_eq!(
@@ -226,7 +226,7 @@ mod tests {
                 &ProjectPhase::Halted {
                     reason: "x".to_string()
                 },
-                ProjectTransition::Resume
+                ProjectTransition::Resume { to_drafting: false }
             )
             .unwrap(),
             ProjectPhase::Running
@@ -263,7 +263,7 @@ mod tests {
         // cannot interrupt a Ready project
         assert!(step_project(&ProjectPhase::Ready, ProjectTransition::Interrupt).is_err());
         // cannot resume a Running project
-        assert!(step_project(&ProjectPhase::Running, ProjectTransition::Resume).is_err());
+        assert!(step_project(&ProjectPhase::Running, ProjectTransition::Resume { to_drafting: false }).is_err());
         // cannot complete an Interrupted project
         assert!(
             step_project(&ProjectPhase::Interrupted, ProjectTransition::Complete { at_ms: 1 })
@@ -272,8 +272,36 @@ mod tests {
         // Done is terminal
         assert!(step_project(
             &ProjectPhase::Done { at_ms: 1 },
-            ProjectTransition::Resume
+            ProjectTransition::Resume { to_drafting: false }
         )
         .is_err());
+    }
+
+    #[test]
+    fn drafting_is_interruptible_and_resumes_to_drafting() {
+        // Feature: interrupt-from-drafting. Drafting -> Interrupted is now a legal edge so any
+        // dangling drafting process can be cut off from the start of PRD drafting.
+        assert_eq!(
+            step_project(&ProjectPhase::Drafting, ProjectTransition::Interrupt).unwrap(),
+            ProjectPhase::Interrupted
+        );
+        // A resume that recalls a drafting-interrupt (`to_drafting: true`) returns to Drafting...
+        assert_eq!(
+            step_project(
+                &ProjectPhase::Interrupted,
+                ProjectTransition::Resume { to_drafting: true }
+            )
+            .unwrap(),
+            ProjectPhase::Drafting
+        );
+        // ...while a running/halted interrupt (`to_drafting: false`) still resumes to Running.
+        assert_eq!(
+            step_project(
+                &ProjectPhase::Interrupted,
+                ProjectTransition::Resume { to_drafting: false }
+            )
+            .unwrap(),
+            ProjectPhase::Running
+        );
     }
 }

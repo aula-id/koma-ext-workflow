@@ -193,6 +193,18 @@ pub struct OutboundNotice {
     pub paused: bool,
 }
 
+/// One machine-diary entry (feature: tracelog) — a single line of what the office machine DID,
+/// not what a document says. `ts` is epoch milliseconds (the kernel's authoritative `now_ms`),
+/// `kind` a short category tag (`"gate"`, `"research"`, `"task"`, `"phase"`, ...), and `summary`
+/// a one-line human description that NEVER carries document content (byte counts / ids / reasons
+/// only). Rendered on the panel's trace tab as `HH:MM:SS kind summary`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceEvent {
+    pub ts: i64,
+    pub kind: String,
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub max_workers: u32,
@@ -341,6 +353,21 @@ pub struct Project {
     pub tasks: Vec<Task>,
     pub config: ProjectConfig,
     pub outbox: Vec<OutboundNotice>,
+    /// Machine-diary trace ring (feature: tracelog): a capped, newest-last log of what the office
+    /// machine did — persona/TRD/CRD invokes, doc captures, safeguard-gate stops/approvals,
+    /// research + audit lifecycle, breakdown/authorize, task transitions, interrupt/resume. One
+    /// line per entry, never document content. Capped at the kernel's `TRACE_CAP` (200, oldest
+    /// dropped) so a long project can never balloon `state.json`. `#[serde(default)]` for
+    /// back-compat with pre-tracelog state files.
+    #[serde(default)]
+    pub trace: Vec<TraceEvent>,
+    /// The phase a currently-`Interrupted` project was in when it was interrupted (feature:
+    /// interrupt-from-drafting). Set on interrupt, read on resume so the machine returns to the
+    /// RIGHT phase — a Drafting-interrupt resumes to `Drafting`, a Running/Halted one to `Running`
+    /// — then cleared. `None` whenever the project is not interrupted. `#[serde(default)]` so
+    /// pre-feature state files (which never encode it) still load clean.
+    #[serde(default)]
+    pub interrupted_from: Option<ProjectPhase>,
     pub seq: u64,
 }
 

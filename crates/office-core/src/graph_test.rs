@@ -70,6 +70,8 @@ mod tests {
             tasks,
             config: ProjectConfig::default_config(),
             outbox: vec![],
+            trace: vec![],
+            interrupted_from: None,
             seq: 0,
         }
     }

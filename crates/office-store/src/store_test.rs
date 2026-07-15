@@ -58,6 +58,8 @@ fn project(slug: &str) -> Project {
         tasks: vec![one_task("t1")],
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
+        trace: Vec::new(),
+        interrupted_from: None,
         seq: 0,
     }
 }

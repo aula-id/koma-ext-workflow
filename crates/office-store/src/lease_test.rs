@@ -158,6 +158,8 @@ fn seed_project(store: &Store, slug: &str) {
         }],
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
+        trace: Vec::new(),
+        interrupted_from: None,
         seq: 0,
     };
     store.save_project(&p).unwrap();

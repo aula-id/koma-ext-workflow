@@ -137,10 +137,17 @@ pub enum ProjectTransition {
     /// Ready -> Running. Gated: `delivery_path_valid` must be true (the hard
     /// authorization gate, ARCHITECTURE.md 6.3.3). A false flag is an illegal edge.
     Authorize { delivery_path_valid: bool },
-    /// Running -> Interrupted (interrupt button / workflow_interrupt).
+    /// Running -> Interrupted AND Drafting -> Interrupted (interrupt button /
+    /// workflow_interrupt). Drafting is included so any dangling drafting process
+    /// (research/audit analyst, in-flight persona/assume-check invoke) can be cut off from
+    /// the very start of PRD drafting (feature: interrupt-from-drafting).
     Interrupt,
-    /// Interrupted -> Running and Halted -> Running (resume).
-    Resume,
+    /// Interrupted -> (Running | Drafting) and Halted -> Running (resume). `to_drafting` is
+    /// supplied by the kernel from `Project.interrupted_from`: a Drafting-interrupt resumes
+    /// back to Drafting, every other interrupt (and a Halt) resumes to Running. Carried on the
+    /// transition — like `Authorize`'s `delivery_path_valid` — so the pure machine stays the
+    /// single source of truth for the resume target.
+    Resume { to_drafting: bool },
     /// Running -> Halted (kernel: line stuck).
     Halt { reason: String },
     /// Running -> Done (all tasks Done).
@@ -163,7 +170,7 @@ fn project_transition_label(t: &ProjectTransition) -> &'static str {
         ProjectTransition::AcceptBreakdown => "AcceptBreakdown",
         ProjectTransition::Authorize { .. } => "Authorize",
         ProjectTransition::Interrupt => "Interrupt",
-        ProjectTransition::Resume => "Resume",
+        ProjectTransition::Resume { .. } => "Resume",
         ProjectTransition::Halt { .. } => "Halt",
         ProjectTransition::Complete { .. } => "Complete",
     }
@@ -189,6 +196,9 @@ pub fn step_project(
         }
 
         (ProjectPhase::Running, ProjectTransition::Interrupt) => Ok(ProjectPhase::Interrupted),
+        // Drafting is interruptible too (feature: interrupt-from-drafting) so a dangling
+        // drafting process can be cut off before the board even exists.
+        (ProjectPhase::Drafting, ProjectTransition::Interrupt) => Ok(ProjectPhase::Interrupted),
         (ProjectPhase::Running, ProjectTransition::Halt { reason }) => Ok(ProjectPhase::Halted {
             reason: reason.clone(),
         }),
@@ -196,8 +206,14 @@ pub fn step_project(
             Ok(ProjectPhase::Done { at_ms: *at_ms })
         }
 
-        (ProjectPhase::Interrupted, ProjectTransition::Resume) => Ok(ProjectPhase::Running),
-        (ProjectPhase::Halted { .. }, ProjectTransition::Resume) => Ok(ProjectPhase::Running),
+        (ProjectPhase::Interrupted, ProjectTransition::Resume { to_drafting }) => {
+            if *to_drafting {
+                Ok(ProjectPhase::Drafting)
+            } else {
+                Ok(ProjectPhase::Running)
+            }
+        }
+        (ProjectPhase::Halted { .. }, ProjectTransition::Resume { .. }) => Ok(ProjectPhase::Running),
 
         _ => Err(err()),
     }

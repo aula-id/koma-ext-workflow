@@ -353,6 +353,12 @@ mod tests {
                     paused: true,
                 },
             ],
+            trace: vec![TraceEvent {
+                ts: now as i64,
+                kind: "phase".to_string(),
+                summary: "hard interrupt from running".to_string(),
+            }],
+            interrupted_from: Some(ProjectPhase::Running),
             seq: 42,
         };
 
