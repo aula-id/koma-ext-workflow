@@ -51,6 +51,9 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: vec![],
+        assumptions_approved: false,
+        self_resolved_assumptions: vec![],
+        capture_nudge_count: 0,
         assumption_rounds: 0,
         office_transcript: vec![],
         office_summary: String::new(),
@@ -62,6 +65,8 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         tasks,
         config: ProjectConfig::default_config(),
         outbox: vec![],
+        trace: vec![],
+        interrupted_from: None,
         seq,
     }
 }

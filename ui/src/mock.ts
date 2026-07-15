@@ -59,6 +59,12 @@ function historyEvent(atMs: number, event: string) {
   return { atMs, event };
 }
 
+/** One machine-diary entry (feature: tracelog): `{ ts, kind, summary }`, mirroring office-core
+ * domain.rs `TraceEvent` / digest.rs's full-snapshot `trace` array. */
+function traceEvent(ts: number, kind: string, summary: string) {
+  return { ts, kind, summary };
+}
+
 // ---------------------------------------------------------------------------
 // Project 1 — Running: "Notifications Revamp". 15 tasks across all 5 columns,
 // including 2 parked, a dependency web, and bounce history.
@@ -253,6 +259,14 @@ function buildRunningProject() {
     officeTranscript: [],
     officeSummary: '',
     outbox: [],
+    trace: [
+      traceEvent(T0 + 40 * 60 * 1000, 'task', 'in-app-toast-component → done (review pass)'),
+      traceEvent(T0 + 60 * 60 * 1000, 'task', 'build-fanout-consumer-worker → worker dispatched (attempt 1)'),
+      traceEvent(T0 + 120 * 60 * 1000, 'task', 'build-fanout-consumer-worker → todo (review bounce 1)'),
+      traceEvent(T0 + 121 * 60 * 1000, 'task', 'build-fanout-consumer-worker → worker dispatched (attempt 2)'),
+      traceEvent(T0 + 190 * 60 * 1000, 'task', 'email-channel-adapter → reviewer dispatched'),
+      traceEvent(T0 + 200 * 60 * 1000, 'task', 'rate-limit-shared-sms → parked (worker blocked)'),
+    ],
     config: defaultConfig({ maxWorkers: 4, bounceBudget: 3, workerModel: 'claude-sonnet', reviewerModel: 'claude-opus' }),
   };
 }
@@ -341,6 +355,16 @@ function buildDraftingProject() {
       { id: 2, text: 'Still waiting on a decision for tier-downgrade timing before breakdown can start.', sent: false, paused: true },
       { id: 3, text: 'Reminder: this project has been in Drafting for 3 days.', sent: false, paused: false },
     ],
+    trace: [
+      traceEvent(nowMs() - 32 * 60 * 1000, 'office', 'message received: We want to redesign the loyalty program around tiers instead of…'),
+      traceEvent(nowMs() - 31 * 60 * 1000, 'invoke', 'persona reply'),
+      traceEvent(nowMs() - 20 * 60 * 1000, 'capture', 'PRD captured (612 bytes)'),
+      traceEvent(nowMs() - 20 * 60 * 1000, 'gate', 'checking PRD for assumptions'),
+      traceEvent(nowMs() - 19 * 60 * 1000, 'gate', 'PRD clean — proceeding'),
+      traceEvent(nowMs() - 19 * 60 * 1000, 'research', 'spawned — analyzing the stack'),
+      traceEvent(nowMs() - 3 * 60 * 1000, 'research', 'done — 412 bytes of notes'),
+      traceEvent(nowMs() - 90 * 1000, 'invoke', 'TRD authoring'),
+    ],
     config: defaultConfig(),
   };
 }
@@ -396,6 +420,13 @@ function buildDraftingAssumptionsProject() {
     ],
     officeSummary: 'Admin bulk CSV import with client-side validation and a per-row error report; partial-import commit behavior is an open/assumed question.',
     outbox: [],
+    trace: [
+      traceEvent(nowMs() - 10 * 60 * 1000, 'office', 'message received: Admins need to bulk-import products from a CSV instead of…'),
+      traceEvent(nowMs() - 9 * 60 * 1000, 'invoke', 'persona reply'),
+      traceEvent(nowMs() - 8 * 60 * 1000, 'capture', 'PRD captured (388 bytes)'),
+      traceEvent(nowMs() - 8 * 60 * 1000, 'gate', 'checking PRD for assumptions'),
+      traceEvent(nowMs() - 7 * 60 * 1000, 'gate', 'PRD STOPPED — 1 assumption(s) flagged'),
+    ],
     config: defaultConfig(),
   };
 }
@@ -526,6 +557,11 @@ function buildHaltedProject() {
     officeTranscript: [],
     officeSummary: '',
     outbox: [],
+    trace: [
+      traceEvent(T0 + 30 * 60 * 1000, 'task', 'migrate-auth-service → worker dispatched (attempt 1)'),
+      traceEvent(T0 + 60 * 60 * 1000, 'task', 'migrate-auth-service → parked (worker blocked)'),
+      traceEvent(T0 + 60 * 60 * 1000, 'phase', 'halted — parked task(s) legacy/t1 block everything'),
+    ],
     config: defaultConfig({ maxWorkers: 2, bounceBudget: 2, keepDesks: true }),
   };
 }
@@ -640,6 +676,11 @@ function handleOp(payload: any): any {
     case 'interrupt': {
       const p = findProject(payload.project);
       if (!p) return err(`unknown project: ${payload.project}`);
+      // Remember the pre-interrupt phase so resume returns to the right one (a drafting-interrupt
+      // resumes back to Drafting) — mirrors office-core's Project.interrupted_from.
+      p.prevPhaseKind = p.phase.kind;
+      const mode = payload.mode === 'soft' ? 'soft drain' : 'hard interrupt';
+      p.trace = [...(p.trace ?? []), traceEvent(nowMs(), 'phase', `${mode} from ${p.phase.kind}`)];
       p.phase = { kind: 'interrupted' };
       schedulePush();
       return ok();
@@ -648,7 +689,10 @@ function handleOp(payload: any): any {
     case 'resume': {
       const p = findProject(payload.project);
       if (!p) return err(`unknown project: ${payload.project}`);
-      p.phase = { kind: 'running' };
+      const to = p.prevPhaseKind === 'drafting' ? 'drafting' : 'running';
+      p.prevPhaseKind = undefined;
+      p.trace = [...(p.trace ?? []), traceEvent(nowMs(), 'phase', `resumed to ${to}`)];
+      p.phase = { kind: to };
       schedulePush();
       return ok();
     }
@@ -744,6 +788,7 @@ function handleOp(payload: any): any {
           officeTranscript: [],
           officeSummary: '',
           outbox: [],
+          trace: [],
           config: defaultConfig(),
         },
       ];

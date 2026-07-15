@@ -193,6 +193,18 @@ pub struct OutboundNotice {
     pub paused: bool,
 }
 
+/// One machine-diary entry (feature: tracelog) — a single line of what the office machine DID,
+/// not what a document says. `ts` is epoch milliseconds (the kernel's authoritative `now_ms`),
+/// `kind` a short category tag (`"gate"`, `"research"`, `"task"`, `"phase"`, ...), and `summary`
+/// a one-line human description that NEVER carries document content (byte counts / ids / reasons
+/// only). Rendered on the panel's trace tab as `HH:MM:SS kind summary`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceEvent {
+    pub ts: i64,
+    pub kind: String,
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub max_workers: u32,
@@ -228,6 +240,9 @@ pub struct ProjectConfig {
     /// the original freeze-and-ask behavior for EVERY material item. `assumption_check == false`
     /// still disables the checker entirely regardless of mode. Named-fn default `"auto"` (not
     /// `#[serde(default)]`, which would force an empty string) so legacy state files load autonomous.
+    /// (Unification 2026-07-15: this single mode enum SUPERSEDES the branch's `assumption_trust`
+    /// bool — `"auto"` is the old `assumption_trust == true`, `"ask"` the old `false`; the new
+    /// default flips to autonomous.)
     #[serde(default = "default_assumption_mode")]
     pub assumption_mode: String,
 }
@@ -316,6 +331,30 @@ pub struct Project {
     /// for back-compat.
     #[serde(default)]
     pub pending_assumptions: Vec<String>,
+    /// Sticky per-project approval of the safeguard gate. Set once the user answers a
+    /// pending-assumptions stop with a deterministic approval intent (kernel `office_message`) OR
+    /// invokes `workflow_approve` (kernel `approve_assumptions`); thereafter `gate_doc` fails OPEN
+    /// for every doc in THIS project (`assumptions_approved || !config.assumption_check`), so a
+    /// re-emitted doc proceeds instead of re-stopping (the audit's approval loop). NEVER auto-reset
+    /// — the owner's "super-autonomous once approved" contract: once set it dominates, so toggling
+    /// `config.assumption_check` does NOT re-gate this project. `config.assumption_check` remains
+    /// the wholesale gate on/off escape hatch for projects that were never approved.
+    /// `#[serde(default)]` (false) for back-compat.
+    #[serde(default)]
+    pub assumptions_approved: bool,
+    /// Append-only audit trail of assumptions the safeguard flagged that an active approval
+    /// (`assumptions_approved`, set by chat intent or `workflow_approve`) auto-resolved instead of
+    /// stopping on. Capped to the most recent ~100 entries so a long drafting session can never
+    /// balloon the state file. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub self_resolved_assumptions: Vec<String>,
+    /// Consecutive deterministic capture-miss nudges issued for the current PRD (kernel Persona
+    /// arm): incremented each time a long Drafting reply lands with no ```prd fence while the PRD
+    /// slot is still empty, reset to 0 on a successful fence capture. Caps the nudge loop
+    /// (`MAX_CAPTURE_NUDGES`) so a model that never emits the fence falls back to waiting on the
+    /// user rather than looping forever. `#[serde(default)]` (0) for back-compat.
+    #[serde(default)]
+    pub capture_nudge_count: u32,
     /// How many autonomous auto-resolution rounds the safeguard has run on the CURRENT doc capture
     /// (autonomous-safeguard pivot). Bumped each time an `InvokePurpose::AssumeResolve` invoke is
     /// emitted, RESET to 0 on every fresh doc capture (a persona/TRD/CRD fence), and capped at
@@ -334,6 +373,21 @@ pub struct Project {
     pub tasks: Vec<Task>,
     pub config: ProjectConfig,
     pub outbox: Vec<OutboundNotice>,
+    /// Machine-diary trace ring (feature: tracelog): a capped, newest-last log of what the office
+    /// machine did — persona/TRD/CRD invokes, doc captures, safeguard-gate stops/approvals,
+    /// research + audit lifecycle, breakdown/authorize, task transitions, interrupt/resume. One
+    /// line per entry, never document content. Capped at the kernel's `TRACE_CAP` (200, oldest
+    /// dropped) so a long project can never balloon `state.json`. `#[serde(default)]` for
+    /// back-compat with pre-tracelog state files.
+    #[serde(default)]
+    pub trace: Vec<TraceEvent>,
+    /// The phase a currently-`Interrupted` project was in when it was interrupted (feature:
+    /// interrupt-from-drafting). Set on interrupt, read on resume so the machine returns to the
+    /// RIGHT phase — a Drafting-interrupt resumes to `Drafting`, a Running/Halted one to `Running`
+    /// — then cleared. `None` whenever the project is not interrupted. `#[serde(default)]` so
+    /// pre-feature state files (which never encode it) still load clean.
+    #[serde(default)]
+    pub interrupted_from: Option<ProjectPhase>,
     pub seq: u64,
 }
 

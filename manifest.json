@@ -366,6 +366,25 @@
         "input_schema": {
           "type": "object"
         }
+      },
+      {
+        "name": "workflow_delete_project",
+        "description": "Permanently delete (archive) a project and stop its agents. IRREVERSIBLE. Two-step confirm: pass 'confirm' equal to the exact project slug; a missing or mismatched confirm deletes nothing and replies with the value to send.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string"
+            },
+            "confirm": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project",
+            "confirm"
+          ]
+        }
       }
     ]
   }

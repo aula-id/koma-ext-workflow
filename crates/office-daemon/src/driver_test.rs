@@ -70,6 +70,9 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: vec![],
+        assumptions_approved: false,
+        self_resolved_assumptions: vec![],
+        capture_nudge_count: 0,
         assumption_rounds: 0,
         office_transcript: vec![],
         office_summary: String::new(),
@@ -81,6 +84,8 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         tasks,
         config: ProjectConfig::default_config(),
         outbox: vec![],
+        trace: vec![],
+        interrupted_from: None,
         seq: 1,
     }
 }
@@ -149,7 +154,7 @@ fn agents_done_fetches_result_moves_to_review_and_spawns_reviewer() {
     d.insert_for_test(project("auth", ProjectPhase::Running, vec![t]), 1_000);
 
     d.handle(
-        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string() }),
+        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }),
         2_000,
     );
 
@@ -524,7 +529,11 @@ fn project_archive_kills_bindings_removes_project_and_deletes_state() {
         "auth/t1",
         TaskState::OnProgress { binding: worker_binding(101, 1_000), attempt: 1 },
     );
-    d.insert_for_test(project("auth", ProjectPhase::Running, vec![t]), 1_000);
+    // A project-level research binding (6.2b) is NOT a task binding; the delete must kill it
+    // too, alongside the in-flight worker.
+    let mut p = project("auth", ProjectPhase::Running, vec![t]);
+    p.research = Some(research_binding(202, 1_000));
+    d.insert_for_test(p, 1_000);
     assert!(d.holds_lease("auth"));
 
     d.handle(
@@ -532,11 +541,16 @@ fn project_archive_kills_bindings_removes_project_and_deletes_state() {
         2_000,
     );
 
-    assert_eq!(call_count(&d.host, "agents.kill"), 1, "the in-flight binding is killed");
-    assert_eq!(
-        last_call(&d.host, "agents.kill").unwrap().get("agentId").and_then(Value::as_u64),
-        Some(101)
-    );
+    let killed: Vec<u64> = d
+        .host
+        .calls
+        .iter()
+        .filter(|(m, _)| m == "agents.kill")
+        .filter_map(|(_, params)| params.get("agentId").and_then(Value::as_u64))
+        .collect();
+    assert_eq!(killed.len(), 2, "the worker AND the project-level research binding are killed");
+    assert!(killed.contains(&101), "the in-flight worker binding is killed");
+    assert!(killed.contains(&202), "the project-level research binding is killed");
 
     assert!(d.project("auth").is_none(), "the project is removed from memory");
     assert!(
@@ -572,6 +586,14 @@ fn project_archive_on_a_non_owned_project_is_dropped_project_still_present() {
     assert_eq!(call_count(&d.host, "agents.kill"), 0, "no bindings are killed for a dropped archive");
     assert!(d.project("other").is_some(), "a non-owned archive must be dropped, not applied");
     assert!(d.store.load_project("other").is_ok(), "state.json must remain on disk");
+    // ...but the user is told the truth instead of a silent no-op (the panel already acked
+    // {ok:true} and dropped the card): a chat notice explains the refusal by name.
+    let notice = last_call(&d.host, "chat.prompt").expect("a refusal chat notice is sent");
+    let text = notice.get("text").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        text.contains("owned by another koma session"),
+        "the refusal names the real reason, got: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -749,7 +771,7 @@ fn research_agents_done_fetches_findings_and_drafts_the_trd() {
     // The private agents.done notify for the researcher correlates to project "a" via the
     // research binding, fetches the findings, stores them, and drafts the TRD.
     d.handle(
-        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 700, status: "done".to_string() }),
+        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 700, status: "done".to_string(), error: None }),
         3_000,
     );
     let a = d.project("a").unwrap();
@@ -1025,7 +1047,7 @@ fn completion_with_crd_spawns_office_auditor_and_records_its_id() {
 
     // The reviewer finishes -> the last task is Done -> the auditor is spawned (not Done yet).
     d.handle(
-        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 500, status: "done".to_string() }),
+        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 500, status: "done".to_string(), error: None }),
         2_000,
     );
 
@@ -1064,7 +1086,7 @@ fn auditor_cross_process_spawn_degrades_to_done_without_releasing_lease() {
     assert!(d.holds_lease("auth"));
 
     d.handle(
-        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 500, status: "done".to_string() }),
+        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 500, status: "done".to_string(), error: None }),
         2_000,
     );
 

@@ -85,6 +85,16 @@ pub fn breakdown(project: &str) -> Value {
     json!({ "op": "breakdown", "project": project })
 }
 
+/// `{ "op": "archive_project", "project": <project> }`.
+///
+/// Permanently delete (archive) a project and stop its agents. `project` is required by the
+/// parser. Like every other command tool the office acknowledges in chat, not in the tool
+/// result. The two-step confirm (the caller must echo the slug) lives in the `workflow-mcp`
+/// tool, not here — this builder only emits the envelope once the tool has decided to fire.
+pub fn archive_project(project: &str) -> Value {
+    json!({ "op": "archive_project", "project": project })
+}
+
 /// `{ "op": "approve", "project": <project> }`.
 ///
 /// Approve the safeguard's pending assumptions for a drafting project (ARCHITECTURE.md 6.2c):

@@ -298,6 +298,14 @@ fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeAct
         // Ungrounded assumptions the safeguard flagged in the last doc gate (6.2c): the docs tab
         // renders these as an amber pending-assumptions strip while the pipeline waits.
         obj["pendingAssumptions"] = json!(p.pending_assumptions);
+        // Machine-diary trace ring (feature: tracelog): the panel's trace tab renders these as an
+        // `HH:MM:SS kind summary` timeline. Full mode only, like the other bodies; summary mode
+        // drops it under the 900KB size guard.
+        obj["trace"] = json!(p
+            .trace
+            .iter()
+            .map(|e| json!({ "ts": e.ts, "kind": e.kind, "summary": e.summary }))
+            .collect::<Vec<_>>());
         obj["officeTranscript"] = json!(p
             .office_transcript
             .iter()

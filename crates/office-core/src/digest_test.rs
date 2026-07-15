@@ -45,6 +45,9 @@ mod tests {
             audit_rounds: 0,
             last_audit_grade: None,
             pending_assumptions: vec![],
+            assumptions_approved: false,
+            self_resolved_assumptions: vec![],
+            capture_nudge_count: 0,
             assumption_rounds: 0,
             office_transcript: vec![ChatMsg { who: ChatAuthor::User, text: "hi".to_string() }],
             office_summary: String::new(),
@@ -56,6 +59,8 @@ mod tests {
             tasks,
             config: ProjectConfig::default_config(),
             outbox: Vec::new(),
+            trace: Vec::new(),
+            interrupted_from: None,
             seq,
         }
     }

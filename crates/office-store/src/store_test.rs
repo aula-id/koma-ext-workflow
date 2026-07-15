@@ -45,6 +45,9 @@ fn project(slug: &str) -> Project {
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: Vec::new(),
+        assumptions_approved: false,
+        self_resolved_assumptions: Vec::new(),
+        capture_nudge_count: 0,
         assumption_rounds: 0,
         office_transcript: Vec::new(),
         office_summary: String::new(),
@@ -56,6 +59,8 @@ fn project(slug: &str) -> Project {
         tasks: vec![one_task("t1")],
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
+        trace: Vec::new(),
+        interrupted_from: None,
         seq: 0,
     }
 }

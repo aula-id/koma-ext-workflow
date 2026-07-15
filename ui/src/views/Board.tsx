@@ -8,6 +8,7 @@ import DepMap from '../components/DepMap';
 import TaskDetail from './TaskDetail';
 import Prd from './Prd';
 import OfficeMap from './OfficeMap';
+import TraceLog from './TraceLog';
 import ConfirmButton from '../components/ConfirmButton';
 import { docCards, DocCard } from '../lib/docCards';
 
@@ -33,6 +34,15 @@ export interface Story {
 export interface ChatMsg {
   who: 'user' | 'office';
   text: string;
+}
+
+/** One machine-diary entry (feature: tracelog), mirroring office-core domain.rs `TraceEvent`
+ * and digest.rs's full-snapshot `trace` array. `ts` is epoch millis; `summary` is a single line,
+ * never document content. Rendered in the 'trace' tab as `HH:MM:SS kind summary`. */
+export interface TraceEvent {
+  ts: number;
+  kind: string;
+  summary: string;
 }
 
 /** Not part of the frozen envelope (PANEL_PROTOCOL.md 2.1 does not serialize the
@@ -70,6 +80,9 @@ export interface Project {
   pendingAssumptions?: string[];
   officeTranscript?: ChatMsg[];
   officeSummary?: string;
+  /** Machine-diary trace ring (full snapshot only, feature: tracelog); rendered in the 'trace'
+   * tab. Optional + newest-last; capped server-side at 200 entries. */
+  trace?: TraceEvent[];
   outbox?: OutboundNoticeView[];
   /** Fixed-staff liveness for the office view (6.2b/6.2c): whether the project-level
    * researcher / clean-build auditor sub-agent is currently in flight. Full mode only. */
@@ -245,7 +258,7 @@ export interface BoardProps {
   initialTaskId?: string;
 }
 
-type Tab = 'office' | 'board' | 'drilldown' | 'depmap' | 'prd';
+type Tab = 'office' | 'board' | 'drilldown' | 'depmap' | 'prd' | 'trace';
 
 export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _onSettings, initialTab, initialTaskId }) => {
   const rawProject = useStore((s) => s.getProject(projectId));
@@ -429,9 +442,15 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
               buttons side by side for every state. flex:none so a long project
               name can never crush the buttons. */}
           <div style={{ display: 'flex', gap: '0.5rem', flex: 'none' }}>
-            {phaseKind === 'running' && (
+            {(phaseKind === 'running' || phaseKind === 'drafting') && (
               <React.Fragment>
-                <ConfirmButton label="drain" className="wf-btn" onConfirm={() => void runInterrupt('soft')} testId="drain-btn" />
+                {/* drain (soft) applies only to a running production line; Drafting has no line to
+                    drain, only dangling analyst/invoke processes to cut off. */}
+                {phaseKind === 'running' && (
+                  <ConfirmButton label="drain" className="wf-btn" onConfirm={() => void runInterrupt('soft')} testId="drain-btn" />
+                )}
+                {/* interrupt (hard) is available from the START of PRD drafting so any dangling
+                    process can be cut off (feature: interrupt-from-drafting). */}
                 <ConfirmButton label="interrupt" className="wf-btn wf-btn-danger" onConfirm={() => void runInterrupt('hard')} testId="interrupt-btn" />
               </React.Fragment>
             )}
@@ -492,7 +511,7 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
 
         {/* koma-flat tabs: text + active underline, no boxes */}
         <div style={{ display: 'flex', gap: '1.1rem', margin: '0.75rem 0 1rem', borderBottom: '1px solid var(--wf-border)' }}>
-          {(['office', 'board', 'drilldown', 'depmap', 'prd'] as Tab[]).map((t) => (
+          {(['office', 'board', 'drilldown', 'depmap', 'prd', 'trace'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -505,7 +524,17 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
                 borderRadius: 0,
               }}
             >
-              {t === 'office' ? 'office' : t === 'board' ? 'board' : t === 'drilldown' ? 'drilldown' : t === 'depmap' ? 'dependencies' : 'docs'}
+              {t === 'office'
+                ? 'office'
+                : t === 'board'
+                  ? 'board'
+                  : t === 'drilldown'
+                    ? 'drilldown'
+                    : t === 'depmap'
+                      ? 'dependencies'
+                      : t === 'prd'
+                        ? 'docs'
+                        : 'trace'}
             </button>
           ))}
         </div>
@@ -605,7 +634,9 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
           />
         )}
 
-        {tab === 'prd' && <Prd project={project} />}
+        {tab === 'prd' && <Prd project={project} onOpenTrace={() => setTab('trace')} />}
+
+        {tab === 'trace' && <TraceLog project={project} />}
 
         {/* Drawer lives OUTSIDE the tab switch so a depmap node click opens it too. */}
         <AnimatePresence>

@@ -96,6 +96,9 @@ mod tests {
             audit_rounds: 1,
             last_audit_grade: Some(93),
             pending_assumptions: vec!["assumed Postgres, user never stated a DB".to_string()],
+            assumptions_approved: true,
+            self_resolved_assumptions: vec!["assumed nightly cron, self-resolved under approval".to_string()],
+            capture_nudge_count: 2,
             assumption_rounds: 1,
             office_transcript: vec![
                 ChatMsg {
@@ -351,6 +354,12 @@ mod tests {
                     paused: true,
                 },
             ],
+            trace: vec![TraceEvent {
+                ts: now as i64,
+                kind: "phase".to_string(),
+                summary: "hard interrupt from running".to_string(),
+            }],
+            interrupted_from: Some(ProjectPhase::Running),
             seq: 42,
         };
 
@@ -382,7 +391,10 @@ mod tests {
         assert_eq!(deserialized.config.crd_pass_grade, 95);
         assert!(!deserialized.config.assumption_check);
         assert_eq!(deserialized.config.safeguard_role, "safeguard");
-        // Autonomous-safeguard fields round-trip too.
+        // The approval/nudge additive fields + the autonomous-safeguard fields all round-trip.
+        assert!(deserialized.assumptions_approved, "assumptions_approved round-trips");
+        assert_eq!(deserialized.self_resolved_assumptions.len(), 1);
+        assert_eq!(deserialized.capture_nudge_count, 2);
         assert_eq!(deserialized.assumption_rounds, 1);
         assert_eq!(deserialized.config.assumption_mode, "ask");
     }
@@ -431,7 +443,11 @@ mod tests {
         assert_eq!(p.config.crd_pass_grade, 98, "absent crd_pass_grade defaults to 98, not 0");
         assert!(p.config.assumption_check, "absent assumption_check defaults to true, not false");
         assert_eq!(p.config.safeguard_role, "safeguard");
-        // Autonomous-safeguard defaults: a legacy project loads FULLY AUTONOMOUS ("auto"), round 0.
+        // The approval/nudge additive fields default cleanly on a legacy state file. Autonomous-
+        // safeguard defaults: a legacy project loads FULLY AUTONOMOUS ("auto"), round 0.
+        assert!(!p.assumptions_approved, "absent assumptions_approved defaults to false");
+        assert!(p.self_resolved_assumptions.is_empty(), "absent self_resolved_assumptions defaults to empty");
+        assert_eq!(p.capture_nudge_count, 0, "absent capture_nudge_count defaults to 0");
         assert_eq!(p.assumption_rounds, 0, "absent assumption_rounds defaults to 0");
         assert_eq!(
             p.config.assumption_mode, "auto",
@@ -651,5 +667,8 @@ mod tests {
         assert_eq!(config.crd_pass_grade, 98);
         assert!(config.assumption_check);
         assert_eq!(config.safeguard_role, "safeguard");
+        // Assumption mode defaults to "auto" (ULTRA-AUTOMATIC / autonomous, the post-unification
+        // default); only ConfigSet flips it to "ask" (freeze-and-ask).
+        assert_eq!(config.assumption_mode, "auto", "assumption mode defaults to auto (autonomous)");
     }
 }

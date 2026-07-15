@@ -198,6 +198,13 @@ fn parse(text: &str, file: &str) -> Result<(Command, String), String> {
             };
             Ok((Command::Breakdown { project }, "queued".to_string()))
         }
+        "archive_project" => {
+            let project = match str_field(&value, "project") {
+                Some(p) if !p.is_empty() => p,
+                _ => return Err(format!("{file}: op 'archive_project' requires a non-empty 'project'")),
+            };
+            Ok((Command::ProjectArchive { project }, "queued".to_string()))
+        }
         "approve" => {
             let project = match str_field(&value, "project") {
                 Some(p) if !p.is_empty() => p,
@@ -237,11 +244,11 @@ fn opt_str_field(v: &Value, key: &str) -> Option<String> {
 pub enum Target {
     /// A `brief`: `project` is the addressed id (`None` = start a new project).
     Brief { project: Option<String> },
-    /// A project-addressed op (`authorize`/`interrupt`/`resume`/`status`/`breakdown`/`approve`):
-    /// the `project` id (`status` may legitimately carry `None` = a global query). `breakdown` and
-    /// `approve` are owner-only exactly like `authorize` (6.4): re-running the breakdown or
-    /// approving pending assumptions must only ever be claimed by the instance that owns the
-    /// project.
+    /// A project-addressed op (`authorize`/`interrupt`/`resume`/`status`/`breakdown`/
+    /// `archive_project`/`approve`): the `project` id (`status` may legitimately carry `None` = a
+    /// global query). `breakdown`, `archive_project`, and `approve` are owner-only exactly like
+    /// `authorize` (6.4): re-running the breakdown, permanently deleting the project, or approving
+    /// pending assumptions must only ever be claimed by the instance that owns it.
     Project { project: Option<String> },
     /// A `comment` addressed to a task id (ownership resolves via the task's project prefix).
     Task { task: String },
@@ -265,7 +272,7 @@ pub fn peek_target(text: &str) -> Target {
             project: opt_str_field(&value, "project"),
         },
         Some("authorize") | Some("interrupt") | Some("resume") | Some("status")
-        | Some("breakdown") | Some("approve") => Target::Project {
+        | Some("breakdown") | Some("archive_project") | Some("approve") => Target::Project {
             project: opt_str_field(&value, "project"),
         },
         Some("comment") => match opt_str_field(&value, "task") {

@@ -57,6 +57,9 @@ mod tests {
             audit_rounds: 0,
             last_audit_grade: None,
             pending_assumptions: vec![],
+            assumptions_approved: false,
+            self_resolved_assumptions: vec![],
+            capture_nudge_count: 0,
             assumption_rounds: 0,
             office_transcript: vec![],
             office_summary: String::new(),
@@ -68,6 +71,8 @@ mod tests {
             tasks,
             config: ProjectConfig::default_config(),
             outbox: vec![],
+            trace: vec![],
+            interrupted_from: None,
             seq: 0,
         }
     }

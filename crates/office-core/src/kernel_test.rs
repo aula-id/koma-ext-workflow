@@ -44,6 +44,9 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: Vec::new(),
+        assumptions_approved: false,
+        self_resolved_assumptions: Vec::new(),
+        capture_nudge_count: 0,
         assumption_rounds: 0,
         office_transcript: Vec::new(),
         office_summary: String::new(),
@@ -55,6 +58,8 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         tasks,
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
+        trace: Vec::new(),
+        interrupted_from: None,
         seq: 0,
     }
 }
@@ -676,6 +681,7 @@ fn full_task_lifecycle_effect_sequence() {
         Input::Host(HostEvent::AgentsDone {
             agent_id: 10,
             status: "done".into(),
+            error: None,
         }),
         1500,
         4,
@@ -706,6 +712,7 @@ fn full_task_lifecycle_effect_sequence() {
         Input::Host(HostEvent::AgentsDone {
             agent_id: 11,
             status: "done".into(),
+            error: None,
         }),
         2500,
         4,
@@ -823,6 +830,7 @@ fn worker_error_requeues_with_attempt_increment() {
         Input::Host(HostEvent::AgentsDone {
             agent_id: 6,
             status: "error".into(),
+            error: None,
         }),
         1000,
         0, // cap 0: observe Todo before re-dispatch
@@ -1072,7 +1080,7 @@ fn config_set_applies_only_the_provided_fields() {
             keep_desks: Some(true),
             crd_pass_grade: Some(90),
             assumption_check: Some(false),
-            assumption_mode: None,
+            assumption_mode: Some("ask".to_string()),
         }),
         1000,
         4,
@@ -1086,6 +1094,7 @@ fn config_set_applies_only_the_provided_fields() {
     // 6.2c config fields round-trip through config_set exactly like the rest.
     assert_eq!(p.config.crd_pass_grade, 90, "crdPassGrade parses through into ProjectConfig");
     assert!(!p.config.assumption_check, "assumptionCheck=false disables the safeguard gate");
+    assert_eq!(p.config.assumption_mode, "ask", "assumptionMode parses through into ProjectConfig");
     assert!(fx.iter().any(|e| matches!(e, Effect::Persist)), "a mutation always persists");
 }
 
@@ -1374,7 +1383,7 @@ fn prd_capture_spawns_research_and_defers_breakdown() {
 fn research_done_status_fetches_the_findings() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.research = Some(researcher_binding(55, 1000));
-    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 55, status: "done".into() }), 2000, 4);
+    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 55, status: "done".into(), error: None }), 2000, 4);
     assert_eq!(fx, vec![Effect::FetchResult { ext_agent_id: 55 }]);
 }
 
@@ -1603,6 +1612,164 @@ fn assume_check_trd_clean_proceeds_to_crd_and_crd_clean_to_breakdown() {
         4,
     );
     assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::Breakdown);
+}
+
+// ---------------------------------------------------------------------------
+// Assumption approval + capture-miss nudge (autonomy loop fix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn approval_intent_matches_clear_approvals_and_rejects_negations() {
+    // Positives: every deterministic phrase plus natural wrappings; "approve another approach"
+    // proves the whole-word negation veto never trips on "another" -> "not".
+    for msg in [
+        "approve", "Approved", "please approve this", "approve it",
+        "you decide", "go ahead", "let's proceed", "LGTM!", "ok go",
+        "approve another approach",
+    ] {
+        assert!(is_approval_intent(msg), "should read as approval: {msg:?}");
+    }
+    // Negatives: no approval word, OR an approval word paired with a negation — a SAFEGUARD only
+    // opens on a CLEAR approval (blanket autonomy is `assumption_mode = "auto"`, not a fuzzy match).
+    for msg in [
+        "I don't approve of waiting",
+        "do not proceed",
+        "never approve this",
+        "I can't approve yet",
+        "reject and rethink",
+        "what database should we use?",
+    ] {
+        assert!(!is_approval_intent(msg), "should NOT read as approval: {msg:?}");
+    }
+}
+
+#[test]
+fn office_message_approval_closes_the_gate_and_clears_pending() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.pending_assumptions = vec!["assumed Postgres".into(), "assumed React".into()];
+    let fx = step(&mut p, Input::Command(Command::OfficeMessage { text: "approve".into() }), 1000, 4);
+
+    assert!(p.assumptions_approved, "a clear approval sets the sticky flag");
+    assert!(p.pending_assumptions.is_empty(), "pending assumptions are cleared on approval");
+    assert!(p.outbox.iter().any(|n| n.text.contains("gate closed")), "a trace notice is queued");
+    // The message still drives the persona — it re-emits the doc, which now passes the gate.
+    assert!(fx
+        .iter()
+        .any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Persona, .. })));
+}
+
+#[test]
+fn office_message_non_approval_leaves_the_gate_stopped() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.pending_assumptions = vec!["assumed Postgres".into()];
+    step(
+        &mut p,
+        Input::Command(Command::OfficeMessage { text: "I don't approve of waiting".into() }),
+        1000,
+        4,
+    );
+    assert!(!p.assumptions_approved, "an ambiguous/negated message does NOT close the gate");
+    assert_eq!(p.pending_assumptions.len(), 1, "pending assumptions remain");
+}
+
+#[test]
+fn approved_project_skips_the_gate_on_next_capture() {
+    // assumption_check ON (default) but the project was already approved: a captured PRD proceeds
+    // STRAIGHT to research (no AssumeCheck invoke), the same fail-open shape as the config toggle.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.assumptions_approved = true;
+    let reply = "```prd\n# App\nBuild a CLI.\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "approved -> gate skipped -> research");
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeCheckPrd, .. })),
+        "no assume-check invoke once approved"
+    );
+}
+
+#[test]
+fn approved_belt_never_stops_even_on_an_in_flight_assumptions_verdict() {
+    // A check in flight when the user approved comes back "assumptions" — the belt keeps it from
+    // stopping the already-approved pipeline (race protection).
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.assumptions_approved = true;
+    p.prd_markdown = "# App".into();
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed Postgres\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 4);
+
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the approved belt proceeds");
+    assert!(p.pending_assumptions.is_empty());
+    assert!(p.outbox.iter().any(|n| n.text.contains("no-assume (approved)")));
+}
+
+#[test]
+fn self_resolved_assumptions_are_capped_at_100() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // The approval belt (an in-flight verdict landing after the user approved) is what records
+    // flagged items onto the audit trail, so drive the cap through `assumptions_approved`.
+    p.assumptions_approved = true;
+    p.prd_markdown = "# App".into();
+    p.self_resolved_assumptions = (0..99).map(|i| format!("old {i}")).collect();
+    // Flagging 5 more pushes to 104 -> capped back to the most recent 100 (oldest excess dropped).
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- a\n- b\n- c\n- d\n- e\n";
+    step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 4);
+
+    assert_eq!(p.self_resolved_assumptions.len(), 100, "capped to ~100");
+    assert_eq!(p.self_resolved_assumptions.last().unwrap(), "e", "newest kept");
+    assert_eq!(p.self_resolved_assumptions.first().unwrap(), "old 4", "oldest excess dropped");
+}
+
+#[test]
+fn capture_miss_nudges_twice_then_falls_back_to_waiting() {
+    // A long Drafting reply with no ```prd fence and no PRD yet is a forgotten-fence PRD: fire a
+    // deterministic re-invoke, capped at MAX_CAPTURE_NUDGES, then fall back to surfacing the reply.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = String::new();
+    let long_prose = format!("Here is my detailed product thinking. {}", "detail. ".repeat(80));
+    assert!(long_prose.len() > 500);
+
+    let fx1 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(long_prose.clone())), 1000, 4);
+    assert_eq!(p.capture_nudge_count, 1);
+    let inv1 = invoke_effects(&fx1);
+    assert_eq!(inv1.len(), 1, "a nudge re-invoke is fired");
+    match inv1[0] {
+        Effect::InvokeModel { purpose, system, .. } => {
+            assert_eq!(*purpose, InvokePurpose::Persona);
+            assert!(system.contains("Emit ONLY the complete document"), "nudge instruction appended to system");
+        }
+        other => panic!("expected InvokeModel, got {other:?}"),
+    }
+    assert!(p.outbox.is_empty(), "a nudge does not spam the user's chat");
+
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(long_prose.clone())), 1100, 4);
+    assert_eq!(p.capture_nudge_count, 2);
+    assert_eq!(invoke_effects(&fx2).len(), 1, "second (last) nudge fired");
+
+    let fx3 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(long_prose.clone())), 1200, 4);
+    assert!(invoke_effects(&fx3).is_empty(), "no nudge past the cap");
+    assert_eq!(p.capture_nudge_count, 2, "counter stays at the cap (reset only on capture)");
+    assert!(p.outbox.iter().any(|n| n.text.starts_with("office[")), "the reply is surfaced as a notice");
+}
+
+#[test]
+fn capture_miss_does_not_nudge_short_replies() {
+    // A short fence-less Drafting reply is a legitimate clarifying question — do NOT nudge; wait.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok("Do you want auth?".into())), 1000, 4);
+    assert!(invoke_effects(&fx).is_empty(), "short replies are not nudged");
+    assert_eq!(p.capture_nudge_count, 0);
+    assert!(p.outbox.iter().any(|n| n.text.contains("Do you want auth?")));
+}
+
+#[test]
+fn capture_nudge_counter_resets_on_successful_prd_capture() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.capture_nudge_count = 2; // as if we had nudged to the cap
+    let reply = "```prd\n# App\nBuild it.\n```";
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert_eq!(p.prd_markdown, "# App\nBuild it.");
+    assert_eq!(p.capture_nudge_count, 0, "a successful capture resets the nudge cap");
 }
 
 // ---------------------------------------------------------------------------
@@ -2004,7 +2171,7 @@ fn audit_done_status_fetches_the_verdict() {
     let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
     p.crd_markdown = "# CRD".into();
     p.audit = Some(auditor_binding(50, 100));
-    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "done".into() }), 2000, 4);
+    let fx = step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "done".into(), error: None }), 2000, 4);
     assert_eq!(fx, vec![Effect::FetchResult { ext_agent_id: 50 }]);
 }
 
@@ -2104,7 +2271,7 @@ fn dead_auditor_degrades_to_done() {
     let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
     p.crd_markdown = "# CRD".into();
     p.audit = Some(auditor_binding(50, 100));
-    step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "killed".into() }), 2000, 4);
+    step(&mut p, Input::Host(HostEvent::AgentsDone { agent_id: 50, status: "killed".into(), error: None }), 2000, 4);
     assert!(matches!(p.phase, ProjectPhase::Done { .. }));
     assert!(p.audit.is_none());
     assert!(p.outbox.iter().any(|n| n.text.contains("audit skipped")));
@@ -2152,4 +2319,134 @@ fn same_inputs_same_effects() {
     let fx2 = step(&mut p2, Input::Host(HostEvent::Tick), 1000, 4);
     assert_eq!(fx1, fx2);
     assert_eq!(p1, p2);
+}
+
+// ---------------------------------------------------------------------------
+// Tracelog (feature: machine diary) + interrupt-from-drafting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trace_ring_caps_at_200_dropping_oldest() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // Each office message emits at least two trace events (the received line + the invoke it
+    // triggers), so 200 messages drives the ring well past its 200-entry cap.
+    for i in 0..200u64 {
+        step(
+            &mut p,
+            Input::Command(Command::OfficeMessage { text: format!("msg {i}") }),
+            1000 + i,
+            4,
+        );
+    }
+    assert_eq!(p.trace.len(), 200, "the ring is capped at 200 entries");
+    assert!(
+        !p.trace.iter().any(|e| e.summary == "message received: msg 0"),
+        "the oldest entries were dropped"
+    );
+    assert!(
+        p.trace.iter().any(|e| e.summary == "message received: msg 199"),
+        "the newest entry is retained (newest-last)"
+    );
+}
+
+#[test]
+fn trace_records_capture_gate_and_research() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // Gate ON (default): a ```prd fence traces the doc capture (byte count, never body) and the
+    // safeguard gate check.
+    let reply = "ok\n```prd\n# App\nBuild it.\n```";
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.to_string())), 1000, 4);
+    assert!(
+        p.trace.iter().any(|e| e.kind == "capture" && e.summary.starts_with("PRD captured")),
+        "PRD capture is traced: {:?}",
+        p.trace
+    );
+    assert!(
+        p.trace.iter().any(|e| e.kind == "gate" && e.summary.contains("checking PRD")),
+        "the gate check is traced"
+    );
+
+    // A clean verdict proceeds to research — both the clean gate and the research spawn are traced.
+    step(
+        &mut p,
+        invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())),
+        1100,
+        4,
+    );
+    assert!(p.trace.iter().any(|e| e.kind == "gate" && e.summary.contains("PRD clean")));
+    assert!(p.trace.iter().any(|e| e.kind == "research" && e.summary.starts_with("spawned")));
+}
+
+#[test]
+fn trace_records_gate_stop_on_assumptions() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // Unification 2026-07-15: the default mode is now "auto" (untagged items auto-resolve, no
+    // stop), so drive "ask" mode to exercise (and trace) the freeze-and-stop path.
+    p.config.assumption_mode = "ask".to_string();
+    p.prd_markdown = "# App".into();
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed Postgres\n- assumed React\n";
+    step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
+    assert!(
+        p.trace
+            .iter()
+            .any(|e| e.kind == "gate" && e.summary.contains("STOPPED") && e.summary.contains("2 assumption")),
+        "the gate stop records the flagged count: {:?}",
+        p.trace
+    );
+}
+
+#[test]
+fn drafting_interrupt_kills_analyst_and_resume_returns_to_drafting() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    // A live research analyst is in flight; interrupting Drafting must cut it off.
+    p.research = Some(researcher_binding(77, 500));
+    let fx = step(&mut p, Input::Command(Command::Interrupt { hard: true }), 1000, 4);
+
+    assert!(matches!(p.phase, ProjectPhase::Interrupted));
+    assert_eq!(
+        p.interrupted_from,
+        Some(ProjectPhase::Drafting),
+        "the pre-interrupt phase is remembered for resume"
+    );
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 77 })),
+        "the research analyst is killed"
+    );
+    assert!(p.research.is_none(), "the research binding is cleared so a late result no-ops");
+    assert!(p
+        .trace
+        .iter()
+        .any(|e| e.kind == "phase" && e.summary.contains("hard interrupt from drafting")));
+
+    // Resume returns to Drafting (not forward to Running) and clears the memo.
+    step(&mut p, Input::Command(Command::Resume), 1100, 4);
+    assert!(matches!(p.phase, ProjectPhase::Drafting), "a drafting-interrupt resumes back to Drafting");
+    assert_eq!(p.interrupted_from, None, "the memo is cleared once resumed");
+    assert!(p
+        .trace
+        .iter()
+        .any(|e| e.kind == "phase" && e.summary.contains("resumed to drafting")));
+}
+
+#[test]
+fn invoke_result_is_ignored_while_interrupted() {
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    p.prd_markdown = String::new();
+    p.interrupted_from = Some(ProjectPhase::Drafting);
+    // A persona reply that WOULD capture a PRD arrives after the interrupt: it must NOT advance
+    // the drafting pipeline (the phase is the guard against stale in-flight invokes).
+    let reply = "ok\n```prd\n# App\nBuild it.\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.to_string())), 1000, 4);
+
+    assert!(p.prd_markdown.is_empty(), "a stale persona result does not capture a PRD while interrupted");
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })),
+        "no pipeline effect from a stale result"
+    );
+    assert!(
+        p.trace
+            .iter()
+            .any(|e| e.kind == "invoke" && e.summary.contains("ignored") && e.summary.contains("interrupted")),
+        "the ignored result is recorded on the diary"
+    );
 }

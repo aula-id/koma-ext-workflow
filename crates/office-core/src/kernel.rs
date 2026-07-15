@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::{
     AgentBinding, AgentKind, ChatAuthor, ChatMsg, Comment, CommentAuthor, CommentId, ParkReason,
-    Project, ProjectPhase, Receipt, Task, TaskEvent, TaskId, TaskState,
+    Project, ProjectPhase, Receipt, Task, TaskEvent, TaskId, TaskState, TraceEvent,
 };
 use crate::graph::{self, ready_set};
 use crate::machine::{step_project, ProjectTransition};
@@ -80,6 +80,23 @@ const PROVISIONAL: u64 = 0;
 /// `session_capacity`; this constant is only the clamp ceiling for the per-project
 /// `max_workers` soft sub-ceiling.
 const MAX_PROJECT_WORKERS: u32 = 4;
+
+/// Max consecutive capture-miss nudges the kernel fires for the PRD before falling back to waiting
+/// on the user (feature: capture nudge). A long Drafting reply with no ```prd fence and no PRD yet
+/// triggers a deterministic re-invoke asking for ONLY the fenced doc; after this many in a row
+/// (reset by any successful capture) the kernel stops nudging and surfaces the reply as today.
+const MAX_CAPTURE_NUDGES: u32 = 2;
+
+/// A Drafting reply must be at least this many bytes to be treated as a forgotten-fence PRD worth
+/// nudging (feature: capture nudge). Short fence-less replies are almost always legitimate
+/// clarifying questions the office is waiting on the user to answer, so nudging them would wrongly
+/// force a premature PRD; only a long prose reply is likely a PRD the office narrated but forgot to
+/// wrap in the ```prd fence (live-test 2026-07-15).
+const PRD_NUDGE_MIN_REPLY_BYTES: usize = 500;
+
+/// The system-appended instruction on a capture-miss nudge re-invoke (feature: capture nudge).
+const PRD_NUDGE_INSTRUCTION: &str = "\nYour previous reply did not include the required ```prd \
+fence. Emit ONLY the complete document in the fence now — no prose.\n";
 
 // ---------------------------------------------------------------------------
 // Public protocol
@@ -150,6 +167,8 @@ pub enum Command {
         /// The safeguard assumption-handling mode: `"auto"` (autonomous) | `"ask"` (freeze-and-ask).
         /// Only those two values are accepted (case-insensitive); any other string is ignored like
         /// an absent field (additive partial update). Autonomous-safeguard pivot 2026-07-15.
+        /// (Unification 2026-07-15: the single knob that supersedes the branch's `assumption_trust`
+        /// bool — `"auto"` = old trust ON, `"ask"` = old trust OFF.)
         assumption_mode: Option<String>,
     },
     /// Explicit human approval of the safeguard's pending assumptions (`workflow_approve`,
@@ -174,8 +193,11 @@ pub enum HostEvent {
         agent_id: u64,
         spawned_at_ms: u64,
     },
-    /// A sub-agent reached a terminal host status (`done`/`error`/`killed`).
-    AgentsDone { agent_id: u64, status: String },
+    /// A sub-agent reached a terminal host status (`done`/`error`/`killed`). `error` is the
+    /// optional additive failure text koma now sends alongside a non-`done` status (feature C);
+    /// `None` when absent (old komas) or on the driver's own `agents.status`-poll path, so the
+    /// event shape stays back-compatible.
+    AgentsDone { agent_id: u64, status: String, error: Option<String> },
     /// The driver fetched a terminal agent's report/review text.
     Result { agent_id: u64, text: String },
     /// A `Spawn` effect failed before producing any report.
@@ -330,13 +352,18 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
             if hard {
                 hard_interrupt(p, now_ms, ctx);
             } else {
-                soft_interrupt(p, ctx);
+                soft_interrupt(p, now_ms, ctx);
             }
         }
         Command::Resume => {
-            if let Ok(ph) = step_project(&p.phase, ProjectTransition::Resume) {
+            // The resume target is remembered on `interrupted_from` (set at interrupt time): a
+            // Drafting-interrupt resumes back to Drafting, everything else to Running. The machine
+            // owns the actual edge; the kernel only supplies the recalled flag.
+            let to_drafting = matches!(p.interrupted_from, Some(ProjectPhase::Drafting));
+            if let Ok(ph) = step_project(&p.phase, ProjectTransition::Resume { to_drafting }) {
+                trace(p, now_ms, "phase", format!("resumed to {}", phase_label(&ph)), ctx);
                 p.phase = ph;
-                ctx.dirty = true;
+                p.interrupted_from = None;
             }
         }
         Command::Unpark { task } => {
@@ -392,8 +419,8 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 ctx.dirty = true;
             }
         }
-        Command::OfficeMessage { text } => office_message(p, text, ctx),
-        Command::RequestBreakdown => request_breakdown(p, ctx),
+        Command::OfficeMessage { text } => office_message(p, text, now_ms, ctx),
+        Command::RequestBreakdown => request_breakdown(p, now_ms, ctx),
         Command::Authorize {
             delivery_path,
             allow_outside_workspace,
@@ -464,10 +491,86 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
 // Front office (6.2 / 6.3) — off-loop invoke choreography
 // ---------------------------------------------------------------------------
 
+/// Deterministic approval-intent phrases (matched case-insensitively, whole-word/phrase). When a
+/// project is stopped on `pending_assumptions` and the user's message carries one of these, the
+/// safeguard gate is closed for the project so the re-emitted doc proceeds instead of re-stopping
+/// (the audit's approval loop). Kept explicit + auditable rather than a fuzzy classifier.
+const APPROVAL_PHRASES: &[&str] = &[
+    "approve", "approved", "you decide", "go ahead", "proceed", "lgtm", "ok go",
+];
+
+/// Negation words that VETO an approval match. A message that pairs an approval word with any of
+/// these is ambiguous ("I don't approve of waiting"), so it is conservatively NOT treated as
+/// approval — the safeguard is a SAFETY gate, so only a CLEAR approval closes it (an owner who
+/// wants blanket autonomy sets `config.assumption_mode = "auto"` instead). Matched whole-word after
+/// folding apostrophes ("don't" -> "dont"), so "another" never reads as "not".
+const APPROVAL_NEGATIONS: &[&str] = &[
+    "not", "dont", "never", "cant", "cannot", "wont", "reject", "disapprove",
+];
+
+/// Normalize `msg` for whole-word/phrase matching: lowercase, drop apostrophes (so "don't"
+/// folds to one token "dont"), replace every other non-alphanumeric run with a single space,
+/// and pad with a leading + trailing space so `" phrase "` substring checks are word-anchored.
+fn normalize_for_match(msg: &str) -> String {
+    let mut s = String::with_capacity(msg.len() + 2);
+    s.push(' ');
+    let mut prev_space = true;
+    for c in msg.chars() {
+        if c == '\'' {
+            continue; // fold "don't" -> "dont", "can't" -> "cant"
+        }
+        let lc = c.to_ascii_lowercase();
+        if lc.is_ascii_alphanumeric() {
+            s.push(lc);
+            prev_space = false;
+        } else if !prev_space {
+            s.push(' ');
+            prev_space = true;
+        }
+    }
+    if !s.ends_with(' ') {
+        s.push(' ');
+    }
+    s
+}
+
+/// Whether `msg` is a deterministic approval of pending safeguard assumptions: it contains at
+/// least one [`APPROVAL_PHRASES`] entry as a whole word/phrase AND no [`APPROVAL_NEGATIONS`]
+/// token anywhere. The negation veto is what rejects the "I don't approve of waiting" false
+/// positive; the whole-word anchoring is what keeps "disapprove" from reading as "approve".
+pub(crate) fn is_approval_intent(msg: &str) -> bool {
+    let h = normalize_for_match(msg);
+    if APPROVAL_NEGATIONS.iter().any(|n| h.contains(&format!(" {n} "))) {
+        return false;
+    }
+    APPROVAL_PHRASES.iter().any(|p| h.contains(&format!(" {p} ")))
+}
+
 /// Append the user turn and issue a persona invoke. If the assembled prompt would cross
 /// the fold threshold, a summarize invoke is issued FIRST (6.2); the persona invoke is
 /// re-issued from `invoke_result` once the fold lands.
-fn office_message(p: &mut Project, text: String, ctx: &mut Ctx) {
+///
+/// Approval short-circuit: when the project is stopped on flagged assumptions and the incoming
+/// message is a deterministic approval, the gate is closed for THIS project first
+/// (`assumptions_approved`), `pending_assumptions` cleared, and a trace notice queued — so the
+/// persona invoke that follows re-emits the doc and `gate_doc` fails open instead of re-stopping.
+fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
+    if !p.pending_assumptions.is_empty() && is_approval_intent(&text) {
+        p.assumptions_approved = true;
+        p.pending_assumptions.clear();
+        // The queued notice is the durable user-facing signal (outbox row + chat.prompt effect);
+        // the trace ring records the same event on the machine diary.
+        trace(p, now_ms, "gate", "approval detected — safeguard gate closed for this project", ctx);
+        queue_notice(
+            p,
+            now_ms,
+            format!("office[{}]: assumptions approved — gate closed for this project.", p.id.0),
+            ctx,
+        );
+    }
+
+    // Trace BEFORE the move: the preview is the first ~80 chars, never the whole message.
+    trace(p, now_ms, "office", format!("message received: {}", trace_preview(&text, 80)), ctx);
     p.office_transcript.push(ChatMsg {
         who: ChatAuthor::User,
         text,
@@ -476,16 +579,19 @@ fn office_message(p: &mut Project, text: String, ctx: &mut Ctx) {
 
     if office::should_fold(p, "") {
         let (system, prompt) = office::build_fold(p);
+        trace(p, now_ms, "invoke", "fold (summarize transcript)", ctx);
         emit_invoke(ctx, InvokePurpose::Fold, &p.config.office_role, system, prompt);
     } else {
         let (system, prompt) = office::build_invoke(p, "");
+        trace(p, now_ms, "invoke", "persona reply", ctx);
         emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
     }
 }
 
 /// Issue the breakdown invoke for the current PRD (6.3.2).
-fn request_breakdown(p: &mut Project, ctx: &mut Ctx) {
+fn request_breakdown(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     let (system, prompt) = office::build_breakdown_prompt(p, None, false);
+    trace(p, now_ms, "breakdown", "requested", ctx);
     emit_invoke(ctx, InvokePurpose::Breakdown, &p.config.office_role, system, prompt);
 }
 
@@ -515,6 +621,7 @@ fn start_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         // binding's PRESENCE, not a persona label, so no per-task persona applies.
         persona: String::new(),
     });
+    trace(p, now_ms, "research", "spawned — analyzing the stack", ctx);
 }
 
 /// The driver recorded the real research agent id onto the provisional binding (6.2b).
@@ -532,13 +639,14 @@ fn on_research_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: 
 fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
     p.research_notes = office::extract_research(&text);
     p.research = None;
+    trace(p, now_ms, "research", format!("done — {} bytes of notes", p.research_notes.len()), ctx);
     queue_notice(
         p,
         now_ms,
         format!("office[{}]: research done — drafting the TRD.", p.id.0),
         ctx,
     );
-    start_trd_invoke(p, ctx);
+    start_trd_invoke(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
@@ -547,6 +655,7 @@ fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx)
 /// Never wedges Drafting.
 fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
     p.research = None;
+    trace(p, now_ms, "research", format!("degraded: {}", trace_preview(&reason, 80)), ctx);
     queue_notice(
         p,
         now_ms,
@@ -556,14 +665,15 @@ fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx)
         ),
         ctx,
     );
-    start_trd_invoke(p, ctx);
+    start_trd_invoke(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
 /// Issue the TRD authoring invoke (6.2b): PRD (+ research notes when present) -> a ```trd
 /// fenced markdown document. Off-loop like every other invoke.
-fn start_trd_invoke(p: &mut Project, ctx: &mut Ctx) {
+fn start_trd_invoke(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     let (system, prompt) = office::build_trd_prompt(p);
+    trace(p, now_ms, "invoke", "TRD authoring", ctx);
     emit_invoke(ctx, InvokePurpose::Trd, &p.config.office_role, system, prompt);
 }
 
@@ -577,6 +687,7 @@ fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
             Some(trd) => {
                 p.trd_markdown = trd;
                 p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
+                trace(p, now_ms, "capture", format!("TRD drafted ({} bytes)", p.trd_markdown.len()), ctx);
                 queue_notice(
                     p,
                     now_ms,
@@ -612,14 +723,15 @@ fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
         ),
     }
     // No TRD captured -> nothing to safeguard-check; proceed straight to the CRD invoke.
-    start_crd_invoke(p, ctx);
+    start_crd_invoke(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
 /// Issue the CRD authoring invoke (6.2c): PRD (+ TRD when present) -> a ```crd fenced Clean-build
 /// Requirement Document. Off-loop, on the office role, like the TRD invoke.
-fn start_crd_invoke(p: &mut Project, ctx: &mut Ctx) {
+fn start_crd_invoke(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     let (system, prompt) = office::build_crd_prompt(p);
+    trace(p, now_ms, "invoke", "CRD authoring", ctx);
     emit_invoke(ctx, InvokePurpose::Crd, &p.config.office_role, system, prompt);
 }
 
@@ -632,6 +744,7 @@ fn handle_crd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
             Some(crd) => {
                 p.crd_markdown = crd;
                 p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
+                trace(p, now_ms, "capture", format!("CRD drafted ({} bytes)", p.crd_markdown.len()), ctx);
                 queue_notice(
                     p,
                     now_ms,
@@ -667,7 +780,7 @@ fn handle_crd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
         ),
     }
     // No CRD captured -> nothing to safeguard-check and no audit later; break down anyway.
-    request_breakdown(p, ctx);
+    request_breakdown(p, now_ms, ctx);
     ctx.dirty = true;
 }
 
@@ -691,16 +804,18 @@ enum Deferred {
 fn run_deferred(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
     match deferred {
         Deferred::Research => start_research(p, now_ms, ctx),
-        Deferred::Crd => start_crd_invoke(p, ctx),
-        Deferred::Breakdown => request_breakdown(p, ctx),
+        Deferred::Crd => start_crd_invoke(p, now_ms, ctx),
+        Deferred::Breakdown => request_breakdown(p, now_ms, ctx),
     }
 }
 
-/// Gate a freshly-captured drafting doc through the safeguard no-assume check (6.2c). When the
-/// gate is disabled (`config.assumption_check == false`) it is a straight pass-through to the
-/// deferred stage. Otherwise it emits an `AssumeCheck*` invoke on the `safeguard_role`; the
-/// result (in [`handle_assume_check_result`]) either proceeds to `deferred` (clean / fail-open)
-/// or stops the pipeline with `pending_assumptions`.
+/// Gate a freshly-captured drafting doc through the safeguard no-assume check (6.2c). The gate is a
+/// straight pass-through to the deferred stage when it is disabled (`config.assumption_check ==
+/// false`) OR already approved for this project (`assumptions_approved`, set by a deterministic
+/// approval in `office_message`) — both are the same fail-open shape, and the approval one is what
+/// breaks the audit's re-emit -> re-gate -> stop loop. Otherwise it emits an `AssumeCheck*` invoke
+/// on the `safeguard_role`; the result (in [`handle_assume_check_result`]) either proceeds to
+/// `deferred` (clean / fail-open) or stops the pipeline with `pending_assumptions`.
 fn gate_doc(
     p: &mut Project,
     purpose: InvokePurpose,
@@ -710,14 +825,18 @@ fn gate_doc(
     now_ms: u64,
     ctx: &mut Ctx,
 ) {
-    if !p.config.assumption_check {
-        // Gate disabled -> no pending assumptions can be outstanding; clear any (a re-check that
-        // reaches a now-disabled gate) and pass straight through to the deferred stage.
+    if p.assumptions_approved || !p.config.assumption_check {
+        // Gate skipped: either approved for this project (sticky, set by a chat approval intent or
+        // workflow_approve) or disabled outright. Clear any stale pending (a re-check that reaches a
+        // now-skipped gate) and pass straight through to the deferred stage.
+        let why = if p.assumptions_approved { "already approved" } else { "gate off" };
         p.pending_assumptions.clear();
+        trace(p, now_ms, "gate", format!("{label} gate skipped ({why})"), ctx);
         run_deferred(p, deferred, now_ms, ctx);
         return;
     }
     let (system, prompt) = office::build_assume_check_prompt(p, label, body);
+    trace(p, now_ms, "gate", format!("checking {label} for assumptions"), ctx);
     emit_invoke(ctx, purpose, &p.config.safeguard_role, system, prompt);
 }
 
@@ -756,6 +875,10 @@ fn recheck_pending_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 /// the delegation in the transcript), then clear `pending_assumptions` DIRECTLY and resume the
 /// deferred stage for the newest gated doc — no re-invoke, no waiting on the model. With nothing
 /// pending it is a no-op beyond a notice.
+///
+/// Unification 2026-07-15: like a chat approval intent (`office_message`), the explicit tool ALSO
+/// sets the sticky `assumptions_approved` flag, so the safeguard gate is closed for THIS project and
+/// later docs proceed without re-stopping — ONE coherent approval model across both entry points.
 fn approve_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     p.office_transcript.push(ChatMsg {
         who: ChatAuthor::User,
@@ -766,7 +889,9 @@ fn approve_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         queue_notice(p, now_ms, format!("office[{}]: nothing awaiting approval.", p.id.0), ctx);
         return;
     }
+    p.assumptions_approved = true;
     p.pending_assumptions.clear();
+    trace(p, now_ms, "gate", "workflow_approve — safeguard gate closed for this project", ctx);
     queue_notice(
         p,
         now_ms,
@@ -779,10 +904,13 @@ fn approve_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 }
 
 /// A safeguard assumption-check returned (6.2c). `clean` (or an unparseable block) clears
-/// `pending_assumptions` and proceeds to the deferred stage; `assumptions` STOPS the pipeline,
-/// storing the flagged items and noticing the user (the doc is stored/visible either way, and a
-/// subsequent chat + fresh fence re-runs this gate). `Err` FAILS OPEN: proceed with a notice —
-/// a flaky safeguard must never wedge Drafting.
+/// `pending_assumptions` and proceeds to the deferred stage. An `assumptions` verdict is routed by
+/// `handle_assumptions` per `config.assumption_mode` ('ask' freezes on every material item; 'auto'
+/// freezes only on `[critical]` items and auto-resolves the rest) — UNLESS an active approval
+/// (`assumptions_approved`) is set, in which case the flagged items are recorded onto
+/// `self_resolved_assumptions` and the pipeline proceeds instead (the belt for a check that was in
+/// flight when the user approved). `Err` FAILS OPEN: proceed with a notice — a flaky safeguard must
+/// never wedge Drafting.
 fn handle_assume_check_result(
     p: &mut Project,
     deferred: Deferred,
@@ -793,6 +921,7 @@ fn handle_assume_check_result(
 ) {
     match outcome {
         Err(e) => {
+            trace(p, now_ms, "gate", format!("{doc_label} check errored — failing open"), ctx);
             queue_notice(
                 p,
                 now_ms,
@@ -806,15 +935,39 @@ fn handle_assume_check_result(
             Some(check)
                 if check.verdict == report::AssumeVerdict::Assumptions && !check.items.is_empty() =>
             {
-                // Mode-aware handling (autonomous-safeguard pivot): 'ask' freezes on every material
-                // item; 'auto' freezes only on [critical] items and auto-resolves the rest.
-                handle_assumptions(p, deferred, doc_label, check.items, now_ms, ctx);
+                let n = check.items.len();
+                if p.assumptions_approved {
+                    // An approval landed while this check was still in flight (the race belt): the
+                    // gate is closed for THIS project, so do NOT stop. Record the flagged items on
+                    // the audit trail (capped) and take the SAME proceed path as a clean verdict.
+                    record_self_resolved(p, &check.items);
+                    trace(p, now_ms, "gate", format!("{doc_label} self-resolved {n} assumption(s) (approved)"), ctx);
+                    queue_notice(
+                        p,
+                        now_ms,
+                        format!(
+                            "office[{}]: no-assume (approved): self-resolved {} assumption{}, proceeding.",
+                            p.id.0,
+                            n,
+                            if n == 1 { "" } else { "s" }
+                        ),
+                        ctx,
+                    );
+                    p.pending_assumptions.clear();
+                    run_deferred(p, deferred, now_ms, ctx);
+                } else {
+                    // Mode-aware handling (autonomous-safeguard pivot): 'ask' freezes on every
+                    // material item; 'auto' freezes only on [critical] items and auto-resolves the
+                    // rest. Trace lives inside handle_assumptions per the branch it takes.
+                    handle_assumptions(p, deferred, doc_label, check.items, now_ms, ctx);
+                }
             }
             _ => {
                 // Clean, or an unparseable/inconclusive block -> fail open and proceed. When this
                 // CLEARS a stopped gate (pending was non-empty), tell the user the pipeline is
                 // resuming — both the re-check-on-reply path (recheck_pending_assumptions) and a
                 // re-emitted fence land here.
+                trace(p, now_ms, "gate", format!("{doc_label} clean — proceeding"), ctx);
                 if !p.pending_assumptions.is_empty() {
                     queue_notice(
                         p,
@@ -829,6 +982,18 @@ fn handle_assume_check_result(
         },
     }
     ctx.dirty = true;
+}
+
+/// Append safeguard-flagged assumptions that an active approval (`assumptions_approved`)
+/// auto-resolved to the project's audit trail, capped to the most recent [`SELF_RESOLVED_CAP`]
+/// entries so a long drafting session can never balloon the state file.
+fn record_self_resolved(p: &mut Project, items: &[String]) {
+    const SELF_RESOLVED_CAP: usize = 100;
+    p.self_resolved_assumptions.extend(items.iter().cloned());
+    let len = p.self_resolved_assumptions.len();
+    if len > SELF_RESOLVED_CAP {
+        p.self_resolved_assumptions.drain(0..len - SELF_RESOLVED_CAP);
+    }
 }
 
 /// Autonomous auto-resolution round cap (autonomous-safeguard pivot). After this many auto-
@@ -908,6 +1073,13 @@ fn handle_assumptions(
     p.assumption_rounds += 1;
     p.pending_assumptions.clear();
     let n = auto.len();
+    trace(
+        p,
+        now_ms,
+        "gate",
+        format!("{doc_label} resolving {n} auto assumption(s) (round {}/{})", p.assumption_rounds, AUTO_ROUND_CAP),
+        ctx,
+    );
     queue_notice(
         p,
         now_ms,
@@ -947,6 +1119,7 @@ fn freeze_pending(p: &mut Project, doc_label: &str, items: Vec<String>, now_ms: 
         ctx,
     );
     p.pending_assumptions = items;
+    trace(p, now_ms, "gate", format!("{doc_label} STOPPED (ask) — {n} assumption(s) flagged"), ctx);
     // STOP: the doc is stored/visible; the user must act before the pipeline proceeds.
 }
 
@@ -969,12 +1142,14 @@ fn freeze_critical(p: &mut Project, doc_label: &str, critical: Vec<String>, now_
         ctx,
     );
     p.pending_assumptions = critical;
+    trace(p, now_ms, "gate", format!("{doc_label} STOPPED (critical) — {n} assumption(s) flagged"), ctx);
 }
 
 /// The round cap was hit: proceed with the deferred stage anyway, disclosing that N assumptions were
 /// left undecided (they remain documented in the doc). Ultra-automatic mode never stalls on paperwork.
 fn proceed_with_undecided(p: &mut Project, deferred: Deferred, n: usize, now_ms: u64, ctx: &mut Ctx) {
     p.pending_assumptions.clear();
+    trace(p, now_ms, "gate", format!("round cap hit — proceeding with {n} undecided assumption(s)"), ctx);
     queue_notice(
         p,
         now_ms,
@@ -1011,6 +1186,7 @@ fn handle_assume_resolve_result(p: &mut Project, outcome: Result<String, String>
             match office::extract_fenced(&text, &tag) {
                 Some(revised) => {
                     set_doc_body(p, label, revised.clone());
+                    trace(p, now_ms, "capture", format!("{label} revised by auto-resolve ({} bytes)", revised.len()), ctx);
                     // Re-run the SAME gate on the revised doc (re-partition + re-check). Does NOT
                     // reset assumption_rounds — this is a resolution capture, not a fresh doc.
                     gate_doc(p, purpose, label, &revised, deferred, now_ms, ctx);
@@ -1033,6 +1209,7 @@ fn handle_assume_resolve_result(p: &mut Project, outcome: Result<String, String>
 /// and proceed with the deferred stage. Never wedges.
 fn proceed_after_failed_resolve(p: &mut Project, deferred: Deferred, reason: &str, now_ms: u64, ctx: &mut Ctx) {
     p.pending_assumptions.clear();
+    trace(p, now_ms, "gate", format!("auto-resolve failed: {}", trace_preview(reason, 60)), ctx);
     queue_notice(
         p,
         now_ms,
@@ -1089,8 +1266,12 @@ fn clip_assumptions(items: &[String]) -> String {
 /// path; `delivery_valid` is its verdict, and `office::authorize` re-checks the shape
 /// before transitioning `Ready -> Running`.
 fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_ms: u64, ctx: &mut Ctx) {
+    let path_str = delivery_path.display().to_string();
     match office::authorize(p, delivery_path, allow_outside) {
-        Ok(()) => ctx.dirty = true,
+        Ok(()) => {
+            trace(p, now_ms, "authorize", format!("granted — {}", trace_preview(&path_str, 80)), ctx);
+            ctx.dirty = true;
+        }
         Err(e) => {
             // Report the ACTUAL phase — the old text hardcoded "stays in Ready"
             // even while Drafting, which sent the main agent chasing a phase that
@@ -1109,6 +1290,7 @@ fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_m
                 ""
             };
             let notice = format!("authorization refused: {:?}; project is in {}{}", e, phase, hint);
+            trace(p, now_ms, "authorize", format!("refused ({e:?}) — project in {phase}"), ctx);
             queue_notice(p, now_ms, notice, ctx);
             ctx.dirty = true;
         }
@@ -1118,6 +1300,15 @@ fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_m
 /// Apply an off-loop invoke result (5.1). Purpose-tagged so no persistent per-request
 /// bookkeeping is needed — the kernel reacts to the result as an ordinary command.
 fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    // Interrupt-from-drafting (feature): a persona/fold/breakdown/TRD/CRD/assume-check result that
+    // was already in flight when the user interrupted must NOT advance the pipeline. The phase is
+    // the guard — a stale result simply no-ops against Interrupted rather than needing a per-invoke
+    // epoch. (In-flight WORKER results arrive as `HostEvent::Result`, not here, so a soft drain
+    // still completes its running agents.)
+    if matches!(p.phase, ProjectPhase::Interrupted) {
+        trace(p, now_ms, "invoke", format!("ignored {:?} result — project interrupted", purpose), ctx);
+        return;
+    }
     match purpose {
         InvokePurpose::Persona => {
             let reply = match outcome {
@@ -1145,7 +1336,9 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             if matches!(p.phase, ProjectPhase::Drafting) {
                 if let Some(prd) = office::extract_prd(&reply) {
                     p.prd_markdown = prd;
+                    p.capture_nudge_count = 0; // a successful capture resets the nudge cap
                     p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
+                    trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
                     queue_notice(
                         p,
                         now_ms,
@@ -1163,6 +1356,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 if let Some(trd) = office::extract_fenced(&reply, "trd") {
                     p.trd_markdown = trd;
                     p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
+                    trace(p, now_ms, "capture", format!("TRD captured via chat ({} bytes)", p.trd_markdown.len()), ctx);
                     queue_notice(p, now_ms, format!("office[{}]: TRD updated (panel).", p.id.0), ctx);
                     let body = p.trd_markdown.clone();
                     gate_doc(p, InvokePurpose::AssumeCheckTrd, "TRD", &body, Deferred::Crd, now_ms, ctx);
@@ -1172,6 +1366,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 if let Some(crd) = office::extract_fenced(&reply, "crd") {
                     p.crd_markdown = crd;
                     p.assumption_rounds = 0; // fresh capture -> new auto-resolution round budget
+                    trace(p, now_ms, "capture", format!("CRD captured via chat ({} bytes)", p.crd_markdown.len()), ctx);
                     queue_notice(p, now_ms, format!("office[{}]: CRD updated (panel).", p.id.0), ctx);
                     let body = p.crd_markdown.clone();
                     gate_doc(p, InvokePurpose::AssumeCheckCrd, "CRD", &body, Deferred::Breakdown, now_ms, ctx);
@@ -1199,6 +1394,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             if matches!(p.phase, ProjectPhase::Ready) {
                 if let Some(trd) = office::extract_fenced(&reply, "trd") {
                     p.trd_markdown = trd;
+                    trace(p, now_ms, "capture", format!("TRD updated in Ready ({} bytes)", p.trd_markdown.len()), ctx);
                     queue_notice(
                         p,
                         now_ms,
@@ -1211,6 +1407,27 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                     ctx.dirty = true;
                     return;
                 }
+            }
+
+            // Capture miss (feature: capture nudge): in Drafting, a long reply that landed no
+            // ```prd fence while the PRD slot is still empty is almost always a PRD the office
+            // narrated but forgot to fence (live-test 2026-07-15). Fire ONE deterministic re-invoke
+            // asking for ONLY the fenced doc, capped at MAX_CAPTURE_NUDGES in a row so a model that
+            // never emits the fence falls back to today's wait-for-user behavior instead of looping.
+            // TRD/CRD are authored through their own dedicated invokes, never this Persona channel,
+            // so the PRD is the only doc this nudge targets.
+            if matches!(p.phase, ProjectPhase::Drafting)
+                && p.prd_markdown.trim().is_empty()
+                && reply.len() > PRD_NUDGE_MIN_REPLY_BYTES
+                && p.capture_nudge_count < MAX_CAPTURE_NUDGES
+            {
+                p.capture_nudge_count += 1;
+                trace(p, now_ms, "nudge", format!("PRD capture-miss nudge #{}", p.capture_nudge_count), ctx);
+                let (mut system, prompt) = office::build_invoke(p, "");
+                system.push_str(PRD_NUDGE_INSTRUCTION);
+                emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
+                ctx.dirty = true;
+                return;
             }
 
             let clipped = clip_notice(&reply);
@@ -1338,6 +1555,7 @@ fn land_breakdown(p: &mut Project, breakdown: office::Breakdown, now_ms: u64, ct
     office::apply_breakdown(p, breakdown);
     let epics = p.epics.len();
     let tasks = p.tasks.len();
+    trace(p, now_ms, "breakdown", format!("accepted — {tasks} task(s), {epics} epic(s)"), ctx);
     queue_notice(
         p,
         now_ms,
@@ -1422,9 +1640,19 @@ fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
 /// in-flight tasks. Workers -> Todo (attempt preserved, not a bounce); reviewers ->
 /// Review{None} (reviewer respawns on resume). Desks are retained (5.5).
 fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let from = p.phase.clone();
     if let Ok(ph) = step_project(&p.phase, ProjectTransition::Interrupt) {
+        // Remember where we came from so resume returns to the right phase (a Drafting-interrupt
+        // resumes back to Drafting, not forward to Running).
+        p.interrupted_from = Some(from.clone());
         p.phase = ph;
+        trace(p, now_ms, "phase", format!("hard interrupt from {}", phase_label(&from)), ctx);
     }
+    // Cut off the project-level drafting/completion analysts (research 6.2b, audit 6.2c). They
+    // are NOT task bindings, so the normalization loop below never touches them; a dangling
+    // researcher/auditor would keep burning tokens against an interrupted project (feature:
+    // interrupt-from-drafting).
+    kill_project_bindings(p, now_ms, ctx);
     for t in p.tasks.iter_mut() {
         match &t.state {
             TaskState::OnProgress { binding, attempt } => {
@@ -1462,11 +1690,35 @@ fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 
 /// Soft drain: stop dispatching new work; leave in-flight agents alone. Phase moves
 /// to Interrupted immediately, which halts the dispatch scan, but completion events
-/// keep flowing so running agents finish and their results are processed (5.5).
-fn soft_interrupt(p: &mut Project, ctx: &mut Ctx) {
+/// keep flowing so running agents finish and their results are processed (5.5). Unlike
+/// [`hard_interrupt`] it does NOT kill the analyst bindings — a drain lets in-flight work
+/// finish — but it still records `interrupted_from` so resume returns to the right phase.
+fn soft_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let from = p.phase.clone();
     if let Ok(ph) = step_project(&p.phase, ProjectTransition::Interrupt) {
+        p.interrupted_from = Some(from.clone());
         p.phase = ph;
-        ctx.dirty = true;
+        trace(p, now_ms, "phase", format!("soft drain from {}", phase_label(&from)), ctx);
+    }
+}
+
+/// Kill the project-level analyst bindings (research 6.2b / audit 6.2c) on a hard interrupt
+/// (feature: interrupt-from-drafting). Project-level, not task bindings, so the task-normalization
+/// loop never touches them. A real (non-provisional) id gets a `Kill` effect; the binding is
+/// cleared either way so a late `agents.done`/result no-ops (`research_bound_to`/`audit_bound_to`
+/// stop matching once the binding is gone).
+fn kill_project_bindings(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if let Some(b) = p.research.take() {
+        if b.ext_agent_id != PROVISIONAL {
+            ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
+        }
+        trace(p, now_ms, "research", "killed on interrupt", ctx);
+    }
+    if let Some(b) = p.audit.take() {
+        if b.ext_agent_id != PROVISIONAL {
+            ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
+        }
+        trace(p, now_ms, "audit", "killed on interrupt", ctx);
     }
 }
 
@@ -1483,7 +1735,9 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
             agent_id,
             spawned_at_ms,
         } => on_spawned(p, &task, agent_id, spawned_at_ms, now_ms, ctx),
-        HostEvent::AgentsDone { agent_id, status } => on_agents_done(p, agent_id, &status, now_ms, ctx),
+        HostEvent::AgentsDone { agent_id, status, error } => {
+            on_agents_done(p, agent_id, &status, error.as_deref(), now_ms, ctx)
+        }
         HostEvent::Result { agent_id, text } => on_result(p, agent_id, text, now_ms, ctx),
         HostEvent::SpawnFailed { task, reason } => on_spawn_failed(p, &task, reason, now_ms, ctx),
         HostEvent::ResearchSpawned { agent_id, spawned_at_ms } => {
@@ -1519,10 +1773,21 @@ fn on_spawned(p: &mut Project, task: &TaskId, agent_id: u64, spawned_at_ms: u64,
     }
 }
 
+/// Build a binding-failure reason from a terminal `status` plus koma's optional additive
+/// `error` text (feature C): `"<who> <status>: <error>"` when error text is present, else
+/// `"<who> <status>"` (old komas, and the driver's own `agents.status`-poll path, send none).
+fn degrade_reason(who: &str, status: &str, error: Option<&str>) -> String {
+    match error {
+        Some(e) if !e.is_empty() => format!("{who} {status}: {e}"),
+        _ => format!("{who} {status}"),
+    }
+}
+
 /// Terminal host status. `done` -> fetch the report (no state change yet);
 /// `error`/`killed`/anything else -> re-queue the task (worker -> Todo attempt++,
-/// reviewer -> Review{None}).
-fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx: &mut Ctx) {
+/// reviewer -> Review{None}). `error` is koma's optional failure text, folded into the
+/// project-level research/audit degrade reason when present.
+fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, error: Option<&str>, now_ms: u64, ctx: &mut Ctx) {
     // Research binding (6.2b) is project-level, checked before the task bindings. `done` ->
     // fetch the findings (existing FetchResult path); anything else is a dead researcher and
     // degrades exactly like a spawn failure (never wedges Drafting).
@@ -1530,7 +1795,7 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx
         if status.eq_ignore_ascii_case("done") {
             ctx.fx.push(Effect::FetchResult { ext_agent_id: agent_id });
         } else {
-            research_degrade(p, format!("researcher {status}"), now_ms, ctx);
+            research_degrade(p, degrade_reason("researcher", status, error), now_ms, ctx);
         }
         return;
     }
@@ -1540,7 +1805,7 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx
         if status.eq_ignore_ascii_case("done") {
             ctx.fx.push(Effect::FetchResult { ext_agent_id: agent_id });
         } else {
-            audit_degrade(p, format!("auditor {status}"), now_ms, ctx);
+            audit_degrade(p, degrade_reason("auditor", status, error), now_ms, ctx);
         }
         return;
     }
@@ -1606,6 +1871,9 @@ fn on_worker_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ctx:
                 binding: None,
                 attempt,
             };
+            let word = if rep.status == ReportStatus::Complete { "complete" } else { "unparseable" };
+            let label = format!("{} → review ({word})", short_task(&p.tasks[idx].id));
+            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
         }
         ReportStatus::Blocked => {
@@ -1615,6 +1883,8 @@ fn on_worker_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ctx:
                 reason: ParkReason::WorkerBlocked(reason),
                 attempt,
             };
+            let label = format!("{} → parked (worker blocked)", short_task(&p.tasks[idx].id));
+            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
             check_halt(p, now_ms, ctx);
         }
@@ -1636,6 +1906,8 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
             p.tasks[idx].last_review = rev.reasons.or(Some(text));
             record(&mut p.tasks[idx], now_ms, "review:pass");
             p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
+            let label = format!("{} → done (review pass)", short_task(&p.tasks[idx].id));
+            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
             maybe_complete_project(p, now_ms, ctx);
             check_halt(p, now_ms, ctx);
@@ -1656,10 +1928,14 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
                     reason: ParkReason::ReviewBounceBudget,
                     attempt,
                 };
+                let label = format!("{} → parked (bounce budget)", short_task(&p.tasks[idx].id));
+                trace(p, now_ms, "task", label, ctx);
                 check_halt(p, now_ms, ctx);
             } else {
                 set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
                 p.tasks[idx].state = TaskState::Todo;
+                let label = format!("{} → todo (review bounce {})", short_task(&p.tasks[idx].id), p.tasks[idx].bounces);
+                trace(p, now_ms, "task", label, ctx);
             }
         }
     }
@@ -1880,6 +2156,8 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
         now_ms,
         format!("dispatch worker attempt {}", attempt),
     );
+    let label = format!("{} → worker dispatched (attempt {attempt})", short_task(tid));
+    trace(p, now_ms, "task", label, ctx);
     ctx.dirty = true;
 }
 
@@ -1914,6 +2192,8 @@ fn spawn_reviewer(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, n
         attempt,
     };
     record(&mut p.tasks[idx], now_ms, "dispatch reviewer");
+    let label = format!("{} → reviewer dispatched", short_task(tid));
+    trace(p, now_ms, "task", label, ctx);
     ctx.dirty = true;
 }
 
@@ -1959,6 +2239,7 @@ fn check_halt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         );
         if let Ok(ph) = step_project(&p.phase, ProjectTransition::Halt { reason: msg.clone() }) {
             p.phase = ph;
+            trace(p, now_ms, "phase", format!("halted — {}", trace_preview(&msg, 80)), ctx);
         }
         queue_notice(p, now_ms, msg, ctx);
         ctx.dirty = true;
@@ -1984,6 +2265,7 @@ fn maybe_complete_project(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         return;
     }
     complete_project(p, now_ms);
+    trace(p, now_ms, "phase", "project complete — all tasks done", ctx);
 }
 
 /// Transition Running -> Done (the terminal completion). Pure phase step; the caller owns the
@@ -2029,6 +2311,7 @@ fn start_audit(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         // binding's PRESENCE, not a persona label.
         persona: String::new(),
     });
+    trace(p, now_ms, "audit", "spawned — clean-build audit", ctx);
     queue_notice(
         p,
         now_ms,
@@ -2056,6 +2339,7 @@ fn on_audit_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: &mu
 fn audit_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
     p.audit = None;
     complete_project(p, now_ms);
+    trace(p, now_ms, "audit", format!("degraded: {}", trace_preview(&reason, 80)), ctx);
     queue_notice(
         p,
         now_ms,
@@ -2078,6 +2362,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
         Some(g) => g,
         None => {
             complete_project(p, now_ms);
+            trace(p, now_ms, "audit", "inconclusive (no grade) — completing", ctx);
             queue_notice(
                 p,
                 now_ms,
@@ -2095,6 +2380,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
 
     if grade >= p.config.crd_pass_grade {
         complete_project(p, now_ms);
+        trace(p, now_ms, "audit", format!("passed — grade {grade}"), ctx);
         queue_notice(
             p,
             now_ms,
@@ -2113,6 +2399,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
         p.audit_rounds += 1;
         let round = p.audit_rounds;
         add_remediation_task(p, round, &report.failures, false, now_ms);
+        trace(p, now_ms, "audit", format!("grade {} < {} — remediation round {}", grade, p.config.crd_pass_grade, round), ctx);
         queue_notice(
             p,
             now_ms,
@@ -2124,6 +2411,7 @@ fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
         );
     } else {
         add_remediation_task(p, p.audit_rounds + 1, &report.failures, true, now_ms);
+        trace(p, now_ms, "audit", format!("still failing (grade {grade}) — parked remediation"), ctx);
         queue_notice(
             p,
             now_ms,
@@ -2233,6 +2521,58 @@ fn queue_notice(p: &mut Project, _now_ms: u64, text: String, ctx: &mut Ctx) {
         notice_id: id,
         text,
     });
+}
+
+/// The machine-diary ring cap (feature: tracelog). Newest-last; the oldest entries drop once the
+/// ring exceeds this, so a long-running project can never balloon `state.json`.
+const TRACE_CAP: usize = 200;
+
+/// Append a machine-diary trace event (feature: tracelog) — what the office machine just DID, one
+/// line, never document content. Every trace is a persisted state change, so it marks the tick
+/// dirty (flushing the trailing `Persist` + `PanelPush` that carries the ring to the panel). The
+/// ring is capped at [`TRACE_CAP`] with the oldest entries dropped.
+fn trace(p: &mut Project, now_ms: u64, kind: &str, summary: impl Into<String>, ctx: &mut Ctx) {
+    p.trace.push(TraceEvent {
+        ts: now_ms as i64,
+        kind: kind.to_string(),
+        summary: summary.into(),
+    });
+    let len = p.trace.len();
+    if len > TRACE_CAP {
+        p.trace.drain(0..len - TRACE_CAP);
+    }
+    ctx.dirty = true;
+}
+
+/// Clip free text to a short, single-line trace preview (feature: tracelog): collapse whitespace
+/// runs to single spaces, then truncate to `max` characters with an ellipsis. Char-count based,
+/// so it never splits a UTF-8 boundary and never leaks a multi-line document body into a summary.
+fn trace_preview(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let clipped: String = flat.chars().take(max).collect();
+    format!("{clipped}…")
+}
+
+/// Lowercase phase label for trace summaries (feature: tracelog).
+fn phase_label(phase: &ProjectPhase) -> &'static str {
+    match phase {
+        ProjectPhase::Drafting => "drafting",
+        ProjectPhase::Ready => "ready",
+        ProjectPhase::Running => "running",
+        ProjectPhase::Interrupted => "interrupted",
+        ProjectPhase::Halted { .. } => "halted",
+        ProjectPhase::Done { .. } => "done",
+    }
+}
+
+/// The short (last-segment) task slug for a trace summary (feature: tracelog): a `TaskId` is the
+/// full hierarchical `<project>/<epic>/<story>/<task>`, so the final segment reads cleanly in a
+/// one-line diary entry without the nested path noise.
+fn short_task(tid: &TaskId) -> &str {
+    tid.0.rsplit('/').next().unwrap_or(&tid.0)
 }
 
 /// Flip acked comments Delivered -> Read. A comment still Pending (never delivered)
