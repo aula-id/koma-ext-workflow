@@ -1,5 +1,17 @@
 import React, { useMemo } from 'react';
-import { TaskStateKey } from './Card';
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  BackgroundVariant,
+  Handle,
+  Position,
+  type Node,
+  type Edge,
+  type NodeProps,
+} from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+import { taskSlug, TaskStateKey } from './Card';
 
 export interface DepTask {
   id: string;
@@ -154,7 +166,7 @@ export function computeHaltCulprits(tasks: DepTask[]): HaltCulprits {
   return { poisoned: poisonedSet, parkedRoots };
 }
 
-function nodeFill(state: TaskStateKey): string {
+function stateColor(state: TaskStateKey): string {
   switch (state) {
     case 'parked':
       return 'var(--wf-status-parked)';
@@ -165,90 +177,154 @@ function nodeFill(state: TaskStateKey): string {
     case 'done':
       return 'var(--wf-status-done)';
     default:
-      return 'var(--wf-bg-secondary)';
+      return 'var(--wf-dim)';
   }
 }
+
+interface WfNodeData extends Record<string, unknown> {
+  title: string;
+  slug: string;
+  state: TaskStateKey;
+  culprit: boolean;
+  running: boolean;
+}
+
+/** Flat koma chip node: truncating HTML (never SVG text soup), status dot + word,
+ * slug line with the full id in the tooltip. Click bubbles via onNodeClick. */
+const WfTaskNode: React.FC<NodeProps> = ({ data }) => {
+  const d = data as WfNodeData;
+  const color = stateColor(d.state);
+  return (
+    <div
+      style={{
+        width: 190,
+        background: 'var(--wf-panel)',
+        border: '1px solid var(--wf-border)',
+        borderLeft: d.culprit ? '3px solid var(--wf-error)' : `3px solid ${color}`,
+        borderRadius: 'var(--wf-radius)',
+        padding: '0.45rem 0.6rem',
+        cursor: 'pointer',
+        fontFamily: 'inherit',
+      }}
+    >
+      {/* invisible anchors — without Handles, React Flow renders no edges at all */}
+      <Handle type="target" position={Position.Left} style={{ opacity: 0, width: 1, height: 1, border: 'none', minWidth: 0, minHeight: 0 }} />
+      <Handle type="source" position={Position.Right} style={{ opacity: 0, width: 1, height: 1, border: 'none', minWidth: 0, minHeight: 0 }} />
+      <div
+        style={{
+          fontSize: '0.75rem',
+          color: 'var(--wf-fg)',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+        title={d.title}
+      >
+        {d.title}
+      </div>
+      <div
+        style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', marginTop: 3, fontSize: '0.62rem', minWidth: 0 }}
+      >
+        <span className="wf-status-dot" style={{ background: color, width: 5, height: 5, flex: 'none' }} />
+        <span style={{ color, flex: 'none' }}>{d.state === 'onprogress' ? 'running' : d.state}</span>
+        <span
+          style={{ color: 'var(--wf-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+        >
+          {d.slug}
+        </span>
+      </div>
+    </div>
+  );
+};
+
+const NODE_TYPES = { wfTask: WfTaskNode };
 
 export interface DepMapProps {
   tasks: DepTask[];
   halted?: boolean;
+  /** Click a node to open its task detail (wired by Board to the drawer). */
+  onTaskClick?: (taskId: string) => void;
 }
 
-export const DepMap: React.FC<DepMapProps> = ({ tasks, halted = false }) => {
+export const DepMap: React.FC<DepMapProps> = ({ tasks, halted = false, onTaskClick }) => {
   const layout = useMemo(() => layoutDag(tasks), [tasks]);
   const culprits = useMemo(() => computeHaltCulprits(tasks), [tasks]);
+  const taskById = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
 
-  const width = MARGIN_X * 2 + layout.laneCount * LANE_WIDTH;
-  const height = MARGIN_Y * 2 + (layout.maxSlot + 1) * ROW_HEIGHT;
+  const nodes: Node[] = useMemo(
+    () =>
+      layout.nodes.map((n) => {
+        const culprit = halted && culprits.poisoned.has(n.id);
+        return {
+          id: n.id,
+          type: 'wfTask',
+          position: { x: n.lane * (LANE_WIDTH + 60), y: n.slot * ROW_HEIGHT },
+          data: {
+            title: n.title,
+            slug: taskSlug(n.id),
+            state: n.state,
+            culprit,
+            running: n.state === 'onprogress',
+          } satisfies WfNodeData,
+          // full id available on hover via the browser-native tooltip route too
+          selectable: true,
+          draggable: false,
+        };
+      }),
+    [layout, halted, culprits],
+  );
 
-  const nodeById = new Map(layout.nodes.map((n) => [n.id, n]));
+  const edges: Edge[] = useMemo(
+    () =>
+      layout.edges.map((e) => {
+        const red =
+          halted && culprits.poisoned.has(e.from) && culprits.poisoned.has(e.to);
+        const active = taskById.get(e.to)?.state === 'onprogress';
+        return {
+          id: `${e.from}->${e.to}`,
+          source: e.from,
+          target: e.to,
+          animated: active,
+          style: {
+            stroke: red ? 'var(--wf-error)' : 'var(--wf-grip)',
+            strokeWidth: red ? 2 : 1,
+          },
+        };
+      }),
+    [layout, halted, culprits, taskById],
+  );
 
   if (tasks.length === 0) {
     return (
-      <div style={{ padding: '1.5rem', color: 'var(--wf-fg-secondary)', fontSize: '0.85rem' }}>
+      <div style={{ padding: '1.5rem', color: 'var(--wf-dim)', fontSize: '0.85rem' }}>
         No tasks yet — the dependency map fills in once the office breaks down the PRD.
       </div>
     );
   }
 
   return (
-    <div style={{ overflow: 'auto', background: 'var(--wf-bg)', borderRadius: 'var(--wf-radius)' }}>
-      <svg width={Math.max(width, 320)} height={Math.max(height, 160)} role="img" aria-label="dependency map">
-        <defs>
-          <marker id="wf-dep-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-            <path d="M0,0 L8,4 L0,8 z" fill="var(--wf-fg-secondary)" />
-          </marker>
-          <marker id="wf-dep-arrow-red" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-            <path d="M0,0 L8,4 L0,8 z" fill="var(--wf-accent-pink)" />
-          </marker>
-        </defs>
-
-        {layout.edges.map((e) => {
-          const from = nodeById.get(e.from);
-          const to = nodeById.get(e.to);
-          if (!from || !to) return null;
-          const red = halted && culprits.poisoned.has(e.from) && culprits.poisoned.has(e.to);
-          const x1 = from.x + NODE_W;
-          const y1 = from.y + NODE_H / 2;
-          const x2 = to.x;
-          const y2 = to.y + NODE_H / 2;
-          const midX = (x1 + x2) / 2;
-          return (
-            <path
-              key={`${e.from}->${e.to}`}
-              d={`M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`}
-              fill="none"
-              stroke={red ? 'var(--wf-accent-pink)' : 'var(--wf-fg-secondary)'}
-              strokeWidth={red ? 2 : 1}
-              opacity={red ? 0.9 : 0.5}
-              markerEnd={red ? 'url(#wf-dep-arrow-red)' : 'url(#wf-dep-arrow)'}
-            />
-          );
-        })}
-
-        {layout.nodes.map((n) => {
-          const isCulprit = halted && culprits.poisoned.has(n.id);
-          return (
-            <g key={n.id} transform={`translate(${n.x}, ${n.y})`} data-testid="dep-node" data-task-id={n.id}>
-              <rect
-                width={NODE_W}
-                height={NODE_H}
-                rx={6}
-                fill="var(--wf-bg-secondary)"
-                stroke={isCulprit ? 'var(--wf-accent-pink)' : nodeFill(n.state)}
-                strokeWidth={isCulprit ? 2 : 1.5}
-              />
-              <rect x={0} y={0} width={6} height={NODE_H} rx={3} fill={nodeFill(n.state)} />
-              <text x={12} y={18} fontSize={11} fontWeight={600} fill="var(--wf-fg)">
-                {n.title.length > 20 ? `${n.title.slice(0, 19)}…` : n.title}
-              </text>
-              <text x={12} y={33} fontSize={9} fill="var(--wf-fg-secondary)">
-                {n.id} · {n.state}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
+    <div
+      style={{
+        height: 'max(420px, calc(100vh - 240px))',
+        borderTop: '1px solid var(--wf-border)',
+      }}
+      data-testid="dep-map"
+    >
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={NODE_TYPES}
+        fitView
+        minZoom={0.2}
+        maxZoom={1.6}
+        nodesConnectable={false}
+        proOptions={{ hideAttribution: true }}
+        onNodeClick={(_ev, node) => onTaskClick?.(node.id)}
+        style={{ background: 'var(--wf-bg)' }}
+      >
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--wf-border)" />
+        <Controls showInteractive={false} position="bottom-right" />
+      </ReactFlow>
     </div>
   );
 };

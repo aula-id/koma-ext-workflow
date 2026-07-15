@@ -25,6 +25,8 @@ function parseDeepLink(raw: string | null): DeepLink {
       return { view: 'board', boardTab: 'board' };
     case 'drilldown':
       return { view: 'board', boardTab: 'drilldown' };
+    case 'depmap':
+      return { view: 'board', boardTab: 'depmap' };
     case 'task':
       return { view: 'board', boardTab: 'board', wantsTask: true };
     case 'office':

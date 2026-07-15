@@ -449,31 +449,6 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
           </div>
           </div>
 
-          <AnimatePresence>
-            {selectedTaskId && selectedTask && (
-              <React.Fragment>
-                {/* Overlay + dim, not a widened layout row: this drawer used to sit
-                    in a flex row next to the column grid, whose combined width could
-                    exceed the viewport and clip the drawer's own content while adding
-                    a page-level horizontal scrollbar (design-critique round 2). It is
-                    now a fixed panel (see TaskDetail.tsx) with a dimming backdrop. */}
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.15 }}
-                  onClick={() => setSelectedTaskId(null)}
-                  style={{
-                    position: 'fixed',
-                    inset: 0,
-                    background: 'rgba(0, 0, 0, 0.5)',
-                    zIndex: 30,
-                  }}
-                />
-                <TaskDetail task={selectedTask} onClose={() => setSelectedTaskId(null)} />
-              </React.Fragment>
-            )}
-          </AnimatePresence>
           </React.Fragment>
         )}
 
@@ -483,10 +458,38 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
           <DepMap
             tasks={project.tasks.map((t) => ({ id: t.id, title: t.title, state: t.state, blockedBy: t.blockedBy }))}
             halted={halted}
+            onTaskClick={(id) => setSelectedTaskId(id)}
           />
         )}
 
         {tab === 'prd' && <Prd project={project} />}
+
+        {/* Drawer lives OUTSIDE the tab switch so a depmap node click opens it too. */}
+        <AnimatePresence>
+          {selectedTaskId && selectedTask && (
+            <React.Fragment>
+              {/* Overlay + dim, not a widened layout row: this drawer used to sit
+                  in a flex row next to the column grid, whose combined width could
+                  exceed the viewport and clip the drawer's own content while adding
+                  a page-level horizontal scrollbar (design-critique round 2). It is
+                  now a fixed panel (see TaskDetail.tsx) with a dimming backdrop. */}
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.15 }}
+                onClick={() => setSelectedTaskId(null)}
+                style={{
+                  position: 'fixed',
+                  inset: 0,
+                  background: 'rgba(0, 0, 0, 0.5)',
+                  zIndex: 30,
+                }}
+              />
+              <TaskDetail task={selectedTask} onClose={() => setSelectedTaskId(null)} />
+            </React.Fragment>
+          )}
+        </AnimatePresence>
 
         {toast && (
           <motion.div
