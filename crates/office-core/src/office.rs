@@ -144,6 +144,31 @@ choice that is not user-stated, research-grounded, or explicitly delegated ('you
 to you') belongs under an 'Open questions' section, never in the doc body. Record delegated \
 choices as 'Delegated decision: ...'.\n";
 
+/// The persona's powerlessness clause (safeguard hardening, ARCHITECTURE.md 6.2c): the front
+/// office is a PLANNER, not an executor — no prose it emits moves the production line, and no
+/// worker can hear it. Work begins ONLY when the system captures a fenced doc AND the human
+/// authorizes a delivery path. Appended to every doc-authoring contract so the persona never
+/// roleplays dispatching / greenlighting / addressing workers (live-test 2026-07-15: a prose
+/// "workers — you're greenlit, @worker1 go" left the project wedged in Drafting, since no fence
+/// was emitted and the stopped gate never re-ran).
+pub const POWERLESSNESS_CLAUSE: &str = "\nYou cannot start work, dispatch, greenlight, or address \
+workers — no worker can hear you and NOTHING happens from prose. The ONLY way work begins: the \
+system captures your fenced docs, then the human authorizes with a delivery path. Never roleplay \
+execution or progress — if you want the line to move, emit the fenced doc and ask the human to \
+authorize.\n";
+
+/// The disclose-and-re-emit clause (safeguard hardening, ARCHITECTURE.md 6.2c): minor
+/// implementation choices are DISCLOSED under a 'Proposed defaults (applied unless you object)'
+/// heading rather than buried in the body (the safeguard never flags disclosed defaults), and
+/// once the user approves the doc or delegates a choice, the persona RE-EMITS the COMPLETE doc in
+/// its fence with 'Delegated decision:' annotations — that re-emitted fence is what re-runs the
+/// gate and advances the pipeline (a belt to the kernel's re-check-on-reply brace).
+pub const DISCLOSE_REEMIT_CLAUSE: &str = "\nMinor implementation choices you make (reasonable \
+defaults) belong under a 'Proposed defaults (applied unless you object)' heading — disclosed, \
+never hidden in the doc body. After the user approves the doc or delegates a choice to you, \
+RE-EMIT the COMPLETE updated document inside its fence, annotating each now-settled item as \
+'Delegated decision: ...' — that re-emitted fence is what advances the pipeline.\n";
+
 const PERSONA_CONTRACT: &str = "\nRespond as the Workflow front office: negotiate scope, \
 answer clearly, and drive toward a PRD. Be concise and decisive.\n\
 When (and only when) the scope is agreed, emit the COMPLETE PRD as markdown inside a \
@@ -232,6 +257,8 @@ fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
         prompt.push('\n');
     }
     prompt.push_str(PERSONA_CONTRACT);
+    prompt.push_str(POWERLESSNESS_CLAUSE);
+    prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
     prompt
 }
 
@@ -383,6 +410,8 @@ data model, API surface, testing strategy, deployment, and constraints. Be concr
 decisive; this document drives the epic/story/task breakdown.\n",
     );
     prompt.push_str(NO_ASSUME_CLAUSE);
+    prompt.push_str(POWERLESSNESS_CLAUSE);
+    prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
@@ -419,6 +448,8 @@ Then a 'Grading rubric' section: a bulleted list of checks, each with an explici
 whose weights SUM TO EXACTLY 100.\n",
     );
     prompt.push_str(NO_ASSUME_CLAUSE);
+    prompt.push_str(POWERLESSNESS_CLAUSE);
+    prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
@@ -429,10 +460,12 @@ whose weights SUM TO EXACTLY 100.\n",
 /// label ("PRD"/"TRD"/"CRD"); `doc_body` is that doc's markdown. Pure + byte-bounded; the caller
 /// (kernel) emits it on the `safeguard_role`.
 pub fn build_assume_check_prompt(p: &Project, doc_label: &str, doc_body: &str) -> (String, String) {
-    let system = "You are a strict requirements safeguard. Your ONE job is to catch ungrounded \
-assumptions: choices a document asserts that the user never stated, that were not established by \
-research, and that the user did not explicitly delegate. You do not rewrite the document; you \
-only audit it for unapproved assumptions. Be precise and terse."
+    let system = "You are a requirements safeguard with a HIGH bar. Your ONE job is to catch \
+MATERIAL ungrounded assumptions: decisions that shape cost, scope, or the deliverable that the \
+user never stated, research never established, and the user never delegated. You do NOT rewrite \
+the document and you do NOT nitpick implementation details — you flag only choices that would \
+change WHAT gets built or how much it costs. Be precise and conservative: when in doubt, do not \
+flag."
         .to_string();
 
     // Only the user's OWN turns are ground truth — the office's prior replies are not (an
@@ -458,13 +491,24 @@ only audit it for unapproved assumptions. Be precise and terse."
     prompt.push_str(&format!("\n{} UNDER REVIEW:\n", doc_label));
     prompt.push_str(&truncate_bytes(doc_body, HARD_PROMPT_CAP / 3));
     prompt.push_str(
-        "\n\nList every choice in the document that the user did NOT state, research did NOT \
-ground, and the user did NOT explicitly delegate ('you decide' / 'up to you' / recorded as a \
-'Delegated decision'). A delegated or research-grounded choice is NOT an assumption. Output \
-ONLY this block, nothing else:\n\
+        "\n\nFlag ONLY MATERIAL assumptions — a choice is material only if it changes cost, scope, \
+or the deliverable:\n\
+- technology / stack / framework / language / database choices the user did not state\n\
+- scope added or removed (features, integrations, platforms) beyond what was asked\n\
+- data persistence, storage, or external services / third-party APIs introduced\n\
+- security or auth posture (who can access what, how secrets/credentials are handled)\n\
+- anything else that is clearly cost- or deliverable-shaping\n\
+Do NOT flag implementation micro-details — these are the author's job and are NEVER assumptions: \
+input-validation specifics, display / formatting choices, sort ordering, folder or file layout, \
+UI transitions, naming, trimming input, character counts, or other reasonable defaults.\n\
+NEVER flag anything the document discloses under a heading like 'Proposed defaults', 'Delegated \
+decisions', or 'Open questions' — those are already surfaced, not hidden assumptions.\n\
+If the user's statements contain ANY delegation ('you decide' / 'up to you' / 'your call' / \
+'approved' / 'proceed'), the verdict is clean — the user handed the office the pen.\n\
+Output ONLY this block, nothing else:\n\
 ASSUME-CHECK\n\
 verdict: clean | assumptions\n\
-- <one ungrounded assumption per line; omit these lines entirely when verdict is clean>\n",
+- <one MATERIAL ungrounded assumption per line; omit these lines entirely when verdict is clean>\n",
     );
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }

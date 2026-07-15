@@ -82,7 +82,12 @@ const ProjectRow: React.FC<{ project: Project; onClick?: () => void; nowMs: numb
         {project.officeActivity ? (
           <div className="truncate flex items-center gap-1" style={{ color: 'var(--wf-info)', fontSize: '0.75rem', marginTop: 2 }}>
             <StatusDot colorVar="var(--wf-info)" running label={project.officeActivity.label} />
-            <span>{project.officeActivity.label} · {formatElapsed(nowMs, project.officeActivity.sinceMs)}</span>
+            {/* A `sinceMs` of 0 is the "waiting on you" sentinel — a waiting state has no elapsed
+                work clock, so the elapsed suffix is hidden. */}
+            <span>
+              {project.officeActivity.label}
+              {project.officeActivity.sinceMs > 0 ? ` · ${formatElapsed(nowMs, project.officeActivity.sinceMs)}` : ''}
+            </span>
           </div>
         ) : (
           project.lastNotice && (
@@ -137,7 +142,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
   );
 
   const attentionProjects = useMemo(
-    () => projects.filter((p) => p.phase.kind === 'halted' || (p.parkedCount || 0) > 0),
+    () => projects.filter(
+      (p) => p.phase.kind === 'halted'
+        || (p.parkedCount || 0) > 0
+        || (p.pendingAssumptions?.length || 0) > 0,
+    ),
     [projects],
   );
   const recentActivity = useMemo(
@@ -216,23 +225,33 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
                 </p>
               ) : (
                 <div className="flex flex-col" style={{ gap: '0.35rem' }}>
-                  {attentionProjects.map((p) => (
-                    <div
-                      key={p.id}
-                      className="flex items-center justify-between text-sm cursor-pointer"
-                      onClick={() => onProjectClick?.(p.id)}
-                    >
-                      <span style={{ color: 'var(--wf-fg)' }}>{p.name}</span>
-                      <span
-                        style={{
-                          color: p.phase.kind === 'halted' ? 'var(--wf-error)' : 'var(--wf-warn)',
-                          fontSize: '0.78rem',
-                        }}
+                  {attentionProjects.map((p) => {
+                    const pending = p.pendingAssumptions?.length || 0;
+                    // Priority: a halted line first, then parked tasks, then a drafting project
+                    // waiting on the user to approve the safeguard's assumptions (6.2c feature 5).
+                    const label = p.phase.kind === 'halted'
+                      ? 'halted'
+                      : (p.parkedCount || 0) > 0
+                        ? `${p.parkedCount} parked`
+                        : `${pending} assumption${pending === 1 ? '' : 's'} await approval`;
+                    return (
+                      <div
+                        key={p.id}
+                        className="flex items-center justify-between text-sm cursor-pointer"
+                        onClick={() => onProjectClick?.(p.id)}
                       >
-                        {p.phase.kind === 'halted' ? 'halted' : `${p.parkedCount} parked`}
-                      </span>
-                    </div>
-                  ))}
+                        <span style={{ color: 'var(--wf-fg)' }}>{p.name}</span>
+                        <span
+                          style={{
+                            color: p.phase.kind === 'halted' ? 'var(--wf-error)' : 'var(--wf-warn)',
+                            fontSize: '0.78rem',
+                          }}
+                        >
+                          {label}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

@@ -84,3 +84,13 @@ pub fn resume(project: &str) -> Value {
 pub fn breakdown(project: &str) -> Value {
     json!({ "op": "breakdown", "project": project })
 }
+
+/// `{ "op": "approve", "project": <project> }`.
+///
+/// Approve the safeguard's pending assumptions for a drafting project (ARCHITECTURE.md 6.2c):
+/// explicit human approval outranks the checker, so the office clears `pending_assumptions` and
+/// resumes the deferred pipeline stage. `project` is required by the parser; the office confirms
+/// as a chat notice, same as every other command tool.
+pub fn approve(project: &str) -> Value {
+    json!({ "op": "approve", "project": project })
+}

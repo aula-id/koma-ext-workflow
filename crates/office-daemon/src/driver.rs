@@ -446,6 +446,13 @@ impl<H: Host> Driver<H> {
                     self.step(i, kernel::Input::Command(kernel::Command::RequestBreakdown), now_ms);
                 }
             }
+            // Explicit human approval of the safeguard's pending assumptions (6.2c). Lease-holder
+            // only, mirroring Breakdown/Interrupt/Resume above; a non-holder's approve is dropped.
+            DCmd::Approve { project } => {
+                if let Some(i) = self.owned_project_by_id(&project) {
+                    self.step(i, kernel::Input::Command(kernel::Command::ApproveAssumptions), now_ms);
+                }
+            }
             // An off-loop invoke completed: apply the driver's one retry, else route the
             // outcome into the kernel (5.1 / 6.2).
             DCmd::InvokeDone { req_id, result } => self.on_invoke_done(req_id, result, now_ms),
@@ -1682,6 +1689,17 @@ fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Opti
     }
     if let Some(b) = &project.audit {
         return Some(OfficeActivity { label: "auditing the delivery".to_string(), since_ms: b.spawned_at_ms });
+    }
+    // Waiting-on-user visibility (safeguard feature 5): no invoke/research/audit is live but the
+    // drafting pipeline is STOPPED on the safeguard's pending assumptions. `since_ms: 0` is a
+    // deliberate sentinel — a waiting state has no "elapsed work" clock, and the UI hides the
+    // elapsed suffix when `sinceMs == 0`.
+    if !project.pending_assumptions.is_empty() {
+        let n = project.pending_assumptions.len();
+        return Some(OfficeActivity {
+            label: format!("waiting on you — {} assumption{}", n, if n == 1 { "" } else { "s" }),
+            since_ms: 0,
+        });
     }
     None
 }

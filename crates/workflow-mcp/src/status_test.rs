@@ -228,3 +228,20 @@ fn no_activity_line_when_neither_research_nor_audit_is_live() {
     let out = status_digest_at(&root, None);
     assert!(!out.contains("activity:"), "{out}");
 }
+
+#[test]
+fn pending_assumptions_surface_a_waiting_on_user_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let store = Store::open(&root).unwrap();
+
+    let mut p = project("shop", "Online Shop", ProjectPhase::Drafting, vec![], 1);
+    p.pending_assumptions = vec![
+        "assumed Postgres".to_string(),
+        "assumed a React SPA".to_string(),
+    ];
+    store.save_project(&p).unwrap();
+
+    let out = status_digest_at(&root, None);
+    assert!(out.contains("waiting on user: 2 unapproved assumptions"), "{out}");
+}

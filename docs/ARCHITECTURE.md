@@ -791,11 +791,49 @@ invoke on `config.safeguard_role` (default `"safeguard"`). Given ONLY the user's
 research notes + the doc, the safeguard emits `ASSUME-CHECK\nverdict: clean|assumptions\n- <item>`
 (tolerant-parsed by `report::parse_assume_check`). `clean` -> proceed with the deferred stage;
 `assumptions` -> STOP, storing `Project.pending_assumptions` and noticing the user (the doc is
-stored/visible; a chat answer + a fresh fence re-runs the gate, and a clean check clears the list);
-`Err` -> FAIL-OPEN (proceed). `config.assumption_check` (default true) skips the gate entirely when
-false. The deferred stage is a pure function of the doc identity on the check's purpose — no hidden
-"which stage" state is persisted, so the resume point is reconstructible from `phase` + which docs
-are non-empty + `pending_assumptions` + `assumption_check` (see the kernel.rs pipeline resume rule).
+stored/visible); `Err` -> FAIL-OPEN (proceed). `config.assumption_check` (default true) skips the
+gate entirely when false. The deferred stage is a pure function of the doc identity on the check's
+purpose — no hidden "which stage" state is persisted, so the resume point is reconstructible from
+`phase` + which docs are non-empty + `pending_assumptions` + `assumption_check`.
+
+*Material-only calibration.* The safeguard flags ONLY MATERIAL assumptions — technology/stack
+choices, scope added/removed, data persistence or external services, security/auth posture, or
+anything else cost- or deliverable-shaping. It NEVER flags implementation micro-details (input
+validation, display formatting, ordering, folder layout, transitions), NEVER flags content the doc
+discloses under "Proposed defaults"/"Delegated decisions"/"Open questions", and returns `clean` the
+moment the user's own turns contain any delegation ("you decide" / "up to you" / "approved" /
+"proceed"). This keeps the gate from wedging on trivia (live-test 2026-07-15 flagged 13 micro-details
+as assumptions).
+
+*Re-running a stopped gate.* A stopped gate re-fires three ways, all off pure state: (1) the persona
+re-emits the fence and the fresh capture re-runs the gate; (2) **the persona replies WITHOUT a new
+fence while `pending_assumptions` is set** — the kernel Persona arm then re-emits the gate for the
+newest captured doc (`recheck_pending_assumptions`) so the transcript, now grown by the user's
+approval/answer/delegation, is re-judged (exactly ONE re-check per persona exchange, since an
+AssumeCheck result is not itself a persona result and cannot recurse); (3) **`workflow_approve`**
+(`office_core::inboxmsg::approve` -> daemon `Command::Approve` -> kernel `Command::ApproveAssumptions`,
+owner-only over the inbox like `authorize`) — explicit human approval OUTRANKS the checker: it
+appends an approval turn to the transcript, clears `pending_assumptions` directly, and resumes the
+deferred stage with no further invoke. A clean re-check (paths 1/2) or an approve (path 3) both
+notice the user ("assumptions resolved/approved — resuming"). This closes the live-test-2026-07-15
+wedge, where the persona answered a safeguard stop in PROSE (no new fence), the gate never re-ran,
+and the project sat in Drafting forever.
+
+*Powerlessness clause.* Because the persona is a planner with no ability to start work — no worker
+can hear it and nothing happens from prose — every doc-authoring contract states this explicitly
+(`office::POWERLESSNESS_CLAUSE`): work begins ONLY when the system captures a fenced doc and the
+human authorizes a delivery path; the persona must never roleplay dispatching/greenlighting workers.
+A companion clause (`office::DISCLOSE_REEMIT_CLAUSE`) tells it to disclose minor choices under
+"Proposed defaults (applied unless you object)" and to RE-EMIT the full doc in its fence (with
+"Delegated decision:" annotations) once the user approves/delegates — a belt to the kernel's
+re-check-on-reply brace.
+
+*Waiting-on-user visibility.* While `pending_assumptions` is non-empty and nothing else is live, the
+driver's `office_activity` reports a `waiting on you — N assumptions` label with `sinceMs: 0` (the UI
+hides the elapsed suffix for the sentinel); the dashboard "Attention needed" section adds a
+`N assumptions await approval` row, the pixel office shows the PM at the front office with a "?"
+bubble tagged "front office - waiting on you", and `workflow_status` prints a
+`waiting on user: N unapproved assumptions` line (read straight off the on-disk `pending_assumptions`).
 
 ### 6.3 PRD -> breakdown -> authorization flow
 

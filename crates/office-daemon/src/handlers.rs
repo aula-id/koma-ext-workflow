@@ -44,6 +44,10 @@ pub enum Command {
     /// `{ op: "breakdown", project }` — ask the office to author + land the epic/story/
     /// task breakdown for the project's PRD (6.3.2). No contributed tool; panel-only.
     Breakdown { project: String },
+    /// `{ op: "approve", project }` — explicit human approval of the safeguard's pending
+    /// assumptions (6.2c): clears `pending_assumptions` and resumes the drafting pipeline.
+    /// No contributed tool; MCP `workflow_approve` + inbox, owner-only like `authorize`.
+    Approve { project: String },
     /// An off-loop `models.invoke` completed (W9): posted by the invoke worker pool onto
     /// the driver channel, NOT parsed from the wire. `req_id` matches the driver's pending
     /// job; `result` is the model output or the error string. The driver applies its one

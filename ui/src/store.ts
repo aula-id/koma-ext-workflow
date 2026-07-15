@@ -38,6 +38,9 @@ export interface Project {
   /** Live office activity (full snapshot only, 6.2d), present only while an activity is in
    * flight; omitted entirely (not null) when idle. At most one is live at a time. */
   officeActivity?: { label: string; sinceMs: number } | null;
+  /** Ungrounded assumptions the safeguard flagged in the last drafting doc gate (6.2c, full
+   * snapshot only). Non-empty means the pipeline is stopped awaiting the user's approval. */
+  pendingAssumptions?: string[];
   [key: string]: any;
 }
 

@@ -39,11 +39,16 @@
 //! of the doc identity carried on the check's `InvokePurpose`, so it is always recomputable and
 //! survives a store reload. `pending_assumptions` (persisted) records only that the LAST gate
 //! found ungrounded assumptions; ANY subsequent clean check clears it. A stopped gate is
-//! re-entered the only way a doc is ever captured — the user answers in chat, the persona
-//! re-emits the fence, and the fresh capture re-runs the gate. If a reload lands mid-invoke the
-//! in-flight check is simply lost (like any invoke) and the next `OfficeMessage` re-runs it. So
-//! the resume point is reconstructible from pure state: `phase` + which docs are non-empty +
-//! `pending_assumptions` + `assumption_check`.
+//! re-entered three ways, all off pure state: (1) the persona re-emits the fence and the fresh
+//! capture re-runs the gate; (2) the persona replies WITHOUT a new fence while
+//! `pending_assumptions` is set — the Persona arm then re-emits the gate for the newest captured
+//! doc (`recheck_pending_assumptions`) so the transcript-grown-by-the-user's-reply is re-judged
+//! (exactly one re-check per persona exchange, since an AssumeCheck result is not a persona
+//! result); (3) `Command::ApproveAssumptions` (workflow_approve) — explicit human approval clears
+//! `pending_assumptions` directly and resumes the deferred stage with no invoke. If a reload lands
+//! mid-invoke the in-flight check is simply lost (like any invoke) and the next `OfficeMessage`
+//! re-runs it. So the resume point is reconstructible from pure state: `phase` + which docs are
+//! non-empty + `pending_assumptions` + `assumption_check`.
 //!
 //! ## Completion audit gate (6.2c)
 //! When the last task passes and the project would complete, [`maybe_complete_project`] spawns
@@ -143,6 +148,12 @@ pub enum Command {
         crd_pass_grade: Option<u32>,
         assumption_check: Option<bool>,
     },
+    /// Explicit human approval of the safeguard's pending assumptions (`workflow_approve`,
+    /// ARCHITECTURE.md 6.2c). Records the approval in the office transcript, then — human approval
+    /// OUTRANKING the checker — clears `pending_assumptions` directly and resumes the deferred
+    /// drafting stage for the newest gated doc, WITHOUT waiting on another safeguard invoke. A
+    /// no-op notice when nothing is pending.
+    ApproveAssumptions,
 }
 
 /// Facts fed back by the driver. `Tick`/`Reconcile` carry no clock — the authoritative
@@ -425,6 +436,7 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 ctx.dirty = true;
             }
         }
+        Command::ApproveAssumptions => approve_assumptions(p, now_ms, ctx),
     }
 }
 
@@ -677,11 +689,71 @@ fn gate_doc(
     ctx: &mut Ctx,
 ) {
     if !p.config.assumption_check {
+        // Gate disabled -> no pending assumptions can be outstanding; clear any (a re-check that
+        // reaches a now-disabled gate) and pass straight through to the deferred stage.
+        p.pending_assumptions.clear();
         run_deferred(p, deferred, now_ms, ctx);
         return;
     }
     let (system, prompt) = office::build_assume_check_prompt(p, label, body);
     emit_invoke(ctx, purpose, &p.config.safeguard_role, system, prompt);
+}
+
+/// The newest non-empty drafting doc and its gate parameters (purpose, human label, a body clone,
+/// deferred stage). Because the pipeline authors PRD -> TRD -> CRD strictly in order and only past
+/// a clean gate, the LAST gate always ran on the newest non-empty doc — so this recovers exactly
+/// which doc `pending_assumptions` belongs to, with no extra persisted state (kernel.rs resume
+/// rule). CRD wins over TRD wins over PRD. `None` only when no doc exists yet (never while
+/// `pending_assumptions` is set).
+fn newest_gated_doc(p: &Project) -> Option<(InvokePurpose, &'static str, String, Deferred)> {
+    if !p.crd_markdown.trim().is_empty() {
+        Some((InvokePurpose::AssumeCheckCrd, "CRD", p.crd_markdown.clone(), Deferred::Breakdown))
+    } else if !p.trd_markdown.trim().is_empty() {
+        Some((InvokePurpose::AssumeCheckTrd, "TRD", p.trd_markdown.clone(), Deferred::Crd))
+    } else if !p.prd_markdown.trim().is_empty() {
+        Some((InvokePurpose::AssumeCheckPrd, "PRD", p.prd_markdown.clone(), Deferred::Research))
+    } else {
+        None
+    }
+}
+
+/// Re-run the safeguard gate on the newest captured drafting doc (feature 1). Called from the
+/// Persona arm when a fenceless reply arrives while `pending_assumptions` is set: the transcript
+/// now carries the user's fresh approval / answers / delegation, so the SAME gate (same purpose ->
+/// same deferred stage) is re-emitted to re-judge it. A clean verdict then clears the list and
+/// resumes the deferred stage in [`handle_assume_check_result`]; a still-dirty verdict refreshes
+/// the list. No-op if there is somehow no doc to gate.
+fn recheck_pending_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if let Some((purpose, label, body, deferred)) = newest_gated_doc(p) {
+        gate_doc(p, purpose, label, &body, deferred, now_ms, ctx);
+    }
+}
+
+/// Explicit human approval of the pending safeguard assumptions (feature 2, `workflow_approve`).
+/// Human approval OUTRANKS the checker: record the approval as a User turn (so any later gate sees
+/// the delegation in the transcript), then clear `pending_assumptions` DIRECTLY and resume the
+/// deferred stage for the newest gated doc — no re-invoke, no waiting on the model. With nothing
+/// pending it is a no-op beyond a notice.
+fn approve_assumptions(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    p.office_transcript.push(ChatMsg {
+        who: ChatAuthor::User,
+        text: "Approved: proceed with your proposed choices (delegated).".to_string(),
+    });
+    ctx.dirty = true;
+    if p.pending_assumptions.is_empty() {
+        queue_notice(p, now_ms, format!("office[{}]: nothing awaiting approval.", p.id.0), ctx);
+        return;
+    }
+    p.pending_assumptions.clear();
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: assumptions approved by user — resuming.", p.id.0),
+        ctx,
+    );
+    if let Some((_, _, _, deferred)) = newest_gated_doc(p) {
+        run_deferred(p, deferred, now_ms, ctx);
+    }
 }
 
 /// A safeguard assumption-check returned (6.2c). `clean` (or an unparseable block) clears
@@ -731,7 +803,18 @@ fn handle_assume_check_result(
                 // STOP: the doc is stored/visible; the user must act before the pipeline proceeds.
             }
             _ => {
-                // Clean, or an unparseable/inconclusive block -> fail open and proceed.
+                // Clean, or an unparseable/inconclusive block -> fail open and proceed. When this
+                // CLEARS a stopped gate (pending was non-empty), tell the user the pipeline is
+                // resuming — both the re-check-on-reply path (recheck_pending_assumptions) and a
+                // re-emitted fence land here.
+                if !p.pending_assumptions.is_empty() {
+                    queue_notice(
+                        p,
+                        now_ms,
+                        format!("office[{}]: assumptions resolved — resuming.", p.id.0),
+                        ctx,
+                    );
+                }
                 p.pending_assumptions.clear();
                 run_deferred(p, deferred, now_ms, ctx);
             }
@@ -814,7 +897,9 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             // clean verdict PROCEEDS to that doc's pipeline stage — PRD -> research, TRD -> CRD,
             // CRD -> breakdown. Without capture the persona chats forever while the board stays
             // empty (live-test 2026-07-15). A re-emitted fence after a stopped gate re-runs the
-            // check (kernel.rs pipeline resume rule).
+            // check; a fenceless reply while `pending_assumptions` is set ALSO re-runs the gate on
+            // the newest captured doc (recheck_pending_assumptions) so the updated transcript is
+            // re-judged (kernel.rs pipeline resume rule).
             if matches!(p.phase, ProjectPhase::Drafting) {
                 if let Some(prd) = office::extract_prd(&reply) {
                     p.prd_markdown = prd;
@@ -847,6 +932,19 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                     gate_doc(p, InvokePurpose::AssumeCheckCrd, "CRD", &body, Deferred::Breakdown, now_ms, ctx);
                     ctx.dirty = true;
                     return;
+                }
+
+                // No fresh fence, but the pipeline is STOPPED on a prior gate's assumptions and the
+                // user just replied — their approval / answers / delegation now sit in the
+                // transcript. Re-run the gate on the newest captured doc so that UPDATED transcript
+                // is re-judged; a clean re-check clears `pending_assumptions` and resumes the
+                // deferred stage. Without this, a stopped gate never re-fires and Drafting wedges
+                // forever (live-test 2026-07-15: the persona answered in prose, no new fence, and
+                // the gate never re-ran). Exactly ONE re-check per persona exchange: the AssumeCheck
+                // result is not a persona result, so it cannot recurse. The persona reply itself
+                // still flows to chat below.
+                if !p.pending_assumptions.is_empty() {
+                    recheck_pending_assumptions(p, now_ms, ctx);
                 }
             }
 

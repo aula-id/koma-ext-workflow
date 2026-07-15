@@ -1596,6 +1596,103 @@ fn assume_check_trd_clean_proceeds_to_crd_and_crd_clean_to_breakdown() {
 }
 
 // ---------------------------------------------------------------------------
+// Safeguard: gate re-run on every reply while pending (feature 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gated_persona_reply_without_fence_reruns_the_gate() {
+    // A STOPPED gate (pending_assumptions set) + a fenceless persona reply re-runs the safeguard
+    // on the newest captured doc, so the user's fresh reply (now in the transcript) is re-judged.
+    // Live-test 2026-07-15: without this the persona chatted forever and the project wedged.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App\nBuild a CLI.".into();
+    p.pending_assumptions = vec!["assumed Postgres".to_string()];
+    let reply = "You decide — I'll proceed with my proposed choices."; // no fence
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "the PRD gate re-runs");
+    // The persona reply still flows to chat.
+    assert!(p.office_transcript.iter().any(|m| m.text.contains("You decide")));
+    // Pending is unchanged until the re-check verdict lands.
+    assert_eq!(p.pending_assumptions, vec!["assumed Postgres".to_string()]);
+}
+
+#[test]
+fn recheck_clean_clears_pending_and_resumes_deferred_stage() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.pending_assumptions = vec!["assumed Postgres".to_string()];
+    // A fenceless reply re-emits the PRD gate...
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok("you decide".into())), 1000, 4);
+    assert_eq!(p.pending_assumptions.len(), 1, "still pending until the re-check verdict");
+    // ...and the re-check comes back clean -> clear + spawn research (the PRD's deferred stage).
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())),
+        1100,
+        4,
+    );
+    assert!(p.pending_assumptions.is_empty(), "a clean re-check clears the list");
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "deferred stage resumes");
+    assert!(p
+        .outbox
+        .iter()
+        .any(|n| n.text.contains("assumptions resolved") && n.text.contains("resuming")));
+}
+
+#[test]
+fn recheck_still_dirty_updates_the_pending_list() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.pending_assumptions = vec!["assumed Postgres".to_string(), "assumed React".to_string()];
+    // Fenceless reply re-emits the gate; the verdict is still dirty but with a shorter list.
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok("here is my reasoning".into())), 1000, 4);
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed React\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1100, 0);
+
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "still stopped");
+    assert_eq!(p.pending_assumptions, vec!["assumed React".to_string()], "list refreshed (shrank)");
+}
+
+// ---------------------------------------------------------------------------
+// Safeguard: workflow_approve -> ApproveAssumptions (feature 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn approve_assumptions_clears_resumes_and_records_the_turn() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.pending_assumptions = vec!["assumed Postgres".to_string()];
+    let fx = step(&mut p, Input::Command(Command::ApproveAssumptions), 1000, 4);
+
+    assert!(p.pending_assumptions.is_empty(), "human approval clears pending DIRECTLY");
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage resumes");
+    assert!(invoke_effects(&fx).is_empty(), "no safeguard re-invoke — approval outranks the checker");
+    // The approval is recorded as a User turn so any later gate sees the delegation.
+    let last = p.office_transcript.last().expect("a turn was appended");
+    assert!(matches!(last.who, ChatAuthor::User), "recorded as a User turn");
+    assert!(last.text.contains("Approved"));
+    assert!(p
+        .outbox
+        .iter()
+        .any(|n| n.text.contains("approved by user") && n.text.contains("resuming")));
+}
+
+#[test]
+fn approve_with_nothing_pending_only_notices() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    // pending_assumptions empty by default.
+    let fx = step(&mut p, Input::Command(Command::ApproveAssumptions), 1000, 4);
+
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "nothing to resume");
+    assert!(invoke_effects(&fx).is_empty());
+    assert!(p.outbox.iter().any(|n| n.text.contains("nothing awaiting approval")));
+    // The turn is still recorded (the user did act).
+    assert!(p.office_transcript.last().map(|m| m.text.contains("Approved")).unwrap_or(false));
+}
+
+// ---------------------------------------------------------------------------
 // CRD invoke (6.2c feature A)
 // ---------------------------------------------------------------------------
 

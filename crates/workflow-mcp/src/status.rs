@@ -103,6 +103,18 @@ fn project_block(p: &Project) -> String {
         yn(!p.research_notes.trim().is_empty()),
         yn(!p.crd_markdown.trim().is_empty()),
     ));
+    // Waiting-on-user (safeguard feature 5): the drafting pipeline is stopped on the safeguard's
+    // pending assumptions. `pending_assumptions` is on-disk state, so status (which reads the
+    // store directly) CAN surface it — unlike the invoke-based activity labels, which never
+    // persist to `Project`.
+    if !p.pending_assumptions.is_empty() {
+        let n = p.pending_assumptions.len();
+        s.push_str(&format!(
+            "  waiting on user: {} unapproved assumption{}\n",
+            n,
+            if n == 1 { "" } else { "s" }
+        ));
+    }
     // The last clean-build audit grade (6.2c), only when the project has been audited.
     if let Some(g) = p.last_audit_grade {
         s.push_str(&format!("  audit: {g}\n"));

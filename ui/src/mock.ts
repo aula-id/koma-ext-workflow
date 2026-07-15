@@ -384,6 +384,9 @@ function buildDraftingAssumptionsProject() {
     pendingAssumptions: [
       'Assumed partial imports commit the valid rows and skip the invalid ones — the user never said.',
     ],
+    // Waiting-on-user activity (6.2c feature 5): the driver stamps this when the pipeline is
+    // stopped on pending assumptions. `sinceMs: 0` -> the UI hides the elapsed suffix.
+    officeActivity: { label: 'waiting on you — 1 assumption', sinceMs: 0 },
     officeTranscript: [
       { who: 'user', text: 'Admins need to bulk-import products from a CSV instead of typing them in one at a time.' },
       { who: 'office', text: 'Drafted a PRD with client-side validation and a per-row error report. One open question I could not resolve: should a partially-valid file commit the good rows, or is it all-or-nothing? Flagged that as an assumption for now — take a look.' },
