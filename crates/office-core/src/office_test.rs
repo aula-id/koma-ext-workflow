@@ -32,6 +32,7 @@ fn project(phase: ProjectPhase) -> Project {
         epics: vec![],
         stories: vec![],
         tasks: vec![],
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: vec![],
         trace: vec![],
@@ -525,4 +526,147 @@ fn parse_well_known_reads_yes_no_and_defaults_none() {
     assert_eq!(office::parse_well_known("Well-Known: YES please"), Some(true));
     assert_eq!(office::parse_well_known("- well-known: false"), Some(false));
     assert_eq!(office::parse_well_known("verdict: clean\n"), None, "absent -> None (run research)");
+}
+
+// ---------------------------------------------------------------------------
+// Sprints (feature: sprints)
+// ---------------------------------------------------------------------------
+
+const GOOD_WITH_SPRINTS: &str = r#"
+{
+  "epics": [
+    { "slug": "ingest", "title": "Ingest", "intent": "pull data", "stories": [
+      { "slug": "fetch", "title": "Fetch", "intent": "http", "tasks": [
+        { "slug": "client", "title": "HTTP client", "description": "d", "acceptance": ["compiles"], "priority": 5, "blocked_by": [] },
+        { "slug": "retry", "title": "Retry logic", "description": "d", "acceptance": ["retries"], "priority": 1, "blocked_by": ["client"] }
+      ]}
+    ]}
+  ],
+  "sprints": [
+    { "goal": "HTTP foundation", "tasks": ["client"] },
+    { "goal": "Resilience", "tasks": ["retry"] }
+  ]
+}
+"#;
+
+#[test]
+fn parse_and_apply_breakdown_groups_sprints_when_present() {
+    let b = office::parse_breakdown(GOOD_WITH_SPRINTS).expect("valid");
+    let mut p = project(ProjectPhase::Drafting);
+    office::apply_breakdown(&mut p, b);
+    assert_eq!(p.sprints.len(), 2);
+    assert_eq!(p.sprints[0].goal, "HTTP foundation");
+    assert_eq!(p.sprints[0].tasks, vec![office_core_task_id("shop/ingest/fetch/client")]);
+    assert_eq!(p.sprints[1].tasks, vec![office_core_task_id("shop/ingest/fetch/retry")]);
+    assert_eq!(p.sprints[0].status, crate::domain::SprintStatus::Active, "first sprint active");
+    assert_eq!(p.sprints[1].status, crate::domain::SprintStatus::Pending, "the rest pending");
+}
+
+#[test]
+fn breakdown_without_sprints_yields_one_all_tasks_sprint() {
+    // GOOD carries no "sprints" array -> a single implicit sprint of every task (back-compat).
+    let b = office::parse_breakdown(GOOD).expect("valid");
+    let mut p = project(ProjectPhase::Drafting);
+    office::apply_breakdown(&mut p, b);
+    assert_eq!(p.sprints.len(), 1);
+    assert_eq!(p.sprints[0].goal, office::DEFAULT_SPRINT_GOAL);
+    assert_eq!(p.sprints[0].tasks.len(), 2, "both tasks land in the single sprint");
+    assert_eq!(p.sprints[0].status, crate::domain::SprintStatus::Active);
+}
+
+#[test]
+fn breakdown_garbage_sprints_fall_back_to_single_sprint() {
+    // Sprints referencing an unknown slug + an empty sprint -> all dropped -> single all-tasks sprint.
+    let json = r#"{"epics":[{"slug":"e","stories":[{"slug":"s","tasks":[
+      {"slug":"a","acceptance":["x"]},
+      {"slug":"b","acceptance":["y"]}
+    ]}]}],"sprints":[{"goal":"ghost","tasks":["does-not-exist"]},{"goal":"empty","tasks":[]}]}"#;
+    let b = office::parse_breakdown(json).expect("valid");
+    let mut p = project(ProjectPhase::Drafting);
+    office::apply_breakdown(&mut p, b);
+    assert_eq!(p.sprints.len(), 1, "no usable sprint survived -> single fallback");
+    assert_eq!(p.sprints[0].tasks.len(), 2);
+}
+
+#[test]
+fn breakdown_leftover_tasks_append_to_last_sprint() {
+    // Only 'a' is placed; 'b' is orphaned -> appended to the last (only) surviving sprint.
+    let json = r#"{"epics":[{"slug":"e","stories":[{"slug":"s","tasks":[
+      {"slug":"a","acceptance":["x"]},
+      {"slug":"b","acceptance":["y"]}
+    ]}]}],"sprints":[{"goal":"first","tasks":["a"]}]}"#;
+    let b = office::parse_breakdown(json).expect("valid");
+    let mut p = project(ProjectPhase::Drafting);
+    office::apply_breakdown(&mut p, b);
+    assert_eq!(p.sprints.len(), 1);
+    assert_eq!(p.sprints[0].tasks.len(), 2, "the orphaned task was folded into the last sprint");
+}
+
+#[test]
+fn enhancement_breakdown_lands_a_single_implicit_sprint() {
+    // Enhancement track: the breakdown asks for no sprints, so apply wraps its tasks in ONE sprint.
+    let mut p = project(ProjectPhase::Drafting);
+    p.track = "enhancement".to_string();
+    let b = office::parse_breakdown(GOOD).expect("valid"); // GOOD carries no sprint grouping
+    office::apply_breakdown(&mut p, b);
+    assert_eq!(p.sprints.len(), 1, "enhancement = exactly one implicit sprint");
+    assert_eq!(p.sprints[0].status, crate::domain::SprintStatus::Active);
+    assert_eq!(p.sprints[0].tasks.len(), 2);
+}
+
+#[test]
+fn breakdown_prompt_requests_sprints_on_project_track_only() {
+    let mut p = project(ProjectPhase::Drafting);
+    let (_s, prompt) = office::build_breakdown_prompt(&p, None, false);
+    assert!(prompt.contains("\"sprints\""), "project-track breakdown asks for a sprints array");
+    assert!(prompt.contains("group the tasks into ordered SPRINTS"));
+
+    p.track = "enhancement".to_string();
+    let (_s, e_prompt) = office::build_breakdown_prompt(&p, None, false);
+    assert!(!e_prompt.contains("group the tasks into ordered SPRINTS"), "enhancement is one implicit sprint");
+
+    p.track = "project".to_string();
+    let (_s, c_prompt) = office::build_breakdown_prompt(&p, None, true);
+    assert!(!c_prompt.contains("group the tasks into ordered SPRINTS"), "compact keeps the ask tiny");
+}
+
+#[test]
+fn sprint_review_prompt_renders_transcript_and_next_sprint() {
+    let p = project(ProjectPhase::Running);
+    let transcript = vec![
+        crate::domain::SprintLine { speaker: "nova".to_string(), line: "built the client".to_string() },
+        crate::domain::SprintLine { speaker: "reviewer".to_string(), line: "1 passed".to_string() },
+    ];
+    let next_tasks = vec![("shop/x/y/z".to_string(), "Next task".to_string())];
+    let (_s, prompt) = office::build_sprint_review_prompt(
+        &p,
+        "Ship it",
+        &transcript,
+        &["carried".to_string()],
+        Some(("Next goal", &next_tasks)),
+    );
+    assert!(prompt.contains("nova: built the client"));
+    assert!(prompt.contains("SPRINT-REVIEW"));
+    assert!(prompt.contains("Next goal") && prompt.contains("[shop/x/y/z]"));
+    assert!(prompt.contains("CARRY-OVER"));
+
+    // A last sprint (no next) -> summary only, no adjustments block offered.
+    let (_s2, last) = office::build_sprint_review_prompt(&p, "Ship it", &transcript, &[], None);
+    assert!(last.contains("LAST sprint"));
+    assert!(!last.contains("adjustments:"));
+}
+
+#[test]
+fn append_research_learnings_keeps_newest_within_cap() {
+    let existing = "old stack notes";
+    let out = office::append_research_learnings(existing, "sprint 1 learnings");
+    assert!(out.starts_with("sprint 1 learnings"), "newest learnings prepended");
+    assert!(out.contains("old stack notes"));
+    // An empty addition is a no-op.
+    assert_eq!(office::append_research_learnings(existing, "   "), existing);
+    // Over-cap keeps the newest head, drops the oldest tail.
+    let huge = "x".repeat(office::RESEARCH_NOTES_CAP);
+    let capped = office::append_research_learnings(&huge, "FRESH");
+    assert!(capped.starts_with("FRESH"));
+    assert!(capped.len() <= office::RESEARCH_NOTES_CAP);
 }

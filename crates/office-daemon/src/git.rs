@@ -207,6 +207,15 @@ impl Git {
         }
     }
 
+    /// Tag the repo's current main tip `tag` (feature: sprints) — the sprint boundary marker placed
+    /// after a sprint's last merge. `-f` so a re-fired ceremony (e.g. after an interrupt+resume)
+    /// re-points the tag to the same commit instead of failing "already exists". Best-effort: a
+    /// non-zero exit surfaces as [`GitError::Failed`] for the driver to TRACE, never a wedge.
+    pub fn tag(&self, repo: &Path, tag: &str) -> Result<(), GitError> {
+        self.run(repo, &["tag", "-f", tag])?;
+        Ok(())
+    }
+
     /// Remove a task's worktree + delete its branch (item 1). Best-effort and idempotent: each step
     /// is ignored on failure, and the desk dir is scrubbed even if it was never a registered
     /// worktree, so a stale/aborted setup never blocks a fresh one.

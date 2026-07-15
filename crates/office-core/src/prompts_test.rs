@@ -40,6 +40,7 @@ mod tests {
                 tasks: vec![TaskId("shop-crawler/e1-ingest/s2-parser/t4-retry-logic".to_string())],
             }],
             tasks: vec![base_task()],
+            sprints: Vec::new(),
             config: ProjectConfig::default_config(),
             outbox: Vec::new(),
             trace: Vec::new(),
@@ -120,6 +121,22 @@ mod tests {
         assert!(!prompt.contains("COMMENTS FROM THE BOARD"));
 
         assert!(prompt.len() < PROMPT_TARGET_CAP, "prompt was {} bytes", prompt.len());
+    }
+
+    #[test]
+    fn worker_prompt_folds_research_notes_when_present() {
+        // Sprints item 4: the researcher context feed reaches workers via research_notes.
+        let mut project = base_project();
+        project.research_notes = "## Sprint 1 review\n- nova: shipped the fetcher".to_string();
+        let task = project.tasks[0].clone();
+        let prompt = worker(&project, &task, Path::new("/d/desk"), Path::new("/d"), 1, None, &[]);
+        assert!(prompt.contains("OFFICE NOTES"), "notes folded in when present");
+        assert!(prompt.contains("shipped the fetcher"));
+
+        // Empty notes -> the section is omitted entirely (byte-identical to before the feature).
+        project.research_notes = String::new();
+        let bare = worker(&project, &task, Path::new("/d/desk"), Path::new("/d"), 1, None, &[]);
+        assert!(!bare.contains("OFFICE NOTES"), "omitted when empty");
     }
 
     #[test]

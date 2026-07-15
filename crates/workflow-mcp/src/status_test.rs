@@ -66,6 +66,7 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         epics: vec![],
         stories: vec![],
         tasks,
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: vec![],
         trace: vec![],

@@ -788,6 +788,7 @@ impl<H: Host> Driver<H> {
                 Effect::RemoveDesk { repo, desk, branch } => {
                     self.exec_remove_desk(&repo, &desk, &branch)
                 }
+                Effect::TagSprint { repo, tag } => self.exec_tag_sprint(&repo, &tag),
                 Effect::Spawn {
                     task,
                     prompt,
@@ -1176,6 +1177,7 @@ impl<H: Host> Driver<H> {
             epics: Vec::new(),
             stories: Vec::new(),
             tasks: Vec::new(),
+            sprints: Vec::new(),
             config: office_core::ProjectConfig::default_config(),
             outbox: Vec::new(),
             trace: Vec::new(),
@@ -1735,6 +1737,17 @@ impl<H: Host> Driver<H> {
         self.git.remove_worktree(repo, desk, branch);
     }
 
+    /// Tag the delivery repo at a sprint boundary (feature: sprints), serialized on the repo's git
+    /// mutex. Fire-and-forget best-effort exactly like `RemoveDesk`: a failure is TRACED (logged),
+    /// never wedges — the sprint-review ceremony fired independently and does not depend on the tag.
+    fn exec_tag_sprint(&mut self, repo: &Path, tag: &str) {
+        let gate = self.repo_lock(repo);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = self.git.tag(repo, tag) {
+            log_line(&format!("sprint tag '{tag}' failed: {}", e.reason()));
+        }
+    }
+
     // -- capacity + lookups -------------------------------------------------
 
     /// Session-global remaining office slots (5.2.3): the cap minus every in-flight worker
@@ -1947,6 +1960,8 @@ fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Opti
             InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {
                 "breaking down the plan"
             }
+            // Sprints (feature: sprints): the per-sprint review ceremony's single synthesis invoke.
+            InvokePurpose::SprintReview => "running the sprint review",
         };
         return Some(OfficeActivity { label: label.to_string(), since_ms: job.submitted_at_ms });
     }

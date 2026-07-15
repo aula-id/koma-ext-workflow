@@ -304,4 +304,42 @@ mod tests {
             ProjectPhase::Running
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Sprint sub-state machine (feature: sprints)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn step_sprint_walks_the_happy_path() {
+        assert_eq!(
+            step_sprint(&SprintStatus::Pending, SprintTransition::Activate).unwrap(),
+            SprintStatus::Active
+        );
+        assert_eq!(
+            step_sprint(&SprintStatus::Active, SprintTransition::Review).unwrap(),
+            SprintStatus::InReview
+        );
+        assert_eq!(
+            step_sprint(&SprintStatus::InReview, SprintTransition::Complete).unwrap(),
+            SprintStatus::Done
+        );
+    }
+
+    #[test]
+    fn step_sprint_rejects_illegal_edges() {
+        // Only the three forward edges are legal; every other pairing bounces.
+        for (from, t) in [
+            (SprintStatus::Pending, SprintTransition::Review),
+            (SprintStatus::Pending, SprintTransition::Complete),
+            (SprintStatus::Active, SprintTransition::Activate),
+            (SprintStatus::Active, SprintTransition::Complete),
+            (SprintStatus::InReview, SprintTransition::Activate),
+            (SprintStatus::InReview, SprintTransition::Review),
+            (SprintStatus::Done, SprintTransition::Activate),
+            (SprintStatus::Done, SprintTransition::Review),
+            (SprintStatus::Done, SprintTransition::Complete),
+        ] {
+            assert!(step_sprint(&from, t).is_err(), "{from:?} + {t:?} must be illegal");
+        }
+    }
 }

@@ -45,6 +45,10 @@ const CAP_TITLE: usize = 200;
 const CAP_INTENT: usize = 300;
 const CAP_DESCRIPTION: usize = 2500;
 const CAP_REVIEW_NOTES: usize = 1200;
+/// Byte cap for the office-notes block folded into the worker prompt (sprints item 4): stack
+/// research + prior-sprint learnings. Bounded so a long-running multi-sprint project's accreted
+/// notes never blow the worker prompt budget.
+const CAP_WORKER_NOTES: usize = 3000;
 const CAP_ACCEPTANCE_ITEM: usize = 200;
 const MAX_ACCEPTANCE_ITEMS: usize = 15;
 const CAP_COMMENT: usize = 200;
@@ -179,6 +183,15 @@ operations (commits, branches, merges).\n",
     // Tree hygiene (item 2): the worker must not seed the trash the reviewer would fail it for.
     out.push_str(HYGIENE_RULES);
     out.push('\n');
+
+    // Researcher context feed (sprints item 4): the stack research + accreted prior-sprint learnings
+    // live in `research_notes`; fold them in (bounded) so each sprint's workers build on what the
+    // office learned. Non-empty guarded, so a project without notes is byte-identical to before.
+    if !project.research_notes.trim().is_empty() {
+        out.push_str("OFFICE NOTES (stack research + prior-sprint learnings — apply where relevant):\n");
+        out.push_str(&truncate_bytes(&project.research_notes, CAP_WORKER_NOTES));
+        out.push_str("\n\n");
+    }
 
     if attempt > 1 || review_notes.is_some() {
         let notes = review_notes

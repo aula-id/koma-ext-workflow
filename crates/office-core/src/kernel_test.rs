@@ -59,6 +59,7 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         epics: Vec::new(),
         stories: Vec::new(),
         tasks,
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
         trace: Vec::new(),
@@ -3718,4 +3719,282 @@ fn escalated_patch_generates_hygiene_crd_and_audits_on_completion() {
     let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: pass\nreasons: fixed\n".into() }), 1200, 4);
     assert!(fx.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "completion audits against the hygiene CRD instead of skipping");
     assert!(matches!(p.phase, ProjectPhase::Running), "still Running — the audit gates Done, not an immediate completion");
+}
+
+// ---------------------------------------------------------------------------
+// Sprints (feature: sprints)
+// ---------------------------------------------------------------------------
+
+fn sprint(goal: &str, tasks: &[&str], status: SprintStatus) -> Sprint {
+    Sprint {
+        goal: goal.to_string(),
+        tasks: tasks.iter().map(|t| TaskId(t.to_string())).collect(),
+        status,
+        transcript: Vec::new(),
+    }
+}
+
+fn count_invokes(fx: &[Effect], want: InvokePurpose) -> usize {
+    fx.iter()
+        .filter(|e| matches!(e, Effect::InvokeModel { purpose, .. } if *purpose == want))
+        .count()
+}
+
+fn sprint_review_result(text: &str) -> Input {
+    Input::Command(Command::InvokeResult {
+        purpose: InvokePurpose::SprintReview,
+        outcome: Ok(text.to_string()),
+    })
+}
+
+#[test]
+fn sprint_dispatch_scoped_to_active_sprint() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Todo, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["t2"], SprintStatus::Pending),
+    ];
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(count_spawns(&fx), 1, "only the active sprint's task dispatches");
+    assert!(matches!(find_task(&p, "t1").state, TaskState::OnProgress { .. }));
+    assert!(matches!(find_task(&p, "t2").state, TaskState::Todo), "the pending sprint's task waits");
+}
+
+#[test]
+fn empty_sprints_dispatch_all_tasks_globally() {
+    // No sprints (patch / old state) -> the legacy global dispatch, unchanged.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Todo, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(count_spawns(&fx), 2, "empty sprints -> both tasks dispatch as before");
+}
+
+#[test]
+fn sprint_settles_and_opens_review_with_one_invoke() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS.into() }), 1000, 4);
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Done { .. }));
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview, "the settled sprint enters review");
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1, "EXACTLY one ceremony invoke");
+    assert!(matches!(p.phase, ProjectPhase::Running), "SprintReview is a sub-state of Running");
+}
+
+#[test]
+fn sprint_review_transcript_from_real_task_reports() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    p.tasks[0].last_report =
+        Some("OFFICE-REPORT\nstatus: complete\nsummary: wired the ingest pipeline\n".to_string());
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS.into() }), 1000, 4);
+    let tr = &p.sprints[0].transcript;
+    assert!(tr.iter().any(|l| l.line.contains("wired the ingest pipeline")), "worker line from the REAL report");
+    assert!(tr.iter().any(|l| l.speaker == "reviewer"), "a reviewer stats line is present");
+    assert!(tr.iter().any(|l| l.speaker == "researcher"), "the researcher observes silently");
+}
+
+#[test]
+fn sprint_review_carries_parked_task_into_next_sprint() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("t2", TaskState::Parked { reason: ParkReason::ReviewBounceBudget, attempt: 3 }, 0, &[]),
+            task("t3", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1", "t2"], SprintStatus::Active),
+        sprint("s2", &["t3"], SprintStatus::Pending),
+    ];
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1);
+
+    step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: done\n"), 1100, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Done);
+    assert_eq!(p.sprints[1].status, SprintStatus::Active, "the next sprint activates");
+    assert!(p.sprints[1].tasks.contains(&TaskId("t2".to_string())), "the parked task carried over");
+    assert!(!p.sprints[0].tasks.contains(&TaskId("t2".to_string())), "and left the closed sprint");
+}
+
+#[test]
+fn last_sprint_zero_carryover_finish_fires_audit() {
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.crd_markdown = "# CRD\n- README (100)".into();
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+
+    let fx1 = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+    assert!(!fx1.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "the audit waits for the review");
+
+    let fx2 = step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: shipped\n"), 1100, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Done);
+    assert!(fx2.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "the final audit fires after the LAST sprint");
+    assert!(matches!(p.phase, ProjectPhase::Running), "the audit gates Done");
+}
+
+#[test]
+fn sprint_review_pm_adjustments_add_and_drop_next_sprint_tasks() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("proj/s2/keep", TaskState::Todo, 0, &[]),
+            task("proj/s2/drop-me", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["proj/s2/keep", "proj/s2/drop-me"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle s1 -> review
+
+    let plan = "SPRINT-REVIEW\nsummary: reprioritize\nadjustments:\n- drop drop-me\n- add fresh work | build the new thing\n";
+    step(&mut p, sprint_review_result(plan), 1100, 4);
+
+    assert!(!p.tasks.iter().any(|t| t.id.0 == "proj/s2/drop-me"), "dropped task removed from the board");
+    assert!(!p.sprints[1].tasks.iter().any(|t| t.0 == "proj/s2/drop-me"), "and from the sprint");
+    assert!(p.tasks.iter().any(|t| t.id.0.contains("/added/") && t.title.contains("fresh work")), "added task on the board");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0.contains("/added/")), "and in the sprint");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "proj/s2/keep"), "the kept task remains");
+}
+
+#[test]
+fn sprint_review_garbage_result_carries_over_only() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("t2", TaskState::Parked { reason: ParkReason::WorkerBlocked("x".into()), attempt: 1 }, 0, &[]),
+            task("keep", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1", "t2"], SprintStatus::Active),
+        sprint("s2", &["keep"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    // A result with no SPRINT-REVIEW block -> no adjustments; carry-overs still move.
+    step(&mut p, sprint_review_result("the office said nothing parseable"), 1100, 4);
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "t2"), "parked task carried over despite garbage");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "keep"), "no task dropped");
+    assert_eq!(p.sprints[1].tasks.len(), 2);
+}
+
+#[test]
+fn sprint_review_errored_invoke_carries_over_only() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("keep", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["keep"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    let err = Input::Command(Command::InvokeResult {
+        purpose: InvokePurpose::SprintReview,
+        outcome: Err("model call timed out".to_string()),
+    });
+    step(&mut p, err, 1100, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Done, "the ceremony still finishes on an error");
+    assert_eq!(p.sprints[1].status, SprintStatus::Active);
+}
+
+#[test]
+fn sprint_review_emits_git_tag_in_worktree_mode() {
+    let mut p = worktree_project(vec![task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[])]);
+    p.tasks[0].awaiting_merge = true; // the reviewer passed; the merge is landing
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    let fx = step(&mut p, Input::Host(HostEvent::DeskMerged { task: TaskId("t1".to_string()) }), 1000, 4);
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Done { .. }));
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::TagSprint { tag, .. } if tag == "sprint-1")),
+        "the delivery repo is tagged sprint-1 after the sprint's last merge"
+    );
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1);
+}
+
+#[test]
+fn interrupt_during_sprint_review_kills_nothing_and_resume_re_enters() {
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // -> InReview + one invoke fired
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+
+    let fx_int = step(&mut p, Input::Command(Command::Interrupt { hard: true }), 1100, 4);
+    assert!(!fx_int.iter().any(|e| matches!(e, Effect::Kill { .. })), "no live agent to kill during a review");
+    assert!(matches!(p.phase, ProjectPhase::Interrupted));
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview, "the review is remembered across the interrupt");
+
+    let fx_res = step(&mut p, Input::Command(Command::Resume), 1200, 4);
+    assert!(matches!(p.phase, ProjectPhase::Running));
+    assert_eq!(count_invokes(&fx_res, InvokePurpose::SprintReview), 1, "the ceremony re-enters cleanly on resume");
+}
+
+#[test]
+fn empty_sprints_completes_via_legacy_flow_with_no_ceremony() {
+    // Patch track / old state: no sprints -> the legacy all-Done completion, no ceremony invoke.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS.into() }), 1000, 4);
+    assert!(matches!(p.phase, ProjectPhase::Done { .. }), "no CRD + no sprints -> completes immediately");
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 0, "no ceremony for the legacy flow");
+}
+
+#[test]
+fn last_sprint_parked_carryover_halts_via_trailing_sprint() {
+    // The single sprint settles with a parked task; its review opens a trailing sprint that is
+    // immediately stuck -> the project HALTS (breaking any infinite-ceremony loop).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("t2", TaskState::Parked { reason: ParkReason::ReviewBounceBudget, attempt: 3 }, 0, &[]),
+        ],
+    );
+    p.sprints = vec![sprint("s1", &["t1", "t2"], SprintStatus::Active)];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+
+    step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: x\n"), 1100, 4);
+    assert_eq!(p.sprints.len(), 2, "a trailing sprint opened for the lone carry-over");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "t2"));
+    assert!(matches!(p.phase, ProjectPhase::Halted { .. }), "the stuck trailing sprint halts — no loop");
+}
+
+#[test]
+fn sprint_review_feeds_transcript_into_research_notes() {
+    // item 4: the sprint-review transcript + PM summary are folded into research_notes (capped).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[]), task("keep", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["keep"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle -> review
+    step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: pipeline shipped\n"), 1100, 4);
+    assert!(p.research_notes.contains("Sprint 1 review"), "the transcript header is fed into research_notes");
+    assert!(p.research_notes.contains("pipeline shipped"), "including the PM summary line");
 }

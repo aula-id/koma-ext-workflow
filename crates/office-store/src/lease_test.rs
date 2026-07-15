@@ -160,6 +160,7 @@ fn seed_project(store: &Store, slug: &str) {
             awaiting_merge: false,
             dispatch_after_ms: 0,
         }],
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
         trace: Vec::new(),

@@ -196,6 +196,53 @@ pub enum ProjectPhase {
     Done { at_ms: u64 },
 }
 
+/// The lifecycle status of one sprint (feature: sprints). A project-track breakdown groups its
+/// tasks into ordered sprints; the office grinds ONE sprint at a time. `Pending` = not yet started;
+/// `Active` = its tasks are the ones dispatch currently considers; `InReview` = every task settled
+/// and the (theater-over-real-data) sprint-review ceremony is in flight; `Done` = the ceremony
+/// finished and its carry-overs (if any) were folded into the next sprint. There is at most ONE
+/// `Active` (grinding) or `InReview` (ceremony) sprint at a time — the machine.rs `step_sprint`
+/// pure function owns the legal edges. `Copy` so the many read-side comparisons stay ergonomic;
+/// a distinct `#[serde(default = ..)]` is unnecessary because whole `Sprint` records are only ever
+/// written by this build (old state has an EMPTY `Project.sprints`, the legacy no-sprint flow).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SprintStatus {
+    Pending,
+    Active,
+    InReview,
+    Done,
+}
+
+/// One line of a sprint-review ceremony transcript (feature: sprints): a `(speaker, line)` pair the
+/// UI replays as a chat bubble. Speakers are worker persona short names (`nova`, ...), `reviewer`,
+/// `researcher` (a silent observer), and `office` (the PM's synthesis line, appended last when the
+/// single ceremony invoke returns). Assembled PROGRAMMATICALLY from the sprint's tasks' real
+/// OFFICE-REPORT/OFFICE-REVIEW data — the one model invoke only adds the PM's closing line.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SprintLine {
+    pub speaker: String,
+    pub line: String,
+}
+
+/// One sprint of a project-track plan (feature: sprints). `goal` is the model-authored one-line
+/// increment goal; `tasks` are the task ids grinding under this sprint (plus any carry-overs folded
+/// in from a prior sprint's review); `status` drives the sprint sub-state machine; `transcript` is
+/// the sprint-review ceremony chat (empty until the sprint enters `InReview`). A patch board and
+/// pre-feature (or otherwise sprint-less) state carry an EMPTY `Project.sprints` and run the legacy
+/// no-sprint flow unchanged; sprints engage only when the breakdown (or the enhancement wrap)
+/// populates this.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Sprint {
+    pub goal: String,
+    pub tasks: Vec<TaskId>,
+    pub status: SprintStatus,
+    /// The sprint-review ceremony transcript (feature: sprints). `#[serde(default)]` so a sprint
+    /// record persisted before the transcript existed (there are none in practice, but the field is
+    /// the one most likely to be added-to later) still loads clean.
+    #[serde(default)]
+    pub transcript: Vec<SprintLine>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMsg {
     pub who: ChatAuthor,
@@ -424,6 +471,14 @@ pub struct Project {
     pub epics: Vec<Epic>,
     pub stories: Vec<Story>,
     pub tasks: Vec<Task>,
+    /// Ordered sprints of a project-track plan (feature: sprints). The breakdown groups tasks into
+    /// sprints (each with a one-line goal); the office grinds ONE sprint at a time, runs a review
+    /// ceremony between sprints, and completes only when the LAST sprint's review clears with zero
+    /// carry-overs. EMPTY for the patch track and for pre-feature / sprint-less state — that empty
+    /// case is the legacy no-sprint flow (global dispatch, all-Done completion), so old state loads
+    /// and behaves EXACTLY as before. `#[serde(default)]` for that back-compat.
+    #[serde(default)]
+    pub sprints: Vec<Sprint>,
     pub config: ProjectConfig,
     pub outbox: Vec<OutboundNotice>,
     /// Machine-diary trace ring (feature: tracelog): a capped, newest-last log of what the office

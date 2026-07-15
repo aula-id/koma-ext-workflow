@@ -11,7 +11,7 @@ use crate::host::FakeHost;
 use office_core::digest::OfficeActivity;
 use office_core::{
     AgentBinding, AgentKind, ChatAuthor, InvokePurpose, OutboundNotice, Project, ProjectConfig,
-    ProjectPhase, Task, TaskId, TaskState,
+    ProjectPhase, Sprint, SprintStatus, Task, TaskId, TaskState,
 };
 use office_store::Store;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -85,6 +85,7 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         epics: vec![],
         stories: vec![],
         tasks,
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: vec![],
         trace: vec![],
@@ -1673,4 +1674,64 @@ fn worktree_merge_conflict_bounces_the_task() {
     );
     // Main is left clean (aborted merge): still the main-side content.
     assert_eq!(std::fs::read_to_string(delivery.join("shared.txt")).unwrap(), "main-side\n");
+}
+
+#[test]
+fn sprint_tag_failure_is_traced_not_wedged() {
+    // Sprints (feature: sprints): a sprint's last merge tags the delivery repo `sprint-1`. If
+    // `git tag` fails, the driver TRACES it (logs) and the review ceremony still opens — the tag is
+    // fire-and-forget, never a wedge.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" }));
+    host.script("agents.result", json!({ "agentId": 101, "output": "OFFICE-REPORT\nstatus: complete\nsummary: did it\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 202, "status": "spawned" }));
+    host.script("agents.result", json!({ "agentId": 202, "output": "OFFICE-REVIEW\nverdict: pass\nreasons: ok\n" }));
+    let mut d = driver(store, host);
+
+    let (mut p, ws) = worktree_setup("auth", vec![task("auth/t1", TaskState::Todo)]);
+    let delivery = p.delivery_path.clone().unwrap();
+
+    // A git wrapper that forwards to real git for everything EXCEPT the `tag` subcommand (exit 1).
+    // Every driver op passes `-C <cwd>` first, so the tag op's argv is `-C <cwd> tag -f <name>` and
+    // `$3` is exactly `tag`; commit/merge carry `-c ..` committer flags first, so their `$3` is not.
+    let wrapper = ws.path().join("git-notag.sh");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nif [ \"$3\" = tag ]; then echo 'tag disabled' 1>&2; exit 1; fi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    p.sprints = vec![Sprint {
+        goal: "ship it".to_string(),
+        tasks: vec![TaskId("auth/t1".to_string())],
+        status: SprintStatus::Active,
+        transcript: vec![],
+    }];
+    d.insert_for_test(p, 1_000);
+    // Install the wrapper AFTER worktree_setup's real `git init`, BEFORE any driver git op.
+    d.set_git_bin(wrapper.display().to_string());
+
+    let desk = desk_of(&ws, "auth", "t1");
+    d.on_tick(1_000); // worktree add + worker spawn
+    std::fs::write(desk.join("feature.rs"), "fn f() {}\n").unwrap();
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }), 2_000);
+    // reviewer pass -> merge -> Done -> sprint settles -> TagSprint (FAILS) + review ceremony opens.
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 202, status: "done".to_string(), error: None }), 3_000);
+
+    let proj = d.project("auth").unwrap();
+    assert!(matches!(proj.tasks[0].state, TaskState::Done { .. }), "the merge still completed");
+    assert_eq!(proj.sprints[0].status, SprintStatus::InReview, "the review opened despite the tag failure");
+
+    // The tag genuinely failed (via the wrapper), so no sprint-1 tag exists — yet nothing wedged.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&delivery)
+        .args(["tag", "-l"])
+        .output()
+        .unwrap();
+    let tags = String::from_utf8_lossy(&out.stdout);
+    assert!(!tags.contains("sprint-1"), "the tag failed, so no sprint-1 ref was created");
 }

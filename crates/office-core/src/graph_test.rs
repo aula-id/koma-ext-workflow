@@ -72,6 +72,7 @@ mod tests {
             epics: vec![],
             stories: vec![],
             tasks,
+            sprints: Vec::new(),
             config: ProjectConfig::default_config(),
             outbox: vec![],
             trace: vec![],

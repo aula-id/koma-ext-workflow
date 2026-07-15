@@ -60,6 +60,7 @@ fn project(slug: &str) -> Project {
         epics: Vec::new(),
         stories: Vec::new(),
         tasks: vec![one_task("t1")],
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
         trace: Vec::new(),

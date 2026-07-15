@@ -23,7 +23,7 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{ChatAuthor, ChatMsg, Epic, EpicId, Project, ProjectPhase, Story, StoryId, Task, TaskId, TaskState};
+use crate::domain::{ChatAuthor, ChatMsg, Epic, EpicId, Project, ProjectPhase, Sprint, SprintLine, SprintStatus, Story, StoryId, Task, TaskId, TaskState};
 use crate::graph;
 use crate::machine::{step_project, ProjectTransition};
 use crate::prompts;
@@ -101,6 +101,14 @@ pub enum InvokePurpose {
     /// items are recorded as disclosed (`self_resolved_assumptions`) and the gate clears anyway. The
     /// doc-set is recovered from state (`newest_gated_doc`), so one Copy variant suffices.
     AssumeVerify,
+    /// The per-sprint review CEREMONY synthesis (feature: sprints). Fired EXACTLY ONCE when a
+    /// sprint's tasks all settle: the transcript (worker/reviewer/researcher lines) is assembled
+    /// PROGRAMMATICALLY from real task data first, and this single invoke only adds the PM's closing
+    /// line + any adjustments to the NEXT sprint (parsed defensively — unparseable => carry-overs
+    /// only). Runs on the `office_role` like a persona reply, but is NOT a doc-drafting invoke, so
+    /// it is emitted via `emit_invoke` and does NOT take the `drafter_model` override (which stays
+    /// scoped to actual PRD/TRD/CRD authoring). The result routes to `finish_sprint_review`.
+    SprintReview,
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +520,94 @@ existing: yes | no   (does the brief target an EXISTING delivery? only meaningfu
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
+/// Append sprint-review learnings to `existing` research notes, keeping the NEWEST content within
+/// [`RESEARCH_NOTES_CAP`] (feature: sprints item 4). The addition is PREPENDED, then the combined
+/// text is tail-truncated by [`truncate_bytes`] — so the just-learned sprint findings (most relevant
+/// to the next sprint) always survive the cap, and the oldest stack research is dropped first when
+/// the budget is exceeded. An empty addition is a no-op.
+pub fn append_research_learnings(existing: &str, addition: &str) -> String {
+    if addition.trim().is_empty() {
+        return existing.to_string();
+    }
+    let combined = if existing.trim().is_empty() {
+        addition.to_string()
+    } else {
+        format!("{addition}\n\n{existing}")
+    };
+    truncate_bytes(&combined, RESEARCH_NOTES_CAP)
+}
+
+/// Build the sprint-review CEREMONY synthesis `(system, prompt)` for `models.invoke` (feature:
+/// sprints). The transcript participant lines (`transcript`) were assembled PROGRAMMATICALLY from
+/// real task data — this single invoke only asks the PM to (1) write a short sprint summary and (2)
+/// optionally adjust the NEXT sprint's task list. Runs on the `office_role` (see
+/// [`InvokePurpose::SprintReview`]). Pure + byte-bounded like every other builder. `next` is the
+/// next sprint's `(goal, [(task-id, title)])` the PM may edit — `None` when this is the last sprint
+/// (no adjustments possible, summary only).
+pub fn build_sprint_review_prompt(
+    p: &Project,
+    sprint_goal: &str,
+    transcript: &[SprintLine],
+    carry_over_titles: &[String],
+    next: Option<(&str, &[(String, String)])>,
+) -> (String, String) {
+    let system = prompts::office_system(&board_digest(p));
+    let mut prompt = String::new();
+    prompt.push_str(&format!(
+        "You are the Workflow front office (delivery manager) running the review for the sprint whose \
+goal was:\n{}\n\n",
+        truncate_bytes(sprint_goal.trim(), 400)
+    ));
+    prompt.push_str("THE ROOM ALREADY REPORTED (real data — do not contradict it):\n");
+    let mut room = String::new();
+    for line in transcript {
+        room.push_str(&format!("{}: {}\n", line.speaker, line.line));
+    }
+    prompt.push_str(&truncate_bytes(&room, HARD_PROMPT_CAP / 3));
+
+    if carry_over_titles.is_empty() {
+        prompt.push_str("\nCARRY-OVER: none — every task in this sprint reached done.\n");
+    } else {
+        prompt.push_str("\nCARRY-OVER (tasks NOT completed this sprint — they move to the next sprint):\n");
+        let list: String = carry_over_titles.iter().map(|t| format!("- {t}\n")).collect();
+        prompt.push_str(&truncate_bytes(&list, HARD_PROMPT_CAP / 6));
+    }
+
+    match next {
+        Some((next_goal, tasks)) => {
+            prompt.push_str(&format!(
+                "\nNEXT SPRINT — goal: {}\nits currently-planned tasks (you MAY adjust them):\n",
+                truncate_bytes(next_goal.trim(), 300)
+            ));
+            let list: String = tasks
+                .iter()
+                .map(|(id, title)| format!("- [{}] {}\n", id, truncate_bytes(title.trim(), 120)))
+                .collect();
+            prompt.push_str(&truncate_bytes(&list, HARD_PROMPT_CAP / 4));
+            prompt.push_str(
+                "\nSynthesize a SHORT sprint summary, then adjust the NEXT sprint's task list ONLY if \
+what you learned this sprint warrants it. Output ONLY this block, nothing else:\n\
+SPRINT-REVIEW\n\
+summary: <2-4 lines: what shipped, and what carried over and why>\n\
+adjustments:\n\
+- drop <exact task id above to remove>\n\
+- add <new task title> | <one-line description>\n\
+- modify <exact task id above> | <new one-line description>\n\
+(omit the '- ' lines entirely when nothing should change — carry-overs move over either way)\n",
+            );
+        }
+        None => {
+            prompt.push_str(
+                "\nThis was the LAST sprint — there is no next sprint to adjust. Output ONLY this \
+block, nothing else:\n\
+SPRINT-REVIEW\n\
+summary: <2-4 lines: what shipped across the project>\n",
+            );
+        }
+    }
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
 /// A minimal, gradeable clean-build CRD for the ENHANCEMENT track (feature: sdlc-triage). An
 /// enhancement inherits the existing delivery's requirements, so only clean-build HYGIENE is graded
 /// here — the completion auditor still needs a checklist + a rubric summing to 100. Generated
@@ -568,6 +664,19 @@ Rules: every slug is unique and [a-z0-9-]; acceptance is non-empty; blocked_by l
 slugs only; the blocked_by graph is acyclic; add a blocked_by edge between tasks that write \
 the same file.\n",
     );
+    // Sprint grouping (feature: sprints), project track only — the enhancement track is a scoped
+    // change that stays a single implicit sprint, and compact mode drops it to keep the ask tiny.
+    // Absent/partial/garbage `sprints` is safe: the validator falls back to one all-tasks sprint.
+    if p.track != "enhancement" && !compact {
+        prompt.push_str(
+            "\nAlso group the tasks into ordered SPRINTS — each a shippable increment with a \
+one-line goal — by adding a top-level \"sprints\" array alongside \"epics\":\n\
+\"sprints\":[{\"goal\":\"..\",\"tasks\":[\"task-slug\",\"task-slug\"]}]\n\
+Every task slug appears in EXACTLY ONE sprint; order sprints so a task's blocked_by prerequisites \
+land in the same sprint or an earlier one; a small plan may be a SINGLE sprint. Use the task slugs \
+exactly as above.\n",
+        );
+    }
     // SDLC enhancement track (feature: sdlc-triage): a scoped change is small by definition — cap the
     // plan to 1-3 tasks in one epic. The kernel escalates to the full project track if the model
     // returns more than 3 anyway (wider scope than a change).
@@ -883,6 +992,19 @@ pub enum BreakdownError {
 struct RawBreakdown {
     #[serde(default)]
     epics: Vec<RawEpic>,
+    /// Optional ordered sprint grouping (feature: sprints), project track only. Each sprint carries
+    /// a one-line goal and the task slugs it delivers. ABSENT / empty is fully back-compatible — the
+    /// validator then falls back to a single implicit sprint of every task. `#[serde(default)]`.
+    #[serde(default)]
+    sprints: Vec<RawSprint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSprint {
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    tasks: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -928,6 +1050,18 @@ struct RawTask {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Breakdown {
     epics: Vec<VEpic>,
+    /// Ordered sprint grouping (feature: sprints): each entry is a `(goal, task-slugs)` pair. ALWAYS
+    /// non-empty and a partition of every task slug — [`parse_breakdown`] normalizes a missing /
+    /// partial / garbage `sprints` array into a single implicit sprint of all tasks, and appends any
+    /// task the model forgot to the last sprint, so `apply_breakdown` never has to reason about it.
+    sprints: Vec<VSprint>,
+}
+
+/// One validated sprint (feature: sprints): a goal + the raw task slugs it delivers, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VSprint {
+    goal: String,
+    tasks: Vec<String>,
 }
 
 impl Breakdown {
@@ -1060,7 +1194,73 @@ pub fn parse_breakdown(raw: &str) -> Result<Breakdown, BreakdownError> {
         return Err(BreakdownError::Cycle(cycle.nodes.into_iter().map(|id| id.0).collect()));
     }
 
-    Ok(Breakdown { epics })
+    // Sprint grouping (feature: sprints) is LENIENT — it never rejects a breakdown. The ordered
+    // task slugs (board order) are the partition domain; `group_sprints` assigns them to the
+    // model's sprints when present and valid, and falls back to a single all-tasks sprint otherwise.
+    let ordered: Vec<String> = epics
+        .iter()
+        .flat_map(|e| e.stories.iter())
+        .flat_map(|s| s.tasks.iter())
+        .map(|t| t.slug.clone())
+        .collect();
+    let sprints = group_sprints(&ordered, &parsed.sprints);
+
+    Ok(Breakdown { epics, sprints })
+}
+
+/// The goal stamped on a single implicit sprint (feature: sprints) when the breakdown carried no
+/// usable sprint grouping — the whole plan is one increment.
+pub const DEFAULT_SPRINT_GOAL: &str = "Deliver the planned work";
+
+/// Group the ordered task slugs into sprints (feature: sprints), LENIENTLY — this never fails.
+/// `ordered` is every task slug in board order; `raw` is the model's (possibly absent / partial /
+/// garbage) `sprints` array. Rules, in order:
+///   1. For each raw sprint, keep only slugs that EXIST and were not already claimed by an earlier
+///      sprint (dedupe + drop unknowns); a sprint that ends up empty is dropped.
+///   2. Any task not claimed by a surviving sprint is appended to the LAST surviving sprint, so the
+///      result is always a partition of every task (nothing is ever orphaned).
+///   3. If no sprint survives (no `sprints`, all empty/garbage), fall back to ONE sprint of every
+///      task with [`DEFAULT_SPRINT_GOAL`].
+///
+/// The output is ALWAYS non-empty and covers every slug exactly once.
+fn group_sprints(ordered: &[String], raw: &[RawSprint]) -> Vec<VSprint> {
+    let known: std::collections::HashSet<&str> = ordered.iter().map(String::as_str).collect();
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sprints: Vec<VSprint> = Vec::new();
+
+    for rs in raw {
+        let mut tasks: Vec<String> = Vec::new();
+        for slug in &rs.tasks {
+            if known.contains(slug.as_str()) && claimed.insert(slug.clone()) {
+                tasks.push(slug.clone());
+            }
+        }
+        if tasks.is_empty() {
+            continue; // an all-unknown / already-claimed / empty sprint contributes nothing
+        }
+        let goal = if rs.goal.trim().is_empty() {
+            DEFAULT_SPRINT_GOAL.to_string()
+        } else {
+            rs.goal.trim().to_string()
+        };
+        sprints.push(VSprint { goal, tasks });
+    }
+
+    // Any task the model forgot to place goes into the last surviving sprint (in board order).
+    let leftover: Vec<String> = ordered.iter().filter(|s| !claimed.contains(*s)).cloned().collect();
+    if sprints.is_empty() {
+        // No usable grouping at all -> one implicit sprint of every task (the back-compat default).
+        return vec![VSprint {
+            goal: DEFAULT_SPRINT_GOAL.to_string(),
+            tasks: ordered.to_vec(),
+        }];
+    }
+    if !leftover.is_empty() {
+        if let Some(last) = sprints.last_mut() {
+            last.tasks.extend(leftover);
+        }
+    }
+    sprints
 }
 
 fn check_slug(slug: &str, seen: &mut std::collections::HashSet<String>) -> Result<(), BreakdownError> {
@@ -1170,9 +1370,43 @@ pub fn apply_breakdown(p: &mut Project, b: Breakdown) {
     p.stories = stories;
     p.tasks = tasks;
 
+    // Sprints (feature: sprints): resolve each sprint's raw slugs to full task ids via the same map,
+    // and mark the FIRST sprint Active (dispatch scopes to it the moment the project is authorized),
+    // the rest Pending. `group_sprints` already guaranteed a non-empty partition of every task.
+    p.sprints = build_sprints(&b.sprints, &task_id);
+
     if let Ok(phase) = step_project(&p.phase, ProjectTransition::AcceptBreakdown) {
         p.phase = phase;
     }
+}
+
+/// Build the domain [`Sprint`] list from the validated `VSprint`s and the slug -> full-`TaskId` map
+/// (feature: sprints). The FIRST sprint is `Active` (the office grinds it first), every later one
+/// `Pending`. Unknown slugs are filtered defensively (they cannot occur — the map is built from the
+/// same tasks — but never trust the model's slugs blindly). A resulting empty sprint is dropped;
+/// if that somehow leaves nothing, the caller keeps the pre-existing (empty) sprint list, which the
+/// kernel treats as the legacy no-sprint flow.
+fn build_sprints(
+    vsprints: &[VSprint],
+    task_id: &std::collections::HashMap<String, TaskId>,
+) -> Vec<Sprint> {
+    let mut out: Vec<Sprint> = Vec::new();
+    for vs in vsprints {
+        let tasks: Vec<TaskId> = vs.tasks.iter().filter_map(|s| task_id.get(s).cloned()).collect();
+        if tasks.is_empty() {
+            continue;
+        }
+        out.push(Sprint {
+            goal: vs.goal.clone(),
+            tasks,
+            status: SprintStatus::Pending,
+            transcript: Vec::new(),
+        });
+    }
+    if let Some(first) = out.first_mut() {
+        first.status = SprintStatus::Active;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

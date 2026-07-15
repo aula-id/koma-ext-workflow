@@ -354,6 +354,15 @@ mod tests {
                     dispatch_after_ms: 0,
                 },
             ],
+            sprints: vec![Sprint {
+                goal: "First increment".to_string(),
+                tasks: vec![TaskId("shop-crawler/e1-ingest/s1-parse/t1-http".to_string())],
+                status: SprintStatus::InReview,
+                transcript: vec![SprintLine {
+                    speaker: "nova".to_string(),
+                    line: "delivered the http fetcher".to_string(),
+                }],
+            }],
             config: ProjectConfig {
                 max_workers: 2,
                 bounce_budget: 3,

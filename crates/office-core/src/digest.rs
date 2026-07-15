@@ -1,7 +1,7 @@
 //! Size-capped digest builders: the `context.set` board blob (ARCHITECTURE.md 6.6)
 //! and the panel snapshot JSON (ARCHITECTURE.md 10.2), full and summary modes.
 
-use crate::domain::{ChatAuthor, Column, Comment, CommentAuthor, ParkReason, Project, ProjectPhase, Receipt, Task, TaskState};
+use crate::domain::{ChatAuthor, Column, Comment, CommentAuthor, ParkReason, Project, ProjectPhase, Receipt, Sprint, SprintStatus, Task, TaskState};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -38,6 +38,38 @@ fn phase_str(phase: &ProjectPhase) -> &'static str {
 
 fn is_running_state(state: &TaskState) -> bool {
     matches!(state, TaskState::OnProgress { .. } | TaskState::Review { .. })
+}
+
+/// The wire string for a sprint status (feature: sprints).
+fn sprint_status_str(s: &SprintStatus) -> &'static str {
+    match s {
+        SprintStatus::Pending => "pending",
+        SprintStatus::Active => "active",
+        SprintStatus::InReview => "inreview",
+        SprintStatus::Done => "done",
+    }
+}
+
+/// How many of a sprint's tasks are Done (feature: sprints) — the `n` in the `n/m` progress.
+fn sprint_done_count(p: &Project, sprint: &Sprint) -> usize {
+    sprint
+        .tasks
+        .iter()
+        .filter(|tid| {
+            p.tasks
+                .iter()
+                .any(|t| &t.id == *tid && matches!(t.state, TaskState::Done { .. }))
+        })
+        .count()
+}
+
+/// The index of the project's CURRENT sprint (feature: sprints): the `Active` one, else the
+/// `InReview` one (ceremony in flight). `None` for the legacy no-sprint flow or once all are Done.
+fn current_sprint_idx(p: &Project) -> Option<usize> {
+    p.sprints
+        .iter()
+        .position(|s| matches!(s.status, SprintStatus::Active))
+        .or_else(|| p.sprints.iter().position(|s| matches!(s.status, SprintStatus::InReview)))
 }
 
 /// Up to two "halt/park" one-liners for a project's `attention:` line: the halt
@@ -96,6 +128,23 @@ fn project_line(p: &Project) -> String {
         parked,
         delivery
     );
+
+    // Sprints (feature: sprints): a compact current-sprint line (index/count, goal, n/m tasks, and
+    // whether the review is in flight). Omitted for the legacy no-sprint flow.
+    if let Some(i) = current_sprint_idx(p) {
+        let s = &p.sprints[i];
+        let done = sprint_done_count(p, s);
+        let review = if matches!(s.status, SprintStatus::InReview) { " (in review)" } else { "" };
+        line.push_str(&format!(
+            "  sprint {}/{}: {} ({}/{} tasks){}\n",
+            i + 1,
+            p.sprints.len(),
+            truncate_bytes(s.goal.trim(), 80),
+            done,
+            s.tasks.len(),
+            review
+        ));
+    }
 
     let attn = attention_lines(p);
     if !attn.is_empty() {
@@ -336,6 +385,46 @@ fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeAct
             "researchMode": p.config.research_mode,
             "drafterModel": p.config.drafter_model,
         });
+        // Sprints (feature: sprints): the full sprint list with statuses + n/m progress, and a
+        // pointer to the CURRENT sprint (index/goal/progress + whether its review is in flight).
+        // During a review the reviewed sprint carries its ceremony transcript so the UI can replay
+        // it as chat bubbles. Empty/absent for the legacy no-sprint flow. Full mode only.
+        if !p.sprints.is_empty() {
+            obj["sprints"] = json!(p
+                .sprints
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let mut so = json!({
+                        "index": i,
+                        "goal": s.goal,
+                        "status": sprint_status_str(&s.status),
+                        "total": s.tasks.len(),
+                        "done": sprint_done_count(p, s),
+                        "tasks": s.tasks.iter().map(|t| t.0.clone()).collect::<Vec<_>>(),
+                    });
+                    if matches!(s.status, SprintStatus::InReview) {
+                        so["transcript"] = json!(s
+                            .transcript
+                            .iter()
+                            .map(|l| json!({ "speaker": l.speaker, "text": l.line }))
+                            .collect::<Vec<_>>());
+                    }
+                    so
+                })
+                .collect::<Vec<_>>());
+            if let Some(i) = current_sprint_idx(p) {
+                let s = &p.sprints[i];
+                obj["activeSprint"] = json!({
+                    "index": i,
+                    "count": p.sprints.len(),
+                    "goal": s.goal,
+                    "total": s.tasks.len(),
+                    "done": sprint_done_count(p, s),
+                    "inReview": matches!(s.status, SprintStatus::InReview),
+                });
+            }
+        }
     }
 
     obj

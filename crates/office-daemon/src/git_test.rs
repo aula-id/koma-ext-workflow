@@ -226,3 +226,32 @@ fn missing_git_binary_is_not_found() {
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
+
+// Sprints (feature: sprints): the `tag` method used at each sprint boundary.
+
+#[test]
+fn tag_marks_the_tip_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = git();
+    g.init_repo(dir.path()).expect("init");
+    g.tag(dir.path(), "sprint-1").expect("tag");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["tag", "-l"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sprint-1"), "tag created");
+    // `-f` makes a re-fire (e.g. after interrupt+resume) idempotent, not an "already exists" error.
+    g.tag(dir.path(), "sprint-1").expect("re-tag is idempotent");
+}
+
+#[test]
+fn tag_on_missing_git_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Git::new("/nonexistent/definitely-not-git");
+    match g.tag(dir.path(), "sprint-1") {
+        Err(GitError::NotFound(_)) => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}

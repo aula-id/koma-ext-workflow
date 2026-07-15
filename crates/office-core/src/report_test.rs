@@ -319,4 +319,41 @@ mod tests {
         let v = parse_triage("```\nsdlc-triage\nTRACK: Enhancement\nrationale: scoped change\n```\n");
         assert_eq!(v.track, TriageTrack::Enhancement);
     }
+
+    // -----------------------------------------------------------------------
+    // SPRINT-REVIEW (feature: sprints)
+    // -----------------------------------------------------------------------
+    use crate::report::{parse_sprint_review, SprintAdjustmentKind};
+
+    #[test]
+    fn parse_sprint_review_extracts_summary_and_adjustments() {
+        let text = "prose\nSPRINT-REVIEW\nsummary: shipped the http client; retry carried over because the API was flaky\nadjustments:\n- drop old-task\n- add caching layer | add an LRU cache in front of the client\n- modify retry-task | use exponential backoff\n";
+        let plan = parse_sprint_review(text);
+        assert!(plan.summary.contains("shipped the http client"));
+        assert_eq!(plan.adjustments.len(), 3);
+        assert_eq!(plan.adjustments[0].kind, SprintAdjustmentKind::Drop);
+        assert_eq!(plan.adjustments[0].target, "old-task");
+        assert_eq!(plan.adjustments[1].kind, SprintAdjustmentKind::Add);
+        assert_eq!(plan.adjustments[1].target, "caching layer");
+        assert_eq!(plan.adjustments[1].text, "add an LRU cache in front of the client");
+        assert_eq!(plan.adjustments[2].kind, SprintAdjustmentKind::Modify);
+        assert_eq!(plan.adjustments[2].target, "retry-task");
+        assert_eq!(plan.adjustments[2].text, "use exponential backoff");
+    }
+
+    #[test]
+    fn parse_sprint_review_garbage_yields_empty() {
+        // No SPRINT-REVIEW block at all -> default (empty), so the ceremony carries over only.
+        let plan = parse_sprint_review("the office rambled but emitted no block");
+        assert!(plan.summary.is_empty());
+        assert!(plan.adjustments.is_empty());
+    }
+
+    #[test]
+    fn parse_sprint_review_ignores_unknown_verbs_and_empty_targets() {
+        let text = "SPRINT-REVIEW\nsummary: ok\nadjustments:\n- frobnicate the widget\n- drop\n- add | only a description\n";
+        let plan = parse_sprint_review(text);
+        // 'frobnicate' is not a verb; bare 'drop' has no target; 'add | ..' has an empty title.
+        assert!(plan.adjustments.is_empty(), "got {:?}", plan.adjustments);
+    }
 }

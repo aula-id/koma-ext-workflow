@@ -62,10 +62,11 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::{
     AgentBinding, AgentKind, ChatAuthor, ChatMsg, Comment, CommentAuthor, CommentId, ParkReason,
-    Project, ProjectPhase, Receipt, Task, TaskEvent, TaskId, TaskState, TraceEvent,
+    Project, ProjectPhase, Receipt, Sprint, SprintLine, SprintStatus, Task, TaskEvent, TaskId,
+    TaskState, TraceEvent,
 };
 use crate::graph::{self, ready_set};
-use crate::machine::{step_project, ProjectTransition};
+use crate::machine::{step_project, step_sprint, ProjectTransition, SprintTransition};
 use crate::office::{self, InvokePurpose};
 use crate::prompts;
 use crate::report::{self, ReportStatus, Verdict};
@@ -387,6 +388,14 @@ pub enum Effect {
         desk: PathBuf,
         branch: String,
     },
+    /// Sprints (feature: sprints): tag the delivery repo `sprint-<n>` after a sprint's last merge,
+    /// emitted when the sprint enters its review. Fire-and-forget best-effort like `RemoveDesk` (no
+    /// feedback event); the driver runs `git tag` serialized on the repo mutex and TRACES a failure
+    /// rather than wedging the ceremony. Only emitted in worktree-desks mode (a git repo exists).
+    TagSprint {
+        repo: PathBuf,
+        tag: String,
+    },
     Persist,
 }
 
@@ -414,7 +423,12 @@ pub fn step(p: &mut Project, input: Input, now_ms: u64, session_capacity: u32) -
     // Running (Interrupted/Halted/Done stop the line; in-flight results still get
     // processed above so a soft drain completes naturally).
     if matches!(p.phase, ProjectPhase::Running) {
+        // Sprints (feature: sprints): keep exactly one sprint Active whenever the machinery is live,
+        // scope the dispatch scan to it, then — if that sprint has fully settled — fire its review
+        // ceremony. A no-op for the legacy (empty-sprints) flow.
+        ensure_active_sprint(p, now_ms, &mut ctx);
         dispatch(p, now_ms, session_capacity, &mut ctx);
+        maybe_review_active_sprint(p, now_ms, &mut ctx);
     }
 
     if ctx.dirty {
@@ -463,6 +477,17 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 if resume_should_respawn_research(p) {
                     trace(p, now_ms, "research", "respawned on resume", ctx);
                     start_research(p, now_ms, ctx);
+                }
+                // Sprints (feature: sprints): a hard/soft interrupt during a sprint review dropped
+                // that ceremony's fire-and-forget invoke (its `InvokeResult` no-ops against the
+                // `Interrupted` guard). If we resumed to Running with a sprint still `InReview`, the
+                // ceremony owes a re-fire so it can finish — `fire_sprint_review` re-assembles the
+                // transcript and re-issues the ONE invoke (no re-tag, no double-count).
+                if matches!(p.phase, ProjectPhase::Running) {
+                    if let Some(si) = sprint_under_review_idx(p) {
+                        trace(p, now_ms, "sprint", format!("sprint {} review re-entered on resume", si + 1), ctx);
+                        fire_sprint_review(p, si, now_ms, ctx);
+                    }
                 }
             }
         }
@@ -2238,6 +2263,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
         }
         InvokePurpose::AssumeResolve => handle_assume_resolve_result(p, outcome, now_ms, ctx),
         InvokePurpose::AssumeVerify => handle_assume_verify_result(p, outcome, now_ms, ctx),
+        InvokePurpose::SprintReview => finish_sprint_review(p, outcome, now_ms, ctx),
     }
 }
 
@@ -2494,7 +2520,9 @@ fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
         | InvokePurpose::AssumeCheckTrdCrd
         // AssumeResolve / AssumeVerify re-emit / report prose text blocks, never JSON.
         | InvokePurpose::AssumeResolve
-        | InvokePurpose::AssumeVerify => None,
+        | InvokePurpose::AssumeVerify
+        // SprintReview asks for the `SPRINT-REVIEW` TEXT block (tolerant-parsed), never JSON.
+        | InvokePurpose::SprintReview => None,
     }
 }
 
@@ -3041,7 +3069,14 @@ fn complete_passed_task(p: &mut Project, idx: usize, now_ms: u64, ctx: &mut Ctx)
     trace(p, now_ms, "task", label, ctx);
     maybe_remove_worktree(p, idx, ctx);
     ctx.dirty = true;
-    maybe_complete_project(p, now_ms, ctx);
+    // Sprints (feature: sprints): while the sprint machinery is grinding/reviewing, completion is
+    // decided by the sprint-review flow (the LAST sprint's zero-carry-over review calls
+    // `maybe_complete_project`), NOT here — the step-level `maybe_review_active_sprint` picks up the
+    // settle after this. When no sprint is active (legacy empty-sprints flow, or the post-sprints
+    // audit-remediation window whose tasks live outside any sprint) fall back to the direct check.
+    if !sprint_phase_active(p) {
+        maybe_complete_project(p, now_ms, ctx);
+    }
     check_halt(p, now_ms, ctx);
 }
 
@@ -3296,6 +3331,12 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
         None => return,
     };
 
+    // Sprints (feature: sprints): decide which tasks this scan may consider.
+    let scope = dispatch_scope(p);
+    if matches!(scope, Scope::None) {
+        return; // a sprint review ceremony is in flight — grind nothing until it resolves
+    }
+
     let mut budget = session_capacity;
     if budget == 0 {
         return;
@@ -3306,6 +3347,9 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
     for tid in pending_reviews_sorted(p, now_ms) {
         if budget == 0 || held >= max {
             break;
+        }
+        if !scope.contains(&tid) {
+            continue; // not in the active sprint
         }
         spawn_reviewer(p, &tid, &bound, &delivery, now_ms, ctx);
         held += 1;
@@ -3319,6 +3363,9 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
         if budget == 0 || held >= max {
             break;
         }
+        if !scope.contains(&tid) {
+            continue; // not in the active sprint
+        }
         // Instant-death backoff (item 4): skip a task still inside its cooldown; a later Tick /
         // Reconcile re-scans once `now_ms` passes `dispatch_after_ms` (no busy-wait, no thread).
         if p.tasks.iter().any(|t| t.id == tid && t.dispatch_after_ms > now_ms) {
@@ -3327,6 +3374,541 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
         spawn_worker(p, &tid, &bound, &delivery, now_ms, ctx);
         held += 1;
         budget -= 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sprints (feature: sprints)
+// ---------------------------------------------------------------------------
+
+/// Which tasks a dispatch scan may consider (feature: sprints).
+enum Scope {
+    /// Every task — the legacy no-sprint flow (empty `sprints`) and the post-sprints remediation
+    /// window (all sprints Done, audit remediation tasks live outside any sprint).
+    All,
+    /// Only the tasks of the ACTIVE sprint (plus any carry-overs folded into it).
+    Sprint(std::collections::HashSet<TaskId>),
+    /// Nothing — a sprint is `InReview`, so the line pauses until the ceremony resolves.
+    None,
+}
+
+impl Scope {
+    fn contains(&self, tid: &TaskId) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Sprint(set) => set.contains(tid),
+            Scope::None => false,
+        }
+    }
+}
+
+/// Compute the dispatch scope for a Running project (feature: sprints). Empty `sprints` -> `All`
+/// (legacy). An `Active` sprint -> its task set. An `InReview` sprint (and no `Active`) -> `None`.
+/// All sprints `Done` (no `Active`, no `InReview`) -> `All`, so post-sprint audit remediation tasks
+/// (which live outside any sprint) still dispatch. `ensure_active_sprint` runs first each tick, so
+/// a live-machinery project always has an `Active` or `InReview` sprint here.
+fn dispatch_scope(p: &Project) -> Scope {
+    if p.sprints.is_empty() {
+        return Scope::All;
+    }
+    if let Some(i) = active_sprint_idx(p) {
+        return Scope::Sprint(p.sprints[i].tasks.iter().cloned().collect());
+    }
+    if p.sprints.iter().any(|s| matches!(s.status, SprintStatus::InReview)) {
+        return Scope::None;
+    }
+    Scope::All
+}
+
+/// The index of the sprint currently being ground (status `Active`), if any (feature: sprints).
+fn active_sprint_idx(p: &Project) -> Option<usize> {
+    p.sprints.iter().position(|s| matches!(s.status, SprintStatus::Active))
+}
+
+/// The index of the sprint whose review ceremony is in flight (status `InReview`), if any.
+fn sprint_under_review_idx(p: &Project) -> Option<usize> {
+    p.sprints.iter().position(|s| matches!(s.status, SprintStatus::InReview))
+}
+
+/// Whether the sprint machinery is currently GOVERNING the project (feature: sprints): a sprint is
+/// `Active` (grinding) or `InReview` (ceremony). False for the legacy flow (empty `sprints`) and the
+/// post-sprints remediation window (all sprints `Done`) — in both, `maybe_complete_project` and the
+/// global dispatch scope take over exactly as before.
+fn sprint_phase_active(p: &Project) -> bool {
+    p.sprints
+        .iter()
+        .any(|s| matches!(s.status, SprintStatus::Active | SprintStatus::InReview))
+}
+
+/// Self-heal the sprint invariant at the top of each Running tick (feature: sprints): if the
+/// machinery is live but NO sprint is `Active` or `InReview` while a `Pending` one remains, activate
+/// the earliest `Pending` sprint. In steady state `apply_breakdown` makes sprint 0 `Active` and
+/// `finish_sprint_review` activates the next, so this only fires defensively (e.g. an odd reload) —
+/// keeping the line from stalling with everything `Pending`.
+fn ensure_active_sprint(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if p.sprints.is_empty() {
+        return;
+    }
+    if active_sprint_idx(p).is_some() || sprint_under_review_idx(p).is_some() {
+        return;
+    }
+    if let Some(i) = p.sprints.iter().position(|s| matches!(s.status, SprintStatus::Pending)) {
+        if let Ok(st) = step_sprint(&p.sprints[i].status, SprintTransition::Activate) {
+            p.sprints[i].status = st;
+            trace(p, now_ms, "sprint", format!("sprint {} activated", i + 1), ctx);
+            ctx.dirty = true;
+        }
+    }
+}
+
+/// Whether the active sprint has SETTLED — no further grind progress is possible (feature: sprints):
+/// none of its tasks is running (OnProgress / Review / awaiting a merge) and none is `Todo`-and-ready
+/// (dependencies Done). This subsumes the spec's "all tasks terminal (done/parked)" and also handles
+/// a `Todo` task permanently blocked behind a parked sibling (it can never become ready, so the
+/// sprint carries it over rather than wedging). A task inside its instant-death backoff still counts
+/// as ready via `ready_set`, so a sprint never settles out from under a pending retry.
+fn sprint_settled(p: &Project, sprint_idx: usize) -> bool {
+    let set: std::collections::HashSet<&TaskId> = p.sprints[sprint_idx].tasks.iter().collect();
+    // Any task still being worked keeps the sprint open.
+    let running = p.tasks.iter().any(|t| {
+        set.contains(&t.id)
+            && (matches!(t.state, TaskState::OnProgress { .. } | TaskState::Review { .. })
+                || t.awaiting_merge)
+    });
+    if running {
+        return false;
+    }
+    // Any ready task (deps Done) keeps the sprint open — it will dispatch next scan.
+    let ready = ready_set(&p.tasks);
+    !ready.iter().any(|tid| set.contains(tid))
+}
+
+/// If the active sprint has settled, open its review ceremony (feature: sprints). No-op for the
+/// legacy flow, when no sprint is Active, or when the active sprint is still grinding. Called in
+/// `step` after each dispatch scan, so it fires exactly once per settle (the sprint flips to
+/// `InReview` and this guard then finds no Active sprint).
+fn maybe_review_active_sprint(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let Some(si) = active_sprint_idx(p) else {
+        return;
+    };
+    if p.sprints[si].tasks.is_empty() || !sprint_settled(p, si) {
+        return;
+    }
+    enter_sprint_review(p, si, now_ms, ctx);
+}
+
+/// Open a sprint's review ceremony (feature: sprints): flip it `Active -> InReview`, tag the delivery
+/// repo `sprint-<n>` (worktree mode only — the last merge has landed by now), assemble the
+/// programmatic participant transcript from REAL task data, and fire the SINGLE `SprintReview` invoke
+/// that adds the PM's synthesis. Exactly one invoke per review.
+fn enter_sprint_review(p: &mut Project, sprint_idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    if let Ok(st) = step_sprint(&p.sprints[sprint_idx].status, SprintTransition::Review) {
+        p.sprints[sprint_idx].status = st;
+    }
+    let n = sprint_idx + 1;
+    // Tag the delivery repo at the sprint's last merge (git repos only). Best-effort in the driver.
+    if p.worktree_desks {
+        if let Some(repo) = p.delivery_path.clone() {
+            ctx.fx.push(Effect::TagSprint { repo, tag: format!("sprint-{n}") });
+            trace(p, now_ms, "sprint", format!("tagging delivery sprint-{n}"), ctx);
+        }
+    }
+    trace(p, now_ms, "sprint", format!("sprint {n} settled — opening review"), ctx);
+    fire_sprint_review(p, sprint_idx, now_ms, ctx);
+}
+
+/// (Re-)assemble the sprint's participant transcript and fire the ONE `SprintReview` invoke
+/// (feature: sprints). Split from `enter_sprint_review` so `Resume` can re-enter a ceremony whose
+/// invoke was dropped by the interrupt guard WITHOUT re-tagging or re-tracing the settle. Idempotent:
+/// it REPLACES the sprint transcript with freshly-assembled participant lines each call, so a
+/// re-fire never accumulates duplicates.
+fn fire_sprint_review(p: &mut Project, sprint_idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    let transcript = assemble_sprint_transcript(p, sprint_idx);
+    p.sprints[sprint_idx].transcript = transcript.clone();
+
+    let goal = p.sprints[sprint_idx].goal.clone();
+    let carry_titles = sprint_carryover_titles(p, sprint_idx);
+    let next = next_sprint_editable(p, sprint_idx);
+    let (system, prompt) = office::build_sprint_review_prompt(
+        p,
+        &goal,
+        &transcript,
+        &carry_titles,
+        next.as_ref().map(|(g, t)| (g.as_str(), t.as_slice())),
+    );
+    trace(p, now_ms, "sprint", format!("sprint {} review — PM synthesizing", sprint_idx + 1), ctx);
+    // On the office_role like a persona reply, but NOT a doc-drafting invoke, so `emit_invoke` (no
+    // `drafter_model` override) — see `InvokePurpose::SprintReview`.
+    emit_invoke(ctx, InvokePurpose::SprintReview, &p.config.office_role, system, prompt);
+    ctx.dirty = true;
+}
+
+/// Assemble a sprint's review transcript PROGRAMMATICALLY from real task data (feature: sprints):
+/// one line per worker persona (its tasks' OFFICE-REPORT summaries, compacted), one reviewer line
+/// (pass/carry counts + rolling hygiene), and the researcher as a silent observer. The single
+/// ceremony invoke appends the PM's closing line later.
+fn assemble_sprint_transcript(p: &Project, sprint_idx: usize) -> Vec<SprintLine> {
+    let ids: Vec<&TaskId> = p.sprints[sprint_idx].tasks.iter().collect();
+    let mut lines: Vec<SprintLine> = Vec::new();
+
+    // Worker lines, grouped by the task's deterministic persona (stable across respawns).
+    let mut by_persona: Vec<(String, Vec<String>)> = Vec::new();
+    for tid in &ids {
+        let Some(t) = p.tasks.iter().find(|t| &t.id == *tid) else {
+            continue;
+        };
+        let persona = crate::persona::worker_persona(&t.id.0).to_string();
+        let summary = report::parse_report(t.last_report.as_deref().unwrap_or(""))
+            .summary
+            .unwrap_or_else(|| task_outcome_word(&t.state).to_string());
+        let entry = format!("{} — {}", short_task(&t.id), trace_preview(&summary, 200));
+        match by_persona.iter_mut().find(|(name, _)| *name == persona) {
+            Some((_, v)) => v.push(entry),
+            None => by_persona.push((persona, vec![entry])),
+        }
+    }
+    for (persona, entries) in by_persona {
+        lines.push(SprintLine {
+            speaker: persona,
+            line: trace_preview(&entries.join("; "), 600),
+        });
+    }
+
+    // Reviewer line: pass/carry counts + the project's rolling hygiene average.
+    let done = ids
+        .iter()
+        .filter(|tid| matches!(task_state_of(p, tid), Some(TaskState::Done { .. })))
+        .count();
+    let carried = ids.len().saturating_sub(done);
+    let hygiene = if p.hygiene_count > 0 {
+        (p.hygiene_sum / p.hygiene_count as u64) as u32
+    } else {
+        100
+    };
+    lines.push(SprintLine {
+        speaker: "reviewer".to_string(),
+        line: format!(
+            "{} task{} passed, {} carried over; rolling hygiene {}.",
+            done,
+            if done == 1 { "" } else { "s" },
+            carried,
+            hygiene
+        ),
+    });
+
+    // Researcher: present as a silent observer.
+    lines.push(SprintLine {
+        speaker: "researcher".to_string(),
+        line: "(observing — no new research this sprint)".to_string(),
+    });
+
+    lines
+}
+
+/// A one-word outcome for a task with no usable report summary (feature: sprints), used only as the
+/// fallback text for a worker line.
+fn task_outcome_word(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Done { .. } => "done",
+        TaskState::Parked { .. } => "parked (carried over)",
+        _ => "carried over",
+    }
+}
+
+/// The state of a task id, if it exists (feature: sprints helper).
+fn task_state_of<'a>(p: &'a Project, tid: &TaskId) -> Option<&'a TaskState> {
+    p.tasks.iter().find(|t| &t.id == tid).map(|t| &t.state)
+}
+
+/// The titles of a sprint's carry-over (non-Done) tasks (feature: sprints), for the ceremony prompt.
+fn sprint_carryover_titles(p: &Project, sprint_idx: usize) -> Vec<String> {
+    p.sprints[sprint_idx]
+        .tasks
+        .iter()
+        .filter_map(|tid| p.tasks.iter().find(|t| &t.id == tid))
+        .filter(|t| !matches!(t.state, TaskState::Done { .. }))
+        .map(|t| trace_preview(&t.title, 120))
+        .collect()
+}
+
+/// The next sprint's `(goal, [(task-id, title)])` the PM may adjust (feature: sprints), or `None`
+/// when this is the last sprint. "Next" is the first sprint AFTER `sprint_idx` (any status — normally
+/// the immediately-following Pending one).
+fn next_sprint_editable(p: &Project, sprint_idx: usize) -> Option<(String, Vec<(String, String)>)> {
+    let ni = sprint_idx + 1;
+    let next = p.sprints.get(ni)?;
+    let tasks: Vec<(String, String)> = next
+        .tasks
+        .iter()
+        .filter_map(|tid| p.tasks.iter().find(|t| &t.id == tid))
+        .map(|t| (t.id.0.clone(), t.title.clone()))
+        .collect();
+    Some((next.goal.clone(), tasks))
+}
+
+/// The `SprintReview` invoke returned (feature: sprints) — finish the ceremony. Parse the PM plan
+/// (an `Err`/garbled result -> no changes, carry-overs only), append the PM's line to the transcript,
+/// feed the transcript into `research_notes` (item 4), notify, then fold the sprint forward: apply
+/// the PM's adjustments to the REAL next sprint (drop/add/modify), move the non-done carry-overs into
+/// the next (or a new trailing) sprint, mark this sprint Done, and activate the next. When there is
+/// no next sprint AND zero carry-overs, the project is complete -> the existing audit/complete flow
+/// runs unchanged. `check_halt` after activation catches a trailing sprint that is immediately stuck
+/// (a lone parked carry-over), so the ceremony can never loop forever.
+fn finish_sprint_review(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    let Some(si) = sprint_under_review_idx(p) else {
+        // No sprint is InReview — a stale/duplicate result (e.g. after an interrupt cleared it). No-op.
+        return;
+    };
+    ctx.dirty = true;
+
+    let plan = match outcome {
+        Ok(text) => report::parse_sprint_review(&text),
+        Err(e) => {
+            trace(p, now_ms, "sprint", format!("sprint {} review errored ({}) — carry-overs only", si + 1, trace_preview(&e, 60)), ctx);
+            report::SprintReviewPlan::default()
+        }
+    };
+
+    // The PM's closing line, appended to the programmatic transcript.
+    let summary = if plan.summary.trim().is_empty() {
+        "Sprint reviewed.".to_string()
+    } else {
+        plan.summary.clone()
+    };
+    p.sprints[si].transcript.push(SprintLine {
+        speaker: "office".to_string(),
+        line: trace_preview(&summary, 800),
+    });
+
+    // Researcher context feed (item 4): fold the transcript + summary into research_notes (capped).
+    feed_sprint_learnings(p, si);
+
+    let n = si + 1;
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: sprint {} review — {}", p.id.0, n, sprint_notice_body(p, si)),
+        ctx,
+    );
+
+    // Carry-overs: every non-Done task still in the closing sprint.
+    let carry: Vec<TaskId> = p.sprints[si]
+        .tasks
+        .iter()
+        .filter(|tid| !matches!(task_state_of(p, tid), Some(TaskState::Done { .. })))
+        .cloned()
+        .collect();
+
+    let had_next = si + 1 < p.sprints.len();
+
+    if let Ok(st) = step_sprint(&p.sprints[si].status, SprintTransition::Complete) {
+        p.sprints[si].status = st;
+    }
+
+    // Determine the target sprint for carry-overs + adjustments. A real following sprint is the
+    // target; otherwise a NON-empty carry-over spawns a trailing sprint. A last sprint with zero
+    // carry-overs completes the project.
+    let target = if had_next {
+        Some(si + 1)
+    } else if !carry.is_empty() {
+        p.sprints.push(Sprint {
+            goal: "Carry-over work".to_string(),
+            tasks: Vec::new(),
+            status: SprintStatus::Pending,
+            transcript: Vec::new(),
+        });
+        trace(p, now_ms, "sprint", "trailing sprint opened for carry-overs", ctx);
+        Some(p.sprints.len() - 1)
+    } else {
+        None
+    };
+
+    match target {
+        Some(ti) => {
+            // Adjustments target the REAL next sprint's planned tasks (never a fresh trailing one,
+            // where the model was offered no adjustments).
+            if had_next {
+                apply_sprint_adjustments(p, ti, &plan.adjustments, now_ms, ctx);
+            }
+            move_carryovers(p, si, ti, &carry);
+            if let Ok(st) = step_sprint(&p.sprints[ti].status, SprintTransition::Activate) {
+                p.sprints[ti].status = st;
+            }
+            trace(
+                p,
+                now_ms,
+                "sprint",
+                format!("sprint {} done — {} carried over, sprint {} active", n, carry.len(), ti + 1),
+                ctx,
+            );
+            // A trailing sprint of only parked carry-overs is globally stuck -> halt (breaks any loop).
+            check_halt(p, now_ms, ctx);
+        }
+        None => {
+            trace(p, now_ms, "sprint", format!("sprint {n} done — zero carry-over, project complete"), ctx);
+            maybe_complete_project(p, now_ms, ctx);
+        }
+    }
+}
+
+/// Fold a finished sprint's transcript + PM summary into `research_notes` (feature: sprints item 4),
+/// capped via [`office::append_research_learnings`] so the next sprint's workers/prompts see the
+/// learnings through the existing research-notes plumbing.
+fn feed_sprint_learnings(p: &mut Project, sprint_idx: usize) {
+    let mut block = format!("## Sprint {} review — {}\n", sprint_idx + 1, p.sprints[sprint_idx].goal);
+    for line in &p.sprints[sprint_idx].transcript {
+        block.push_str(&format!("- {}: {}\n", line.speaker, line.line));
+    }
+    p.research_notes = office::append_research_learnings(&p.research_notes, &block);
+}
+
+/// A compact one-line ceremony body for the outbox notice (feature: sprints): the PM's summary line,
+/// clipped.
+fn sprint_notice_body(p: &Project, sprint_idx: usize) -> String {
+    p.sprints[sprint_idx]
+        .transcript
+        .iter()
+        .rev()
+        .find(|l| l.speaker == "office")
+        .map(|l| trace_preview(&l.line, 240))
+        .unwrap_or_else(|| "reviewed".to_string())
+}
+
+/// Move a sprint's carry-over task ids from the closing sprint into the target sprint (feature:
+/// sprints), preserving order and de-duplicating. The tasks keep their board state (a parked
+/// carry-over stays parked; a blocked-Todo stays Todo) — only their sprint membership changes.
+fn move_carryovers(p: &mut Project, from: usize, to: usize, carry: &[TaskId]) {
+    if from == to {
+        return;
+    }
+    let carry_set: std::collections::HashSet<&TaskId> = carry.iter().collect();
+    p.sprints[from].tasks.retain(|tid| !carry_set.contains(tid));
+    for tid in carry {
+        if !p.sprints[to].tasks.contains(tid) {
+            p.sprints[to].tasks.push(tid.clone());
+        }
+    }
+}
+
+/// Apply the PM's sprint-review adjustments to the target (next) sprint's task list (feature:
+/// sprints), DEFENSIVELY — every op is a no-op when its target can't be resolved or the task has
+/// already started. `drop`/`modify` only touch a not-yet-started (`Todo`/`Backlog`) task the target
+/// sprint owns; `add` appends a fresh `Todo` task to the board and the sprint.
+fn apply_sprint_adjustments(
+    p: &mut Project,
+    target_idx: usize,
+    adjustments: &[report::SprintAdjustment],
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    for adj in adjustments {
+        match adj.kind {
+            report::SprintAdjustmentKind::Drop => {
+                if let Some(tid) = resolve_sprint_task(p, target_idx, &adj.target) {
+                    if is_not_started(p, &tid) {
+                        p.sprints[target_idx].tasks.retain(|t| t != &tid);
+                        p.tasks.retain(|t| t.id != tid);
+                        trace(p, now_ms, "sprint", format!("adjustment: dropped {}", short_task(&tid)), ctx);
+                    }
+                }
+            }
+            report::SprintAdjustmentKind::Modify => {
+                if let Some(tid) = resolve_sprint_task(p, target_idx, &adj.target) {
+                    if is_not_started(p, &tid) && !adj.text.trim().is_empty() {
+                        if let Some(t) = p.tasks.iter_mut().find(|t| t.id == tid) {
+                            t.description = adj.text.trim().to_string();
+                            record(t, now_ms, "sprint-adjust:modify");
+                        }
+                        trace(p, now_ms, "sprint", format!("adjustment: modified {}", short_task(&tid)), ctx);
+                    }
+                }
+            }
+            report::SprintAdjustmentKind::Add => {
+                let title = adj.target.trim();
+                if title.is_empty() {
+                    continue;
+                }
+                let id = mint_added_task_id(p, title);
+                let description = if adj.text.trim().is_empty() {
+                    title.to_string()
+                } else {
+                    adj.text.trim().to_string()
+                };
+                let mut task = Task {
+                    id: id.clone(),
+                    title: trace_preview(title, 120),
+                    description,
+                    acceptance: vec![
+                        "The task described is fully implemented and working".to_string(),
+                        "The delivered tree stays clean (no trash or dead files)".to_string(),
+                    ],
+                    blocked_by: Vec::new(),
+                    priority: 0,
+                    state: TaskState::Todo,
+                    bounces: 0,
+                    comments: Vec::new(),
+                    desk: None,
+                    last_report: None,
+                    last_review: None,
+                    history: Vec::new(),
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
+                };
+                record(&mut task, now_ms, "sprint-adjust:add");
+                p.tasks.push(task);
+                p.sprints[target_idx].tasks.push(id.clone());
+                trace(p, now_ms, "sprint", format!("adjustment: added {}", short_task(&id)), ctx);
+            }
+        }
+    }
+}
+
+/// Resolve a PM adjustment `target` to a task id the target sprint owns (feature: sprints): match the
+/// FULL hierarchical id, else the short last-segment slug. `None` when nothing in that sprint matches.
+fn resolve_sprint_task(p: &Project, sprint_idx: usize, target: &str) -> Option<TaskId> {
+    let t = target.trim();
+    p.sprints[sprint_idx]
+        .tasks
+        .iter()
+        .find(|tid| tid.0 == t || short_task(tid) == t)
+        .cloned()
+}
+
+/// Whether a task has NOT started yet (feature: sprints) — `Todo` or `Backlog`, so an adjustment can
+/// safely drop/modify it. In-flight, in-review, parked, and done tasks are left untouched.
+fn is_not_started(p: &Project, tid: &TaskId) -> bool {
+    matches!(task_state_of(p, tid), Some(TaskState::Todo) | Some(TaskState::Backlog))
+}
+
+/// Mint a unique task id for a PM-added task (feature: sprints): `<project>/added/<slug>`, with a
+/// numeric suffix on collision. The slug is derived from the title (lowercased, non-`[a-z0-9]` runs
+/// collapsed to `-`).
+fn mint_added_task_id(p: &Project, title: &str) -> TaskId {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "task" } else { slug };
+    let base = format!("{}/added/{}", p.id.0, slug);
+    if !p.tasks.iter().any(|t| t.id.0 == base) {
+        return TaskId(base);
+    }
+    let mut n = 2u64;
+    loop {
+        let cand = format!("{base}-{n}");
+        if !p.tasks.iter().any(|t| t.id.0 == cand) {
+            return TaskId(cand);
+        }
+        n += 1;
     }
 }
 
