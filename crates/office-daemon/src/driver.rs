@@ -599,7 +599,7 @@ impl<H: Host> Driver<H> {
     }
 
     /// The ownership verdict for a global-inbox file's peeked [`inbox::Target`]. Owner-only
-    /// for project/task-addressed ops (`authorize`/`interrupt`/`resume`/`comment`); a brief
+    /// for project/task-addressed ops (`authorize`/`interrupt`/`resume`/`breakdown`/`comment`); a brief
     /// with an absent or registry-UNKNOWN project is claimable by anyone (it mints locally);
     /// an undeterminable target is claimable (to reject). `known` is the set of project ids
     /// in the registry, used to distinguish an unknown project (mintable) from one owned by

@@ -191,6 +191,13 @@ fn parse(text: &str, file: &str) -> Result<(Command, String), String> {
             };
             Ok((Command::Comment { task, text: ctext }, "queued".to_string()))
         }
+        "breakdown" => {
+            let project = match str_field(&value, "project") {
+                Some(p) if !p.is_empty() => p,
+                _ => return Err(format!("{file}: op 'breakdown' requires a non-empty 'project'")),
+            };
+            Ok((Command::Breakdown { project }, "queued".to_string()))
+        }
         other => Err(format!("{file}: unknown op '{other}'")),
     }
 }
@@ -223,8 +230,10 @@ fn opt_str_field(v: &Value, key: &str) -> Option<String> {
 pub enum Target {
     /// A `brief`: `project` is the addressed id (`None` = start a new project).
     Brief { project: Option<String> },
-    /// A project-addressed op (`authorize`/`interrupt`/`resume`/`status`): the `project`
-    /// id (`status` may legitimately carry `None` = a global query).
+    /// A project-addressed op (`authorize`/`interrupt`/`resume`/`status`/`breakdown`): the
+    /// `project` id (`status` may legitimately carry `None` = a global query). `breakdown`
+    /// is owner-only exactly like `authorize` (6.4): re-running the office breakdown must
+    /// only ever be claimed by the instance that owns the project.
     Project { project: Option<String> },
     /// A `comment` addressed to a task id (ownership resolves via the task's project prefix).
     Task { task: String },
@@ -247,9 +256,11 @@ pub fn peek_target(text: &str) -> Target {
         Some("brief") => Target::Brief {
             project: opt_str_field(&value, "project"),
         },
-        Some("authorize") | Some("interrupt") | Some("resume") | Some("status") => Target::Project {
-            project: opt_str_field(&value, "project"),
-        },
+        Some("authorize") | Some("interrupt") | Some("resume") | Some("status") | Some("breakdown") => {
+            Target::Project {
+                project: opt_str_field(&value, "project"),
+            }
+        }
         Some("comment") => match opt_str_field(&value, "task") {
             Some(task) => Target::Task { task },
             None => Target::Unknown,

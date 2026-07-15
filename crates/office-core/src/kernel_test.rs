@@ -5,6 +5,7 @@
 
 use super::kernel::*;
 use crate::domain::*;
+use crate::office::InvokePurpose;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -923,6 +924,161 @@ fn config_set_with_no_fields_is_a_no_op_and_does_not_mark_dirty() {
 // ---------------------------------------------------------------------------
 // Determinism
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Breakdown timeout -> compact retry ladder (6.3.2)
+// ---------------------------------------------------------------------------
+
+const BREAKDOWN_JSON_OK: &str = r#"{"epics":[{"slug":"e1","title":"Epic","intent":"i","stories":[{"slug":"s1","title":"Story","intent":"i","tasks":[{"slug":"t1","title":"Task","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]}]}]}]}"#;
+
+fn invoke_result(purpose: InvokePurpose, outcome: Result<String, String>) -> Input {
+    Input::Command(Command::InvokeResult { purpose, outcome })
+}
+
+fn invoke_effects(fx: &[Effect]) -> Vec<&Effect> {
+    fx.iter().filter(|e| matches!(e, Effect::InvokeModel { .. })).collect()
+}
+
+#[test]
+fn breakdown_timeout_falls_back_to_one_compact_invoke() {
+    // The kernel only ever sees this Err after the driver's own pool-level retry has
+    // already run and also timed out (driver.rs on_invoke_done) — see the doc comment on
+    // handle_breakdown_result. From the kernel's perspective it is simply: Breakdown Err
+    // "timed out" -> exactly one BreakdownCompact invoke, carrying the compact contract.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Breakdown, Err("model call timed out".to_string())),
+        1000,
+        4,
+    );
+
+    let invokes = invoke_effects(&fx);
+    assert_eq!(invokes.len(), 1, "exactly one compact breakdown invoke is queued");
+    match invokes[0] {
+        Effect::InvokeModel { purpose, prompt, .. } => {
+            assert_eq!(*purpose, InvokePurpose::BreakdownCompact);
+            assert!(prompt.contains("6 tasks"), "compact contract present in the prompt: {prompt}");
+            assert!(prompt.contains("COMPACT MODE"), "compact contract present in the prompt: {prompt}");
+        }
+        other => panic!("expected InvokeModel, got {other:?}"),
+    }
+    // Nothing surfaced to the user yet — the compact attempt has not resolved.
+    assert!(p.outbox.is_empty());
+}
+
+#[test]
+fn breakdown_non_timeout_error_surfaces_immediately_no_compact_fallback() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Breakdown, Err("some other failure".to_string())),
+        1000,
+        4,
+    );
+
+    assert!(invoke_effects(&fx).is_empty(), "a non-timeout error never falls back to compact");
+    assert!(p
+        .outbox
+        .iter()
+        .any(|n| n.text.contains("office breakdown call failed: some other failure")));
+}
+
+#[test]
+fn breakdown_compact_success_lands_tasks_and_ready_notice() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::BreakdownCompact, Ok(BREAKDOWN_JSON_OK.to_string())),
+        1000,
+        4,
+    );
+
+    assert!(invoke_effects(&fx).is_empty());
+    assert_eq!(p.phase, ProjectPhase::Ready, "Drafting -> Ready on a landed compact breakdown");
+    assert_eq!(p.tasks.len(), 1);
+    assert_eq!(p.epics.len(), 1);
+    assert!(
+        p.outbox.iter().any(|n| n.text.contains("board is ready")),
+        "the usual board-ready notice fires for a compact landing too"
+    );
+}
+
+#[test]
+fn breakdown_compact_timeout_surfaces_actionable_notice() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::BreakdownCompact, Err("model call timed out".to_string())),
+        1000,
+        4,
+    );
+
+    assert!(invoke_effects(&fx).is_empty(), "no further retry after the compact attempt");
+    assert!(p.epics.is_empty(), "nothing landed on a compact failure");
+    let notice = p.outbox.iter().find(|n| n.text.contains("office breakdown call failed"));
+    let notice = notice.expect("an actionable notice was queued");
+    assert!(notice.text.contains("workflow_breakdown"), "notice: {}", notice.text);
+    assert!(notice.text.contains("faster model"), "notice: {}", notice.text);
+}
+
+#[test]
+fn breakdown_compact_parse_failure_also_surfaces_actionable_notice() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::BreakdownCompact, Ok("not json".to_string())),
+        1000,
+        4,
+    );
+
+    assert!(invoke_effects(&fx).is_empty(), "compact never re-asks — one shot only");
+    let notice = p.outbox.iter().find(|n| n.text.contains("compact retry"));
+    let notice = notice.expect("an actionable notice was queued");
+    assert!(notice.text.contains("workflow_breakdown"), "notice: {}", notice.text);
+}
+
+#[test]
+fn breakdown_parse_failure_reasks_once_then_surfaces_unchanged() {
+    // Locks in the pre-existing re-ask ladder, untouched by the compact timeout fallback.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Breakdown, Ok("not json".to_string())),
+        1000,
+        4,
+    );
+    let invokes = invoke_effects(&fx);
+    assert_eq!(invokes.len(), 1);
+    match invokes[0] {
+        Effect::InvokeModel { purpose, .. } => assert_eq!(*purpose, InvokePurpose::BreakdownReask),
+        other => panic!("expected InvokeModel, got {other:?}"),
+    }
+
+    let fx2 = step(
+        &mut p,
+        invoke_result(InvokePurpose::BreakdownReask, Ok("still not json".to_string())),
+        2000,
+        4,
+    );
+    assert!(invoke_effects(&fx2).is_empty(), "the re-ask ladder stops after one retry");
+    assert!(p.outbox.iter().any(|n| n.text.contains("rejected twice")));
+    assert!(p.epics.is_empty());
+}
+
+#[test]
+fn breakdown_reask_success_lands_tasks_unchanged() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::BreakdownReask, Ok(BREAKDOWN_JSON_OK.to_string())),
+        1000,
+        4,
+    );
+    assert!(invoke_effects(&fx).is_empty());
+    assert_eq!(p.phase, ProjectPhase::Ready);
+    assert_eq!(p.tasks.len(), 1);
+}
 
 #[test]
 fn same_inputs_same_effects() {

@@ -342,7 +342,7 @@ fn office_message(p: &mut Project, text: String, ctx: &mut Ctx) {
 
 /// Issue the breakdown invoke for the current PRD (6.3.2).
 fn request_breakdown(p: &mut Project, ctx: &mut Ctx) {
-    let (system, prompt) = office::build_breakdown_prompt(p, None);
+    let (system, prompt) = office::build_breakdown_prompt(p, None, false);
     emit_invoke(ctx, InvokePurpose::Breakdown, &p.config.office_role, system, prompt);
 }
 
@@ -430,14 +430,49 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             let (system, prompt) = office::build_invoke(p, "");
             emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
         }
-        InvokePurpose::Breakdown => handle_breakdown_result(p, outcome, false, now_ms, ctx),
-        InvokePurpose::BreakdownReask => handle_breakdown_result(p, outcome, true, now_ms, ctx),
+        InvokePurpose::Breakdown => handle_breakdown_result(p, outcome, now_ms, ctx),
+        InvokePurpose::BreakdownReask => handle_breakdown_reask_result(p, outcome, now_ms, ctx),
+        InvokePurpose::BreakdownCompact => handle_breakdown_compact_result(p, outcome, now_ms, ctx),
     }
 }
 
-/// Validate a breakdown result and land it, or (first failure) re-ask once, or (second
-/// failure) surface to the user (6.3.2).
-fn handle_breakdown_result(p: &mut Project, outcome: Result<String, String>, is_reask: bool, now_ms: u64, ctx: &mut Ctx) {
+/// The FIRST breakdown attempt's result (6.3.2). `Ok` -> validate/land, or (parse failure)
+/// re-ask once. `Err` whose text is a `models.invoke` timeout falls back to ONE compact
+/// breakdown attempt instead of failing outright — by the time the kernel ever sees this
+/// `Err`, the driver's own pool-level retry has ALREADY run and also timed out (`driver.rs`
+/// `on_invoke_done` retries a timed-out invoke exactly once, reusing the same job/slot,
+/// before ever routing the outcome here as `Command::InvokeResult`), so this is genuinely
+/// the second consecutive timeout and a smaller ask is the deterministic next step. Any
+/// other `Err` surfaces immediately, unchanged from before the compact ladder existed.
+fn handle_breakdown_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    let text = match outcome {
+        Ok(t) => t,
+        Err(e) => {
+            if is_breakdown_timeout(&e) {
+                let (system, prompt) = office::build_breakdown_prompt(p, None, true);
+                emit_invoke(ctx, InvokePurpose::BreakdownCompact, &p.config.office_role, system, prompt);
+            } else {
+                queue_notice(p, now_ms, format!("office breakdown call failed: {e}"), ctx);
+                ctx.dirty = true;
+            }
+            return;
+        }
+    };
+    match office::parse_breakdown(&text) {
+        Ok(breakdown) => land_breakdown(p, breakdown, now_ms, ctx),
+        Err(e) => {
+            let (system, prompt) = office::build_breakdown_prompt(p, Some(&format!("{e:?}")), false);
+            emit_invoke(ctx, InvokePurpose::BreakdownReask, &p.config.office_role, system, prompt);
+        }
+    }
+}
+
+/// The single re-ask after a first-attempt parse failure (6.3.2), UNCHANGED by the compact
+/// timeout ladder: `Ok` -> validate/land, or (second parse failure) surface a "rejected
+/// twice" notice — the loop's hard stop. `Err` surfaces the same generic failure notice as
+/// the first attempt; a re-ask never falls back to compact (only a FIRST-attempt timeout
+/// does, in [`handle_breakdown_result`]).
+fn handle_breakdown_reask_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
     let text = match outcome {
         Ok(t) => t,
         Err(e) => {
@@ -447,44 +482,90 @@ fn handle_breakdown_result(p: &mut Project, outcome: Result<String, String>, is_
         }
     };
     match office::parse_breakdown(&text) {
-        Ok(breakdown) => {
-            office::apply_breakdown(p, breakdown);
-            // THE authorize invitation lives HERE, after tasks really exist —
-            // never at PRD capture (live-test 2026-07-15: an early nudge sent the
-            // main agent into authorize/WrongPhase retry loops while the
-            // breakdown was still generating).
-            let epics = p.epics.len();
-            let tasks = p.tasks.len();
+        Ok(breakdown) => land_breakdown(p, breakdown, now_ms, ctx),
+        Err(e) => {
             queue_notice(
                 p,
                 now_ms,
-                format!(
-                    "office[{}]: board is ready — {} task{} across {} epic{}. Authorize with a delivery path (workflow_authorize) to start the production line.",
-                    p.id.0,
-                    tasks,
-                    if tasks == 1 { "" } else { "s" },
-                    epics,
-                    if epics == 1 { "" } else { "s" }
-                ),
+                format!("office breakdown rejected twice ({e:?}); edit the board manually"),
                 ctx,
             );
             ctx.dirty = true;
         }
-        Err(e) => {
-            if is_reask {
-                queue_notice(
-                    p,
-                    now_ms,
-                    format!("office breakdown rejected twice ({e:?}); edit the board manually"),
-                    ctx,
-                );
-                ctx.dirty = true;
-            } else {
-                let (system, prompt) = office::build_breakdown_prompt(p, Some(&format!("{e:?}")));
-                emit_invoke(ctx, InvokePurpose::BreakdownReask, &p.config.office_role, system, prompt);
-            }
-        }
     }
+}
+
+/// The compact fallback's result (6.3.2 timeout ladder) — the one attempt
+/// [`handle_breakdown_result`] issues after a first-attempt timeout. `Ok` -> validate/land
+/// exactly like the normal path. Any failure here — timeout, other invoke error, or a parse
+/// rejection — is terminal: there is no further kernel-level retry, so it surfaces the same
+/// actionable notice either way, with a concrete next step for the user instead of silently
+/// looping or dead-ending.
+fn handle_breakdown_compact_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    let text = match outcome {
+        Ok(t) => t,
+        Err(e) => {
+            surface_compact_breakdown_failure(p, now_ms, format!("office breakdown call failed: {e}"), ctx);
+            return;
+        }
+    };
+    match office::parse_breakdown(&text) {
+        Ok(breakdown) => land_breakdown(p, breakdown, now_ms, ctx),
+        Err(e) => surface_compact_breakdown_failure(
+            p,
+            now_ms,
+            format!("office breakdown (compact retry) rejected: {e:?}"),
+            ctx,
+        ),
+    }
+}
+
+/// Land a validated breakdown on the board and announce it — shared by the first attempt,
+/// the re-ask, and the compact fallback, since every successful path lands identically. THE
+/// authorize invitation lives HERE, after tasks really exist — never at PRD capture
+/// (live-test 2026-07-15: an early nudge sent the main agent into authorize/WrongPhase retry
+/// loops while the breakdown was still generating).
+fn land_breakdown(p: &mut Project, breakdown: office::Breakdown, now_ms: u64, ctx: &mut Ctx) {
+    office::apply_breakdown(p, breakdown);
+    let epics = p.epics.len();
+    let tasks = p.tasks.len();
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: board is ready — {} task{} across {} epic{}. Authorize with a delivery path (workflow_authorize) to start the production line.",
+            p.id.0,
+            tasks,
+            if tasks == 1 { "" } else { "s" },
+            epics,
+            if epics == 1 { "" } else { "s" }
+        ),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
+/// Surface the compact fallback's terminal failure with a concrete next step (6.3.2): unlike
+/// the first attempt's one-shot fallback to compact, nothing after the compact attempt
+/// retries automatically — the user must act.
+fn surface_compact_breakdown_failure(p: &mut Project, now_ms: u64, base: String, ctx: &mut Ctx) {
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "{base}; try workflow_breakdown to retry, or bind a faster model to the office role in the koma sidebar"
+        ),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
+/// Whether a breakdown invoke error string is the host's 25s-budget timeout — the one class
+/// [`handle_breakdown_result`] falls back to a compact attempt for. Mirrors the driver's own
+/// `is_invoke_timeout` (`office-daemon/driver.rs`), duplicated here since the kernel crate
+/// has no dependency on the daemon crate.
+fn is_breakdown_timeout(err: &str) -> bool {
+    err.contains("timed out") || err.contains("timeout")
 }
 
 /// Emit an `InvokeModel` effect. `req_id` is a placeholder (0) — the driver mints the

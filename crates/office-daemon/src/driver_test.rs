@@ -927,6 +927,45 @@ fn global_inbox_leaves_file_for_unowned_project() {
     assert_eq!(call_count(&d.host, "chat.prompt"), 0);
 }
 
+/// `breakdown` is owner-only exactly like `authorize`/`resume` (6.4): this instance may
+/// claim a `breakdown` file addressed to a project it owns...
+#[test]
+fn global_inbox_claims_breakdown_for_owned_project() {
+    let (store, _dir) = temp_store();
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    d.insert_for_test(project("mine", ProjectPhase::Drafting, vec![]), 1_000);
+    assert!(d.holds_lease("mine"));
+
+    write_global_file(&d.store, "1-breakdown.json", r#"{"op":"breakdown","project":"mine"}"#);
+    d.poll_global_inbox(2_000);
+
+    let inbox = d.store.root_dir().join("inbox");
+    assert!(inbox.join("processed").join("1-breakdown.json").exists());
+    assert!(!inbox.join("1-breakdown.json").exists());
+    assert!(call_count(&d.host, "chat.prompt") >= 1, "an ack is sent for a claimed file");
+}
+
+/// ...and must LEAVE one addressed to a project owned by another instance.
+#[test]
+fn global_inbox_leaves_breakdown_for_unowned_project() {
+    let (store, _dir) = temp_store();
+    store
+        .save_project(&project("other", ProjectPhase::Drafting, vec![]))
+        .expect("seed other");
+    let host = FakeHost::new();
+    let mut d = driver(store, host);
+    assert!(!d.holds_lease("other"), "we must not own 'other'");
+
+    write_global_file(&d.store, "1-breakdown.json", r#"{"op":"breakdown","project":"other"}"#);
+    d.poll_global_inbox(2_000);
+
+    let inbox = d.store.root_dir().join("inbox");
+    assert!(inbox.join("1-breakdown.json").exists(), "an unowned breakdown file is left in place");
+    assert!(!inbox.join("processed").join("1-breakdown.json").exists());
+    assert_eq!(call_count(&d.host, "chat.prompt"), 0);
+}
+
 #[test]
 fn global_inbox_claims_unknown_project_brief_and_mints_locally() {
     let (store, _dir) = temp_store();

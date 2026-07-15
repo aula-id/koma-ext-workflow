@@ -42,11 +42,20 @@ pub const HARD_PROMPT_CAP: usize = 32 * 1024;
 pub enum InvokePurpose {
     /// A front-office conversational reply. Result appended to the transcript.
     Persona,
-    /// The JSON epic/story/task breakdown. Result parsed+validated; valid -> board.
+    /// The JSON epic/story/task breakdown. Result parsed+validated; valid -> board. An Err
+    /// whose text is a `models.invoke` timeout falls back to ONE [`BreakdownCompact`]
+    /// attempt instead of surfacing immediately (6.3.2 timeout ladder); any other Err, or a
+    /// parse failure, is unchanged (parse failure -> [`BreakdownReask`]).
     Breakdown,
     /// The single re-ask after a breakdown parse failure (6.3.2). A second failure
     /// surfaces to the user instead of looping.
     BreakdownReask,
+    /// The compact fallback after a FIRST-ATTEMPT breakdown timeout (6.3.2 timeout ladder):
+    /// a smaller, cheaper ask (`build_breakdown_prompt(.., compact: true)`) issued once the
+    /// driver's own pool-level retry (`driver.rs on_invoke_done`) is already exhausted. Any
+    /// failure here — timeout, other error, or a parse rejection — is terminal: it surfaces
+    /// an actionable notice rather than looping further.
+    BreakdownCompact,
     /// The summarize-and-fold call. Result replaces `office_summary`; then the pending
     /// persona invoke is re-issued.
     Fold,
@@ -250,7 +259,12 @@ pub fn apply_fold(p: &mut Project, summary: String) {
 
 /// The output-contract instruction for the breakdown invoke: a strict JSON shape the
 /// deterministic kernel can validate. `error` is appended verbatim on the single re-ask.
-pub fn build_breakdown_prompt(p: &Project, reask_error: Option<&str>) -> (String, String) {
+/// `compact` (the timeout retry ladder, 6.3.2) additionally caps the plan to at most 6
+/// tasks total in one epic with short titles/descriptions and at most 2 acceptance bullets
+/// per task — a deliberately smaller ask that is cheaper and faster for the model to answer
+/// than the full contract, so a slow/timing-out model gets one narrower shot instead of the
+/// same prompt again. The non-compact contract is otherwise byte-for-byte unchanged.
+pub fn build_breakdown_prompt(p: &Project, reask_error: Option<&str>, compact: bool) -> (String, String) {
     let system = prompts::office_system(&board_digest(p));
     let mut prompt = String::new();
     prompt.push_str("Break the PRD below into an epic/story/task plan for the production line.\n\n");
@@ -266,6 +280,14 @@ Rules: every slug is unique and [a-z0-9-]; acceptance is non-empty; blocked_by l
 slugs only; the blocked_by graph is acyclic; add a blocked_by edge between tasks that write \
 the same file.\n",
     );
+    if compact {
+        prompt.push_str(
+            "\nCOMPACT MODE (the previous attempt timed out): keep this breakdown as small \
+as possible — at most 6 tasks TOTAL, in exactly one epic. Titles must be short (a few words); \
+descriptions must be one line each; acceptance is at most 2 bullets per task. Output JSON \
+ONLY — no prose, no code fences, nothing outside the JSON object.\n",
+        );
+    }
     if let Some(err) = reask_error {
         prompt.push_str("\nYour previous answer was rejected: ");
         prompt.push_str(&truncate_bytes(err, 1000));

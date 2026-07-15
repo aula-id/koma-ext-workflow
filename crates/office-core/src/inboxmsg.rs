@@ -75,3 +75,12 @@ pub fn interrupt(project: &str, hard: bool) -> Value {
 pub fn resume(project: &str) -> Value {
     json!({ "op": "resume", "project": project })
 }
+
+/// `{ "op": "breakdown", "project": <project> }`.
+///
+/// Re-run the office breakdown for a drafted PRD (e.g. after a model timeout). `project`
+/// is required by the parser; the result lands as chat notices, same as every other
+/// command tool.
+pub fn breakdown(project: &str) -> Value {
+    json!({ "op": "breakdown", "project": project })
+}
