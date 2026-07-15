@@ -467,6 +467,7 @@ impl<H: Host> Driver<H> {
                 keep_desks,
                 crd_pass_grade,
                 assumption_check,
+                assumption_trust,
             } => {
                 if let Some(i) = self.owned_project_by_id(&project) {
                     self.step(
@@ -479,6 +480,7 @@ impl<H: Host> Driver<H> {
                             keep_desks,
                             crd_pass_grade,
                             assumption_check,
+                            assumption_trust,
                         }),
                         now_ms,
                     );
@@ -1044,6 +1046,9 @@ impl<H: Host> Driver<H> {
             audit_rounds: 0,
             last_audit_grade: None,
             pending_assumptions: Vec::new(),
+            assumptions_approved: false,
+            self_resolved_assumptions: Vec::new(),
+            capture_nudge_count: 0,
             office_transcript: Vec::new(),
             office_summary: String::new(),
             delivery_path: None,

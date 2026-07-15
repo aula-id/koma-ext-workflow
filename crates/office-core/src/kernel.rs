@@ -76,6 +76,23 @@ const PROVISIONAL: u64 = 0;
 /// `max_workers` soft sub-ceiling.
 const MAX_PROJECT_WORKERS: u32 = 4;
 
+/// Max consecutive capture-miss nudges the kernel fires for the PRD before falling back to waiting
+/// on the user (feature: capture nudge). A long Drafting reply with no ```prd fence and no PRD yet
+/// triggers a deterministic re-invoke asking for ONLY the fenced doc; after this many in a row
+/// (reset by any successful capture) the kernel stops nudging and surfaces the reply as today.
+const MAX_CAPTURE_NUDGES: u32 = 2;
+
+/// A Drafting reply must be at least this many bytes to be treated as a forgotten-fence PRD worth
+/// nudging (feature: capture nudge). Short fence-less replies are almost always legitimate
+/// clarifying questions the office is waiting on the user to answer, so nudging them would wrongly
+/// force a premature PRD; only a long prose reply is likely a PRD the office narrated but forgot to
+/// wrap in the ```prd fence (live-test 2026-07-15).
+const PRD_NUDGE_MIN_REPLY_BYTES: usize = 500;
+
+/// The system-appended instruction on a capture-miss nudge re-invoke (feature: capture nudge).
+const PRD_NUDGE_INSTRUCTION: &str = "\nYour previous reply did not include the required ```prd \
+fence. Emit ONLY the complete document in the fence now — no prose.\n";
+
 // ---------------------------------------------------------------------------
 // Public protocol
 // ---------------------------------------------------------------------------
@@ -142,6 +159,10 @@ pub enum Command {
         keep_desks: Option<bool>,
         crd_pass_grade: Option<u32>,
         assumption_check: Option<bool>,
+        /// Trust mode (owner's "just do it" contract): when set, a safeguard `assumptions`
+        /// verdict self-resolves instead of stopping the drafting pipeline. Additive optional
+        /// field, wired exactly like `assumption_check`.
+        assumption_trust: Option<bool>,
     },
 }
 
@@ -380,7 +401,7 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 ctx.dirty = true;
             }
         }
-        Command::OfficeMessage { text } => office_message(p, text, ctx),
+        Command::OfficeMessage { text } => office_message(p, text, now_ms, ctx),
         Command::RequestBreakdown => request_breakdown(p, ctx),
         Command::Authorize {
             delivery_path,
@@ -397,6 +418,7 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
             keep_desks,
             crd_pass_grade,
             assumption_check,
+            assumption_trust,
         } => {
             if let Some(w) = max_workers {
                 p.config.max_workers = w.clamp(1, MAX_PROJECT_WORKERS);
@@ -427,6 +449,10 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 p.config.assumption_check = a;
                 ctx.dirty = true;
             }
+            if let Some(t) = assumption_trust {
+                p.config.assumption_trust = t;
+                ctx.dirty = true;
+            }
         }
     }
 }
@@ -435,10 +461,83 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
 // Front office (6.2 / 6.3) — off-loop invoke choreography
 // ---------------------------------------------------------------------------
 
+/// Deterministic approval-intent phrases (matched case-insensitively, whole-word/phrase). When a
+/// project is stopped on `pending_assumptions` and the user's message carries one of these, the
+/// safeguard gate is closed for the project so the re-emitted doc proceeds instead of re-stopping
+/// (the audit's approval loop). Kept explicit + auditable rather than a fuzzy classifier.
+const APPROVAL_PHRASES: &[&str] = &[
+    "approve", "approved", "you decide", "go ahead", "proceed", "lgtm", "ok go",
+];
+
+/// Negation words that VETO an approval match. A message that pairs an approval word with any of
+/// these is ambiguous ("I don't approve of waiting"), so it is conservatively NOT treated as
+/// approval — the safeguard is a SAFETY gate, so only a CLEAR approval closes it (an owner who
+/// wants blanket autonomy flips `config.assumption_trust` instead). Matched whole-word after
+/// folding apostrophes ("don't" -> "dont"), so "another" never reads as "not".
+const APPROVAL_NEGATIONS: &[&str] = &[
+    "not", "dont", "never", "cant", "cannot", "wont", "reject", "disapprove",
+];
+
+/// Normalize `msg` for whole-word/phrase matching: lowercase, drop apostrophes (so "don't"
+/// folds to one token "dont"), replace every other non-alphanumeric run with a single space,
+/// and pad with a leading + trailing space so `" phrase "` substring checks are word-anchored.
+fn normalize_for_match(msg: &str) -> String {
+    let mut s = String::with_capacity(msg.len() + 2);
+    s.push(' ');
+    let mut prev_space = true;
+    for c in msg.chars() {
+        if c == '\'' {
+            continue; // fold "don't" -> "dont", "can't" -> "cant"
+        }
+        let lc = c.to_ascii_lowercase();
+        if lc.is_ascii_alphanumeric() {
+            s.push(lc);
+            prev_space = false;
+        } else if !prev_space {
+            s.push(' ');
+            prev_space = true;
+        }
+    }
+    if !s.ends_with(' ') {
+        s.push(' ');
+    }
+    s
+}
+
+/// Whether `msg` is a deterministic approval of pending safeguard assumptions: it contains at
+/// least one [`APPROVAL_PHRASES`] entry as a whole word/phrase AND no [`APPROVAL_NEGATIONS`]
+/// token anywhere. The negation veto is what rejects the "I don't approve of waiting" false
+/// positive; the whole-word anchoring is what keeps "disapprove" from reading as "approve".
+pub(crate) fn is_approval_intent(msg: &str) -> bool {
+    let h = normalize_for_match(msg);
+    if APPROVAL_NEGATIONS.iter().any(|n| h.contains(&format!(" {n} "))) {
+        return false;
+    }
+    APPROVAL_PHRASES.iter().any(|p| h.contains(&format!(" {p} ")))
+}
+
 /// Append the user turn and issue a persona invoke. If the assembled prompt would cross
 /// the fold threshold, a summarize invoke is issued FIRST (6.2); the persona invoke is
 /// re-issued from `invoke_result` once the fold lands.
-fn office_message(p: &mut Project, text: String, ctx: &mut Ctx) {
+///
+/// Approval short-circuit: when the project is stopped on flagged assumptions and the incoming
+/// message is a deterministic approval, the gate is closed for THIS project first
+/// (`assumptions_approved`), `pending_assumptions` cleared, and a trace notice queued — so the
+/// persona invoke that follows re-emits the doc and `gate_doc` fails open instead of re-stopping.
+fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
+    if !p.pending_assumptions.is_empty() && is_approval_intent(&text) {
+        p.assumptions_approved = true;
+        p.pending_assumptions.clear();
+        // The queued notice is the durable, persisted trace (outbox row + chat.prompt effect);
+        // the kernel is pure, so this is the only trace channel available to it.
+        queue_notice(
+            p,
+            now_ms,
+            format!("office[{}]: assumptions approved — gate closed for this project.", p.id.0),
+            ctx,
+        );
+    }
+
     p.office_transcript.push(ChatMsg {
         who: ChatAuthor::User,
         text,
@@ -665,11 +764,13 @@ fn run_deferred(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx)
     }
 }
 
-/// Gate a freshly-captured drafting doc through the safeguard no-assume check (6.2c). When the
-/// gate is disabled (`config.assumption_check == false`) it is a straight pass-through to the
-/// deferred stage. Otherwise it emits an `AssumeCheck*` invoke on the `safeguard_role`; the
-/// result (in [`handle_assume_check_result`]) either proceeds to `deferred` (clean / fail-open)
-/// or stops the pipeline with `pending_assumptions`.
+/// Gate a freshly-captured drafting doc through the safeguard no-assume check (6.2c). The gate is a
+/// straight pass-through to the deferred stage when it is disabled (`config.assumption_check ==
+/// false`) OR already approved for this project (`assumptions_approved`, set by a deterministic
+/// approval in `office_message`) — both are the same fail-open shape, and the approval one is what
+/// breaks the audit's re-emit -> re-gate -> stop loop. Otherwise it emits an `AssumeCheck*` invoke
+/// on the `safeguard_role`; the result (in [`handle_assume_check_result`]) either proceeds to
+/// `deferred` (clean / fail-open) or stops the pipeline with `pending_assumptions`.
 fn gate_doc(
     p: &mut Project,
     purpose: InvokePurpose,
@@ -679,7 +780,7 @@ fn gate_doc(
     now_ms: u64,
     ctx: &mut Ctx,
 ) {
-    if !p.config.assumption_check {
+    if p.assumptions_approved || !p.config.assumption_check {
         run_deferred(p, deferred, now_ms, ctx);
         return;
     }
@@ -688,10 +789,12 @@ fn gate_doc(
 }
 
 /// A safeguard assumption-check returned (6.2c). `clean` (or an unparseable block) clears
-/// `pending_assumptions` and proceeds to the deferred stage; `assumptions` STOPS the pipeline,
-/// storing the flagged items and noticing the user (the doc is stored/visible either way, and a
-/// subsequent chat + fresh fence re-runs this gate). `Err` FAILS OPEN: proceed with a notice —
-/// a flaky safeguard must never wedge Drafting.
+/// `pending_assumptions` and proceeds to the deferred stage. An `assumptions` verdict STOPS the
+/// pipeline (storing the flagged items + noticing the user) UNLESS trust mode
+/// (`config.assumption_trust`) or an active approval (`assumptions_approved`) is set — either
+/// self-resolves the flagged items onto `self_resolved_assumptions` and proceeds instead
+/// (`assumptions_approved` here is the belt for a check that was in flight when the user approved).
+/// `Err` FAILS OPEN: proceed with a notice — a flaky safeguard must never wedge Drafting.
 fn handle_assume_check_result(
     p: &mut Project,
     deferred: Deferred,
@@ -715,23 +818,45 @@ fn handle_assume_check_result(
             Some(check)
                 if check.verdict == report::AssumeVerdict::Assumptions && !check.items.is_empty() =>
             {
-                let items = clip_assumptions(&check.items);
                 let n = check.items.len();
-                queue_notice(
-                    p,
-                    now_ms,
-                    format!(
-                        "office[{}]: {} drafted but contains {} unapproved assumption{}: {} — approve them, answer in chat, or say 'you decide'.",
-                        p.id.0,
-                        doc_label,
-                        n,
-                        if n == 1 { "" } else { "s" },
-                        items
-                    ),
-                    ctx,
-                );
-                p.pending_assumptions = check.items;
-                // STOP: the doc is stored/visible; the user must act before the pipeline proceeds.
+                if p.config.assumption_trust || p.assumptions_approved {
+                    // Trust mode — or an approval that landed while this check was still in flight
+                    // (the race belt): do NOT stop. Record the flagged items on the audit trail
+                    // (capped) and take the SAME proceed path as a clean verdict.
+                    record_self_resolved(p, &check.items);
+                    let reason = if p.config.assumption_trust { "trust" } else { "approved" };
+                    queue_notice(
+                        p,
+                        now_ms,
+                        format!(
+                            "office[{}]: no-assume ({}): self-resolved {} assumption{}, proceeding.",
+                            p.id.0,
+                            reason,
+                            n,
+                            if n == 1 { "" } else { "s" }
+                        ),
+                        ctx,
+                    );
+                    p.pending_assumptions.clear();
+                    run_deferred(p, deferred, now_ms, ctx);
+                } else {
+                    let items = clip_assumptions(&check.items);
+                    queue_notice(
+                        p,
+                        now_ms,
+                        format!(
+                            "office[{}]: {} drafted but contains {} unapproved assumption{}: {} — approve them, answer in chat, or say 'you decide'.",
+                            p.id.0,
+                            doc_label,
+                            n,
+                            if n == 1 { "" } else { "s" },
+                            items
+                        ),
+                        ctx,
+                    );
+                    p.pending_assumptions = check.items;
+                    // STOP: the doc is stored/visible; the user must act before the pipeline proceeds.
+                }
             }
             _ => {
                 // Clean, or an unparseable/inconclusive block -> fail open and proceed.
@@ -741,6 +866,18 @@ fn handle_assume_check_result(
         },
     }
     ctx.dirty = true;
+}
+
+/// Append safeguard-flagged assumptions that trust mode / an active approval auto-resolved to the
+/// project's audit trail, capped to the most recent [`SELF_RESOLVED_CAP`] entries so a long
+/// drafting session can never balloon the state file.
+fn record_self_resolved(p: &mut Project, items: &[String]) {
+    const SELF_RESOLVED_CAP: usize = 100;
+    p.self_resolved_assumptions.extend(items.iter().cloned());
+    let len = p.self_resolved_assumptions.len();
+    if len > SELF_RESOLVED_CAP {
+        p.self_resolved_assumptions.drain(0..len - SELF_RESOLVED_CAP);
+    }
 }
 
 /// Clip the assumption list to a short, single-line preview for a chat notice (the full list is
@@ -821,6 +958,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             if matches!(p.phase, ProjectPhase::Drafting) {
                 if let Some(prd) = office::extract_prd(&reply) {
                     p.prd_markdown = prd;
+                    p.capture_nudge_count = 0; // a successful capture resets the nudge cap
                     queue_notice(
                         p,
                         now_ms,
@@ -871,6 +1009,26 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                     ctx.dirty = true;
                     return;
                 }
+            }
+
+            // Capture miss (feature: capture nudge): in Drafting, a long reply that landed no
+            // ```prd fence while the PRD slot is still empty is almost always a PRD the office
+            // narrated but forgot to fence (live-test 2026-07-15). Fire ONE deterministic re-invoke
+            // asking for ONLY the fenced doc, capped at MAX_CAPTURE_NUDGES in a row so a model that
+            // never emits the fence falls back to today's wait-for-user behavior instead of looping.
+            // TRD/CRD are authored through their own dedicated invokes, never this Persona channel,
+            // so the PRD is the only doc this nudge targets.
+            if matches!(p.phase, ProjectPhase::Drafting)
+                && p.prd_markdown.trim().is_empty()
+                && reply.len() > PRD_NUDGE_MIN_REPLY_BYTES
+                && p.capture_nudge_count < MAX_CAPTURE_NUDGES
+            {
+                p.capture_nudge_count += 1;
+                let (mut system, prompt) = office::build_invoke(p, "");
+                system.push_str(PRD_NUDGE_INSTRUCTION);
+                emit_invoke(ctx, InvokePurpose::Persona, &p.config.office_role, system, prompt);
+                ctx.dirty = true;
+                return;
             }
 
             let clipped = clip_notice(&reply);

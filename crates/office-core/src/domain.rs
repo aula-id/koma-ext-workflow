@@ -221,6 +221,14 @@ pub struct ProjectConfig {
     /// like `office_role` for the persona. Named-fn default `"safeguard"`; no panel affordance.
     #[serde(default = "default_safeguard_role")]
     pub safeguard_role: String,
+    /// Trust mode — the owner's "just do it" contract. When `true`, a safeguard verdict of
+    /// `assumptions` does NOT stop the drafting pipeline: the kernel self-resolves the flagged
+    /// items (recording them on `Project.self_resolved_assumptions` for the audit trail) and
+    /// proceeds to the next stage. Off by default (`#[serde(default)]` -> `false`, the careful
+    /// posture); this is the blanket escape hatch, while the per-project approval intent
+    /// (`Project.assumptions_approved`) is the lighter-weight one. Toggled via `ConfigSet`.
+    #[serde(default)]
+    pub assumption_trust: bool,
 }
 
 fn default_crd_pass_grade() -> u32 {
@@ -248,6 +256,7 @@ impl ProjectConfig {
             crd_pass_grade: default_crd_pass_grade(),
             assumption_check: default_assumption_check(),
             safeguard_role: default_safeguard_role(),
+            assumption_trust: false,
         }
     }
 }
@@ -299,6 +308,29 @@ pub struct Project {
     /// a subsequent clean check on any doc clears it. `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub pending_assumptions: Vec<String>,
+    /// Sticky per-project approval of the safeguard gate. Set once the user answers a
+    /// pending-assumptions stop with a deterministic approval intent (kernel `office_message`);
+    /// thereafter `gate_doc` fails OPEN for every doc in THIS project (`assumptions_approved ||
+    /// !config.assumption_check`), so a re-emitted doc proceeds instead of re-stopping (the audit's
+    /// approval loop). NEVER auto-reset — the owner's "super-autonomous once approved" contract:
+    /// once set it dominates, so toggling `config.assumption_check` does NOT re-gate this project.
+    /// `config.assumption_check` remains the wholesale gate on/off escape hatch for projects that
+    /// were never approved. `#[serde(default)]` (false) for back-compat.
+    #[serde(default)]
+    pub assumptions_approved: bool,
+    /// Append-only audit trail of assumptions the safeguard flagged that trust mode
+    /// (`config.assumption_trust`) or an active approval auto-resolved instead of stopping on.
+    /// Capped to the most recent ~100 entries so a long drafting session can never balloon the
+    /// state file. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub self_resolved_assumptions: Vec<String>,
+    /// Consecutive deterministic capture-miss nudges issued for the current PRD (kernel Persona
+    /// arm): incremented each time a long Drafting reply lands with no ```prd fence while the PRD
+    /// slot is still empty, reset to 0 on a successful fence capture. Caps the nudge loop
+    /// (`MAX_CAPTURE_NUDGES`) so a model that never emits the fence falls back to waiting on the
+    /// user rather than looping forever. `#[serde(default)]` (0) for back-compat.
+    #[serde(default)]
+    pub capture_nudge_count: u32,
     pub office_transcript: Vec<ChatMsg>,
     pub office_summary: String,
     pub delivery_path: Option<PathBuf>,

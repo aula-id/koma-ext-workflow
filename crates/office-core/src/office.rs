@@ -156,45 +156,56 @@ research-grounded, or explicitly delegated ('you decide' / 'up to you') belongs 
 decision: ...'.\n";
 
 /// Capture the LAST ` ```<tag> ` fenced block from a persona reply, if any — the generalized
-/// engine behind both PRD (6.2) and TRD (6.2b) capture. The fence is the explicit capture
-/// contract given to the persona (PRD: [`PERSONA_CONTRACT`]; TRD: [`build_trd_prompt`]);
-/// free-text 'here is the doc' prose is deliberately ignored. `tag` is the language hint
-/// after the opening backticks (`"prd"` / `"trd"`), matched exactly.
+/// engine behind PRD (6.2), TRD (6.2b), and CRD (6.2c) capture. The fence is the explicit capture
+/// contract given to the persona (PRD: [`PERSONA_CONTRACT`]; TRD: [`build_trd_prompt`]; CRD:
+/// [`build_crd_prompt`]); free-text 'here is the doc' prose is deliberately ignored. `tag` is the
+/// language hint after the opening backticks (`"prd"` / `"trd"` / `"crd"`).
+///
+/// Line-oriented and forgiving of real model output (fence hardening):
+///  - The tag is matched CASE-INSENSITIVELY and only as the FIRST token of the fence line's info
+///    string, so ` ```PRD `, ` ```prd `, and ` ```prd (final draft) ` all open a "prd" block while
+///    ` ```prdx ` / ` ```rust ` do not.
+///  - The body terminates at the LAST lone closing ``` (a line that is exactly ``` after trimming),
+///    not the first — so an embedded ` ```rust … ``` ` code block inside a document survives instead
+///    of truncating it. If there is no lone closing fence after the opening one, the remainder is
+///    taken (the unterminated-fence fallback).
+///
+/// An empty captured body yields `None`. When several ` ```<tag> ` blocks are present the LAST
+/// opening fence wins (a re-emitted doc supersedes an earlier draft).
 pub fn extract_fenced(reply: &str, tag: &str) -> Option<String> {
-    let fence = format!("```{tag}");
-    let flen = fence.len();
-    let mut result = None;
-    let mut rest = reply;
-    while let Some(start) = rest.find(&fence) {
-        let after = &rest[start + flen..];
-        // fence marker must end its line
-        let body_start = match after.find('\n') {
-            Some(i) if after[..i].trim().is_empty() => i + 1,
-            _ => {
-                rest = &rest[start + flen..];
-                continue;
-            }
-        };
-        let body = &after[body_start..];
-        match body.find("\n```") {
-            Some(end) => {
-                let doc = body[..end].trim();
-                if !doc.is_empty() {
-                    result = Some(doc.to_string());
-                }
-                rest = &body[end + 4..];
-            }
-            None => {
-                // unterminated fence: tolerate, take the remainder
-                let doc = body.trim();
-                if !doc.is_empty() {
-                    result = Some(doc.to_string());
-                }
-                break;
-            }
-        }
+    let lines: Vec<&str> = reply.lines().collect();
+    // LAST opening fence for this tag wins (a re-emitted doc supersedes an earlier draft).
+    let open_idx = lines.iter().rposition(|l| is_open_fence(l, tag))?;
+    // Greedy close: the LAST lone ``` AFTER the opening fence, so an embedded ```code``` block
+    // inside the doc never truncates it. No lone close -> unterminated, take the remainder.
+    let body: &[&str] = match lines[open_idx + 1..].iter().rposition(|l| is_lone_fence(l)) {
+        Some(rel) => &lines[open_idx + 1..open_idx + 1 + rel],
+        None => &lines[open_idx + 1..],
+    };
+    let doc = body.join("\n");
+    let doc = doc.trim();
+    if doc.is_empty() {
+        None
+    } else {
+        Some(doc.to_string())
     }
-    result
+}
+
+/// Whether `line` opens a ` ```<tag> ` fenced block: after the three backticks, the info string's
+/// FIRST whitespace-delimited token must equal `tag` case-insensitively. Tolerates leading
+/// whitespace, a mixed-case tag, and any trailing text after the tag; a bare ` ``` ` (no info
+/// string) is a closing/lone fence, never an opening tag fence.
+fn is_open_fence(line: &str, tag: &str) -> bool {
+    match line.trim_start().strip_prefix("```") {
+        Some(rest) => rest.split_whitespace().next().is_some_and(|t| t.eq_ignore_ascii_case(tag)),
+        None => false,
+    }
+}
+
+/// Whether `line` is a lone closing fence — exactly ` ``` ` once surrounding whitespace is trimmed
+/// (so it never matches an opening ` ```rust ` info line).
+fn is_lone_fence(line: &str) -> bool {
+    line.trim() == "```"
 }
 
 /// Capture a PRD from a persona reply: the LAST ```prd fenced block, if any (6.2). A thin

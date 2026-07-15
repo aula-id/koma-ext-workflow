@@ -20,6 +20,9 @@ fn project(phase: ProjectPhase) -> Project {
         audit_rounds: 0,
         last_audit_grade: None,
         pending_assumptions: vec![],
+        assumptions_approved: false,
+        self_resolved_assumptions: vec![],
+        capture_nudge_count: 0,
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: None,
@@ -312,6 +315,42 @@ fn extract_fenced_generalizes_prd_and_trd_capture() {
     );
     // extract_prd is the thin wrapper over extract_fenced(_, "prd").
     assert_eq!(office::extract_prd("```prd\nY\n```").as_deref(), Some("Y"));
+}
+
+// ---- extract_fenced hardening: case, trailing text, embedded code blocks ----
+
+#[test]
+fn extract_fenced_keeps_embedded_code_blocks() {
+    // A PRD that contains an example ```rust fenced block must NOT truncate at the FIRST closing
+    // ``` (the embedded block's) — capture greedily to the LAST lone closing fence.
+    let reply = "```prd\n# PRD\nExample:\n```rust\nfn main() {}\n```\nDone.\n```";
+    assert_eq!(
+        office::extract_fenced(reply, "prd").as_deref(),
+        Some("# PRD\nExample:\n```rust\nfn main() {}\n```\nDone.")
+    );
+}
+
+#[test]
+fn extract_fenced_tag_match_is_case_insensitive() {
+    assert_eq!(office::extract_fenced("```PRD\n# P\n```", "prd").as_deref(), Some("# P"));
+    assert_eq!(office::extract_fenced("```Trd\nstack\n```", "trd").as_deref(), Some("stack"));
+    // A different tag still never matches, case aside.
+    assert_eq!(office::extract_fenced("```PRD\nx\n```", "trd"), None);
+    // The tag must be the WHOLE first token — a prefix like ```prdx is not a ```prd fence.
+    assert_eq!(office::extract_fenced("```prdx\nx\n```", "prd"), None);
+}
+
+#[test]
+fn extract_fenced_tolerates_trailing_text_after_the_tag() {
+    // A language/annotation after the tag on the fence line is ignored; the body is still captured.
+    assert_eq!(
+        office::extract_fenced("```prd markdown\n# P\nbody\n```", "prd").as_deref(),
+        Some("# P\nbody")
+    );
+    assert_eq!(
+        office::extract_fenced("```prd (final draft)\nX\n```", "prd").as_deref(),
+        Some("X")
+    );
 }
 
 #[test]
