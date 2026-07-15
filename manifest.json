@@ -2,7 +2,7 @@
   "schema": "koma-extension/v0",
   "id": "aula.workflow",
   "name": "Workflow",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Autonomous kanban office: PRD front desk, sub-agent workforce, review line, live dashboard.",
   "tier": "free",
   "kind": "daemon",
