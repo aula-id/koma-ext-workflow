@@ -83,6 +83,16 @@ mod tests {
                 spawned_at_ms: now + 50,
                 kind: AgentKind::Researcher,
             }),
+            crd_markdown: "# CRD\n- README present (10 pts)\n- builds clean (20 pts)".to_string(),
+            audit: Some(AgentBinding {
+                ext_agent_id: 91,
+                session: "session-123".to_string(),
+                spawned_at_ms: now + 900,
+                kind: AgentKind::Auditor,
+            }),
+            audit_rounds: 1,
+            last_audit_grade: Some(93),
+            pending_assumptions: vec!["assumed Postgres, user never stated a DB".to_string()],
             office_transcript: vec![
                 ChatMsg {
                     who: ChatAuthor::User,
@@ -316,6 +326,9 @@ mod tests {
                 office_role: "main".to_string(),
                 worker_max_runtime_ms: 20 * 60 * 1000,
                 keep_desks: true,
+                crd_pass_grade: 95,
+                assumption_check: false,
+                safeguard_role: "safeguard".to_string(),
             },
             outbox: vec![
                 OutboundNotice {
@@ -353,6 +366,15 @@ mod tests {
         assert!(deserialized.trd_markdown.contains("Rust 1.80"));
         assert!(deserialized.research_notes.contains("reqwest 0.12"));
         assert_eq!(deserialized.research.as_ref().unwrap().kind, AgentKind::Researcher);
+        // The 6.2c additive fields (CRD + audit + safeguard) round-trip too.
+        assert!(deserialized.crd_markdown.contains("README present"));
+        assert_eq!(deserialized.audit.as_ref().unwrap().kind, AgentKind::Auditor);
+        assert_eq!(deserialized.audit_rounds, 1);
+        assert_eq!(deserialized.last_audit_grade, Some(93));
+        assert_eq!(deserialized.pending_assumptions.len(), 1);
+        assert_eq!(deserialized.config.crd_pass_grade, 95);
+        assert!(!deserialized.config.assumption_check);
+        assert_eq!(deserialized.config.safeguard_role, "safeguard");
     }
 
     #[test]
@@ -390,6 +412,15 @@ mod tests {
         assert_eq!(p.trd_markdown, "", "absent trd_markdown defaults to empty");
         assert_eq!(p.research_notes, "", "absent research_notes defaults to empty");
         assert!(p.research.is_none(), "absent research binding defaults to None");
+        // 6.2c additive fields also default cleanly on a pre-6.2c state file: the CRD is empty,
+        // no audit ran, and the config's named-fn defaults (not 0/false) take hold so the gate
+        // is not silently disabled on legacy projects.
+        assert_eq!(p.crd_markdown, "", "absent crd_markdown defaults to empty");
+        assert!(p.audit.is_none() && p.audit_rounds == 0 && p.last_audit_grade.is_none());
+        assert!(p.pending_assumptions.is_empty());
+        assert_eq!(p.config.crd_pass_grade, 98, "absent crd_pass_grade defaults to 98, not 0");
+        assert!(p.config.assumption_check, "absent assumption_check defaults to true, not false");
+        assert_eq!(p.config.safeguard_role, "safeguard");
     }
 
     #[test]
@@ -426,10 +457,11 @@ mod tests {
         // Check contributes.sub_agents
         let sub_agents = &value["contributes"]["sub_agents"];
         assert!(sub_agents.is_array());
-        assert_eq!(sub_agents.as_array().unwrap().len(), 3);
+        assert_eq!(sub_agents.as_array().unwrap().len(), 4);
         assert_eq!(sub_agents[0]["name"], "office-worker");
         assert_eq!(sub_agents[1]["name"], "office-reviewer");
         assert_eq!(sub_agents[2]["name"], "office-researcher");
+        assert_eq!(sub_agents[3]["name"], "office-auditor");
 
         // Check contributes.tools
         let tools = &value["contributes"]["tools"];
@@ -539,5 +571,10 @@ mod tests {
         assert_eq!(config.worker_max_runtime_ms, 20 * 60 * 1000);
         assert_eq!(config.worker_model, None);
         assert_eq!(config.reviewer_model, None);
+        // 6.2c defaults: the safeguard gate is ON, the clean-build pass grade is a strict 98,
+        // and the safeguard resolves against the "safeguard" role.
+        assert_eq!(config.crd_pass_grade, 98);
+        assert!(config.assumption_check);
+        assert_eq!(config.safeguard_role, "safeguard");
     }
 }

@@ -63,6 +63,11 @@ fn project(slug: &str, phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         trd_markdown: String::new(),
         research_notes: String::new(),
         research: None,
+        crd_markdown: String::new(),
+        audit: None,
+        audit_rounds: 0,
+        last_audit_grade: None,
+        pending_assumptions: vec![],
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -389,6 +394,8 @@ fn config_set_applies_partial_update_including_keep_desks() {
             worker_model: None,
             reviewer_model: None,
             keep_desks: Some(true),
+            crd_pass_grade: None,
+            assumption_check: None,
         }),
         2_000,
     );
@@ -418,6 +425,8 @@ fn config_set_max_workers_is_clamped_to_the_project_ceiling() {
             worker_model: None,
             reviewer_model: None,
             keep_desks: None,
+            crd_pass_grade: None,
+            assumption_check: None,
         }),
         2_000,
     );
@@ -440,6 +449,8 @@ fn config_set_on_a_non_owned_project_is_dropped_not_applied() {
             worker_model: None,
             reviewer_model: None,
             keep_desks: Some(true),
+            crd_pass_grade: None,
+            assumption_check: None,
         }),
         2_000,
     );
@@ -533,6 +544,16 @@ fn drafting(slug: &str) -> Project {
     project(slug, ProjectPhase::Drafting, vec![])
 }
 
+/// A Drafting project with the 6.2c safeguard gate disabled, so a captured PRD/TRD/CRD fence
+/// proceeds STRAIGHT to its pipeline stage (research/CRD/breakdown). Used to isolate the
+/// research/TRD/CRD pipeline mechanics from the assumption gate, which has its own dedicated
+/// wiring test (`prd_fence_runs_assume_check_then_spawns_research`).
+fn drafting_no_gate(slug: &str) -> Project {
+    let mut p = drafting(slug);
+    p.config.assumption_check = false;
+    p
+}
+
 fn invoke_done(req_id: u64, result: Result<String, String>) -> handlers::Input {
     handlers::Input::Command(handlers::Command::InvokeDone { req_id, result })
 }
@@ -608,7 +629,7 @@ fn persona_reply_with_prd_fence_lands_prd_and_kicks_research() {
     let fake = FakeInvoker::default();
     d.set_invoker(Box::new(fake.clone()));
 
-    d.insert_for_test(drafting("a"), 1_000);
+    d.insert_for_test(drafting_no_gate("a"), 1_000);
     d.handle(
         handlers::Input::Command(handlers::Command::Brief {
             project: Some("a".to_string()),
@@ -659,7 +680,7 @@ fn research_agents_done_fetches_findings_and_drafts_the_trd() {
     let fake = FakeInvoker::default();
     d.set_invoker(Box::new(fake.clone()));
 
-    d.insert_for_test(drafting("a"), 1_000);
+    d.insert_for_test(drafting_no_gate("a"), 1_000);
     d.handle(
         handlers::Input::Command(handlers::Command::Brief {
             project: Some("a".to_string()),
@@ -725,6 +746,134 @@ fn reconcile_runtime_ceiling_kills_over_age_researcher_and_degrades() {
         fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::Trd),
         "Drafting degrades to a PRD-only TRD invoke"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8b. safeguard no-assume gate wiring (6.2c feature C)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prd_fence_runs_assume_check_off_loop_on_safeguard_role_then_research_on_clean() {
+    // With the gate ON (default) a captured PRD submits an AssumeCheck invoke OFF-loop on the
+    // safeguard role — no research spawn yet. A clean check then spawns the researcher.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 700, "status": "spawned" }));
+    let mut d = driver(store, host);
+    let fake = FakeInvoker::default();
+    d.set_invoker(Box::new(fake.clone()));
+
+    d.insert_for_test(drafting("a"), 1_000); // gate ON (default config)
+    d.handle(
+        handlers::Input::Command(handlers::Command::Brief {
+            project: Some("a".to_string()),
+            message: "simple todo app".to_string(),
+        }),
+        1_000,
+    );
+    let persona_id = fake.jobs.lock().unwrap()[0].req_id;
+    d.handle(invoke_done(persona_id, Ok("```prd\n# Todo\nBuild it.\n```".to_string())), 2_000);
+
+    // The gate invoke was submitted on the safeguard role; NO research spawn happened.
+    let gate_id = {
+        let jobs = fake.jobs.lock().unwrap();
+        let gate = jobs
+            .iter()
+            .find(|j| j.purpose == InvokePurpose::AssumeCheckPrd)
+            .expect("an assume-check invoke was submitted");
+        assert_eq!(gate.role, "safeguard", "the gate runs on the safeguard role");
+        gate.req_id
+    };
+    assert!(d.project("a").unwrap().research.is_none(), "research is gated behind the check");
+    assert_eq!(call_count(&d.host, "sessions.spawn_into"), 0, "no research spawn until the check clears");
+
+    // A clean check -> the researcher spawns (same host path as before the gate existed).
+    d.handle(invoke_done(gate_id, Ok("ASSUME-CHECK\nverdict: clean\n".to_string())), 3_000);
+    let spawn = last_call(&d.host, "sessions.spawn_into").expect("a research spawn after a clean check");
+    assert_eq!(spawn.get("agent").and_then(Value::as_str), Some("office-researcher"));
+    assert!(d.project("a").unwrap().research.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// 8c. clean-build auditor spawn wiring (6.2c feature B)
+// ---------------------------------------------------------------------------
+
+fn reviewer_binding(agent_id: u64, spawned_at_ms: u64) -> AgentBinding {
+    AgentBinding {
+        ext_agent_id: agent_id,
+        session: "sess-x".to_string(),
+        spawned_at_ms,
+        kind: AgentKind::Reviewer,
+    }
+}
+
+#[test]
+fn completion_with_crd_spawns_office_auditor_and_records_its_id() {
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    // The last reviewer passes, then the auditor is spawned into the bound session.
+    host.script("agents.result", json!({ "agentId": 500, "output": "OFFICE-REVIEW\nverdict: pass\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 900, "status": "spawned" }));
+    let mut d = driver(store, host);
+
+    let mut p = project(
+        "auth",
+        ProjectPhase::Running,
+        vec![task("auth/t1", TaskState::Review { binding: Some(reviewer_binding(500, 1_000)), attempt: 1 })],
+    );
+    p.crd_markdown = "# CRD\n- README present (100 pts)".to_string();
+    d.insert_for_test(p, 1_000);
+
+    // The reviewer finishes -> the last task is Done -> the auditor is spawned (not Done yet).
+    d.handle(
+        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 500, status: "done".to_string() }),
+        2_000,
+    );
+
+    let spawn = last_call(&d.host, "sessions.spawn_into").expect("an auditor spawn");
+    assert_eq!(spawn.get("agent").and_then(Value::as_str), Some("office-auditor"));
+    assert_eq!(spawn.get("notify").and_then(Value::as_bool), Some(true));
+    assert_eq!(spawn.get("session").and_then(Value::as_str), Some("sess-x"));
+
+    let a = d.project("auth").unwrap();
+    assert!(matches!(a.phase, ProjectPhase::Running), "not Done — the audit gates completion");
+    match &a.audit {
+        Some(b) => {
+            assert_eq!(b.ext_agent_id, 900, "the real auditor id is recorded on the project");
+            assert_eq!(b.kind, AgentKind::Auditor);
+        }
+        None => panic!("an audit binding must be recorded after the spawn"),
+    }
+}
+
+#[test]
+fn auditor_cross_process_spawn_degrades_to_done_without_releasing_lease() {
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("agents.result", json!({ "agentId": 500, "output": "OFFICE-REVIEW\nverdict: pass\n" }));
+    // The bound session moved off-daemon: the auditor spawn is a fire-and-forget `sent`.
+    host.script("sessions.spawn_into", json!({ "status": "sent", "session": "sess-x" }));
+    let mut d = driver(store, host);
+
+    let mut p = project(
+        "auth",
+        ProjectPhase::Running,
+        vec![task("auth/t1", TaskState::Review { binding: Some(reviewer_binding(500, 1_000)), attempt: 1 })],
+    );
+    p.crd_markdown = "# CRD".to_string();
+    d.insert_for_test(p, 1_000);
+    assert!(d.holds_lease("auth"));
+
+    d.handle(
+        handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 500, status: "done".to_string() }),
+        2_000,
+    );
+
+    let a = d.project("auth").unwrap();
+    assert!(matches!(a.phase, ProjectPhase::Done { .. }), "a cross-process auditor spawn degrades to Done");
+    assert!(a.audit.is_none());
+    // Unlike a worker cross-process spawn (5.6), an auditor degrade never releases the lease.
+    assert!(d.holds_lease("auth"), "the audit degrade path keeps the lease");
 }
 
 #[test]

@@ -150,4 +150,38 @@ describe('Prd docs tab renders the TRD + research sections', () => {
     expect(container.textContent).toContain('research notes');
     expect(container.innerHTML).toContain('reqwest 0.12');
   });
+
+  // 6.2c: the CRD section + the amber pending-assumptions strip.
+  it('renders the clean-build-requirements section when a CRD is present', () => {
+    act(() => {
+      root.render(
+        React.createElement(Prd, {
+          project: project({ prdMarkdown: '# PRD', crdMarkdown: '# CRD\nNo unwired files allowed.' }),
+        }),
+      );
+    });
+    expect(container.textContent).toContain('clean-build requirements');
+    expect(container.innerHTML).toContain('No unwired files allowed.');
+  });
+
+  it('renders an amber strip listing pending assumptions', () => {
+    act(() => {
+      root.render(
+        React.createElement(Prd, {
+          project: project({ prdMarkdown: '# PRD', pendingAssumptions: ['assumed Postgres', 'assumed React'] }),
+        }),
+      );
+    });
+    expect(container.textContent).toContain('2 unapproved assumptions');
+    expect(container.textContent).toContain('assumed Postgres');
+    expect(container.textContent).toContain('assumed React');
+  });
+
+  it('omits the CRD section and the assumptions strip when both are absent', () => {
+    act(() => {
+      root.render(React.createElement(Prd, { project: project({ prdMarkdown: '# PRD only' }) }));
+    });
+    expect(container.textContent).not.toContain('clean-build requirements');
+    expect(container.textContent).not.toContain('unapproved assumption');
+  });
 });

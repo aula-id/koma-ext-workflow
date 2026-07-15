@@ -7,6 +7,10 @@ export interface ProjectConfig {
   workerModel?: string;
   reviewerModel?: string;
   keepDesks?: boolean;
+  /** Minimum CRD clean-build audit grade (0-100) to complete instead of remediating (6.2c). */
+  crdPassGrade?: number;
+  /** Whether the safeguard no-assume gate runs after each drafting doc capture (6.2c). */
+  assumptionCheck?: boolean;
 }
 
 /** Project lifecycle phase, per docs/PANEL_PROTOCOL.md 2.1 and office-core
@@ -29,6 +33,8 @@ export interface Project {
   lastNotice?: string;
   truncated?: boolean;
   config?: ProjectConfig;
+  /** The last clean-build audit grade (0-100), full snapshot only (6.2c); shown on the row. */
+  lastAuditGrade?: number | null;
   [key: string]: any;
 }
 
@@ -69,6 +75,7 @@ export const useStore = create<StoreState>((set, get) => ({
         runningCount: p.tasks ? p.tasks.filter((t: any) => t.state === 'onprogress').length : 0,
         parkedCount: p.tasks ? p.tasks.filter((t: any) => t.state === 'parked').length : 0,
         lastNotice: p.outbox && p.outbox.length > 0 ? p.outbox[0].text : undefined,
+        lastAuditGrade: p.lastAuditGrade ?? null,
       })),
     });
   },

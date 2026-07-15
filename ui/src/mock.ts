@@ -38,6 +38,8 @@ function defaultConfig(overrides: Record<string, unknown> = {}): Record<string, 
     workerModel: undefined,
     reviewerModel: undefined,
     keepDesks: false,
+    crdPassGrade: 98,
+    assumptionCheck: true,
     ...overrides,
   };
 }
@@ -246,6 +248,7 @@ function buildRunningProject() {
       { id: 'notif/story-inbox', title: 'Inbox surface', tasks: ['notif/t3', 'notif/t6', 'notif/t8'] },
     ],
     prdMarkdown: '# Notifications Revamp\n\nUnify email/push/SMS/Slack delivery behind one fanout pipeline.',
+    lastAuditGrade: 96,
     officeTranscript: [],
     officeSummary: '',
     outbox: [],
@@ -327,6 +330,29 @@ function buildDraftingProject() {
     '- Pitfall: trailing-12-month windows drift — recompute from the ledger, do not mutate in place.',
   ].join('\n');
 
+  const crdMarkdown = [
+    '# Clean-build Requirements',
+    '',
+    '## Expected file tree',
+    '',
+    '- `src/tiers/` — tier engine (recompute + lookup), imported by the API layer',
+    '- `migrations/` — the `user_tier` materialized view; no new ledger table',
+    '- `README.md` — setup + run instructions',
+    '',
+    '## No trash',
+    '',
+    '- No `.bak`/temp files, no dead deps, no commented-out code, no debug prints left in.',
+    '- Every module is imported by something (no unwired files).',
+    '',
+    '## Grading rubric (weights sum to 100)',
+    '',
+    '- Builds + lints clean — 30',
+    '- File-tree shape matches — 20',
+    '- No unwired/trash files — 20',
+    '- Tier recompute idempotent + ledger-driven — 20',
+    '- README present + accurate — 10',
+  ].join('\n');
+
   return {
     id: 'loyalty',
     name: 'Loyalty Program Redesign',
@@ -339,6 +365,11 @@ function buildDraftingProject() {
     prdMarkdown,
     trdMarkdown,
     researchNotes,
+    crdMarkdown,
+    pendingAssumptions: [
+      'Assumed tier downgrades happen at renewal, but the user left downgrade timing open.',
+      'Assumed Redis 7 for BullMQ; the user never named a cache.',
+    ],
     officeTranscript: [
       { who: 'user', text: 'We want to redesign the loyalty program around tiers instead of a flat points balance.' },
       { who: 'office', text: 'Got it. Should tiers be based on trailing spend, lifetime spend, or something else?' },
@@ -611,6 +642,8 @@ function handleOp(payload: any): any {
       if (payload.workerModel !== undefined) next.workerModel = payload.workerModel;
       if (payload.reviewerModel !== undefined) next.reviewerModel = payload.reviewerModel;
       if (payload.keepDesks !== undefined) next.keepDesks = payload.keepDesks;
+      if (payload.crdPassGrade !== undefined) next.crdPassGrade = clampInt(payload.crdPassGrade, 0, 100, next.crdPassGrade as number);
+      if (payload.assumptionCheck !== undefined) next.assumptionCheck = payload.assumptionCheck;
       p.config = next;
       schedulePush();
       return ok();
@@ -632,6 +665,9 @@ function handleOp(payload: any): any {
           prdMarkdown: '',
           trdMarkdown: '',
           researchNotes: '',
+          crdMarkdown: '',
+          pendingAssumptions: [],
+          lastAuditGrade: null,
           officeTranscript: [],
           officeSummary: '',
           outbox: [],

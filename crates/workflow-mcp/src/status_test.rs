@@ -45,6 +45,11 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         trd_markdown: String::new(),
         research_notes: String::new(),
         research: None,
+        crd_markdown: String::new(),
+        audit: None,
+        audit_rounds: 0,
+        last_audit_grade: None,
+        pending_assumptions: vec![],
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: Some(PathBuf::from("/ws/deliver")),
@@ -90,9 +95,12 @@ fn seed() -> (tempfile::TempDir, PathBuf) {
         OutboundNotice { id: 1, text: "done soon".to_string(), sent: false, paused: false },
         OutboundNotice { id: 2, text: "already sent".to_string(), sent: true, paused: false },
     ];
-    // PRD + TRD present, research not yet run -> digest docs line reads yes/yes/no.
+    // PRD + TRD + CRD present, research not yet run -> digest docs line reads yes/yes/no/yes.
+    // A recorded audit grade surfaces on its own line.
     shop.prd_markdown = "# Shop\nbuild the store".to_string();
     shop.trd_markdown = "# TRD\nstack choices".to_string();
+    shop.crd_markdown = "# CRD\nclean-build checklist".to_string();
+    shop.last_audit_grade = Some(88);
     store.save_project(&shop).unwrap();
 
     let blog = project(
@@ -121,7 +129,8 @@ fn all_projects_digest_reports_counts_parked_bounces_and_outbox() {
     assert!(out.contains("parked: shop/e/s/t3 (bounce budget exceeded)"), "{out}");
     assert!(out.contains("bounces: 5"), "{out}");
     assert!(out.contains("outbox: 1 pending"), "{out}");
-    assert!(out.contains("docs: prd yes, trd yes, research no"), "{out}");
+    assert!(out.contains("docs: prd yes, trd yes, research no, crd yes"), "{out}");
+    assert!(out.contains("audit: 88"), "the last clean-build audit grade surfaces: {out}");
 
     // Halted phase renders its reason; both projects appear, most-recent (higher seq) first.
     assert!(out.contains("blog (Company Blog) - halted: reviewer down"), "{out}");

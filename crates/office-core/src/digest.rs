@@ -59,6 +59,9 @@ fn attention_lines(p: &Project) -> Vec<String> {
                 ParkReason::SpawnFailed(r) => {
                     format!("spawn failed: {}", truncate_bytes(r, CAP_ATTENTION_REASON))
                 }
+                ParkReason::AuditFailed(r) => {
+                    format!("audit failed: {}", truncate_bytes(r, CAP_ATTENTION_REASON))
+                }
             };
             out.push(format!("{} parked: {}", t.id.0, label));
         }
@@ -242,10 +245,17 @@ fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
 
     if mode == SnapshotMode::Full {
         obj["prdMarkdown"] = json!(p.prd_markdown);
-        // The TRD + research notes (6.2b) ride full mode exactly like prdMarkdown; summary
-        // mode drops all three under the 900KB size guard.
+        // The TRD + research notes (6.2b) + CRD (6.2c) ride full mode exactly like prdMarkdown;
+        // summary mode drops them all under the 900KB size guard.
         obj["trdMarkdown"] = json!(p.trd_markdown);
         obj["researchNotes"] = json!(p.research_notes);
+        obj["crdMarkdown"] = json!(p.crd_markdown);
+        // The last clean-build audit grade (6.2c) — surfaced on the dashboard row + MCP status
+        // line when present (null when the project was never audited).
+        obj["lastAuditGrade"] = json!(p.last_audit_grade);
+        // Ungrounded assumptions the safeguard flagged in the last doc gate (6.2c): the docs tab
+        // renders these as an amber pending-assumptions strip while the pipeline waits.
+        obj["pendingAssumptions"] = json!(p.pending_assumptions);
         obj["officeTranscript"] = json!(p
             .office_transcript
             .iter()
@@ -254,13 +264,15 @@ fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
         obj["officeSummary"] = json!(p.office_summary);
         // The panel's `config_set` form (Settings.tsx) needs to read back what it last
         // saved (10.2 round-trip); only the fields that form edits (not `officeRole`/
-        // `workerMaxRuntimeMs`, which have no panel affordance yet).
+        // `workerMaxRuntimeMs`/`safeguardRole`, which have no panel affordance yet).
         obj["config"] = json!({
             "maxWorkers": p.config.max_workers,
             "bounceBudget": p.config.bounce_budget,
             "workerModel": p.config.worker_model,
             "reviewerModel": p.config.reviewer_model,
             "keepDesks": p.config.keep_desks,
+            "crdPassGrade": p.config.crd_pass_grade,
+            "assumptionCheck": p.config.assumption_check,
         });
     }
 

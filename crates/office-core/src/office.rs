@@ -61,9 +61,24 @@ pub enum InvokePurpose {
     Fold,
     /// The Technical Requirements Document authoring call (ARCHITECTURE.md 6.2b), issued after
     /// web-research (or a research degrade) lands during Drafting. `Ok` with a ```trd fence ->
-    /// store `trd_markdown` and request the breakdown; a missing fence or any `Err` STILL
-    /// requests the breakdown (from the PRD alone) — Drafting never wedges on a TRD failure.
+    /// store `trd_markdown` and run the safeguard gate then the CRD; a missing fence or any
+    /// `Err` STILL proceeds to the CRD (from the PRD alone) — Drafting never wedges on a TRD
+    /// failure.
     Trd,
+    /// The Clean-build Requirement Document authoring call (ARCHITECTURE.md 6.2c), issued after
+    /// the TRD (and its safeguard gate). `Ok` with a ```crd fence -> store `crd_markdown`, run
+    /// the safeguard gate, then request the breakdown; a missing fence or any `Err` STILL
+    /// requests the breakdown — the project just completes without a clean-build audit.
+    Crd,
+    /// The safeguard no-assume gate over the PRD (ARCHITECTURE.md 6.2c). Runs on the
+    /// `safeguard_role`. `clean` -> proceed to research; `assumptions` -> stop with
+    /// `pending_assumptions`; `Err` -> FAIL-OPEN (proceed). Copy/Eq is preserved by using a
+    /// distinct variant per doc instead of a payload.
+    AssumeCheckPrd,
+    /// The safeguard no-assume gate over the TRD (6.2c). `clean` -> proceed to the CRD invoke.
+    AssumeCheckTrd,
+    /// The safeguard no-assume gate over the CRD (6.2c). `clean` -> proceed to the breakdown.
+    AssumeCheckCrd,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,12 +133,26 @@ fn render_turns(turns: &[&ChatMsg]) -> String {
     s
 }
 
+/// The no-assume safeguard clause (ARCHITECTURE.md 6.2c) appended to every doc-authoring
+/// contract — PRD ([`PERSONA_CONTRACT`]), TRD ([`build_trd_prompt`]), and CRD
+/// ([`build_crd_prompt`]). Every choice the user did not state, research did not ground, and the
+/// user did not delegate must live under "Open questions", never silently in the doc body — this
+/// is what the safeguard gate ([`build_assume_check_prompt`]) then verifies.
+pub const NO_ASSUME_CLAUSE: &str = "\nDo NOT assume anything the user did not state. Every \
+choice that is not user-stated, research-grounded, or explicitly delegated ('you decide' / 'up \
+to you') belongs under an 'Open questions' section, never in the doc body. Record delegated \
+choices as 'Delegated decision: ...'.\n";
+
 const PERSONA_CONTRACT: &str = "\nRespond as the Workflow front office: negotiate scope, \
 answer clearly, and drive toward a PRD. Be concise and decisive.\n\
 When (and only when) the scope is agreed, emit the COMPLETE PRD as markdown inside a \
 fenced block that starts with ```prd and ends with ``` — that exact fence is how the \
 system captures the PRD and starts the production line; a PRD outside that fence does \
-not count and nothing will happen.\n";
+not count and nothing will happen.\n\
+Do NOT assume anything the user did not state. Every choice that is not user-stated, \
+research-grounded, or explicitly delegated ('you decide' / 'up to you') belongs under an \
+'Open questions' section, never in the PRD body. Record delegated choices as 'Delegated \
+decision: ...'.\n";
 
 /// Capture the LAST ` ```<tag> ` fenced block from a persona reply, if any — the generalized
 /// engine behind both PRD (6.2) and TRD (6.2b) capture. The fence is the explicit capture
@@ -351,6 +380,90 @@ that starts with ```trd and ends with ``` — that exact fence is how the system
 TRD. Cover, as sections: technology stack with SPECIFIC current stable versions, architecture, \
 data model, API surface, testing strategy, deployment, and constraints. Be concrete and \
 decisive; this document drives the epic/story/task breakdown.\n",
+    );
+    prompt.push_str(NO_ASSUME_CLAUSE);
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// Build the CRD authoring `(system, prompt)` for `models.invoke` (ARCHITECTURE.md 6.2c). The
+/// CRD is a Clean-build Requirement Document: a concrete, gradeable acceptance checklist for
+/// THIS project's delivered tree — expected file-tree shape, no unwired files (modules nothing
+/// imports), no trash (temp/`.bak`/dead deps/commented-out code/debug prints), build + lint
+/// pass, a README present — PLUS a grading rubric whose point weights sum to 100. It drives the
+/// completion-time auditor. Built from the PRD (+ TRD when present), byte-bounded like
+/// [`build_trd_prompt`].
+pub fn build_crd_prompt(p: &Project) -> (String, String) {
+    let system = prompts::office_system(&board_digest(p));
+    let mut prompt = String::new();
+    prompt.push_str("Draft the Clean-build Requirement Document (CRD) for the project below.\n\n");
+    prompt.push_str("PRD:\n");
+    prompt.push_str(&truncate_bytes(&p.prd_markdown, HARD_PROMPT_CAP / 3));
+    if !p.trd_markdown.trim().is_empty() {
+        prompt.push_str("\n\nTRD (technical requirements — the CRD must match these choices):\n");
+        prompt.push_str(&truncate_bytes(&p.trd_markdown, HARD_PROMPT_CAP / 3));
+    }
+    prompt.push_str(
+        "\n\nEmit the COMPLETE Clean-build Requirement Document as markdown inside a fenced block \
+that starts with ```crd and ends with ``` — that exact fence is how the system captures the CRD. \
+It is the checklist a read-only auditor will grade the delivered code against, so make every \
+item concrete and checkable by inspecting the delivered tree. Cover, as sections:\n\
+- Expected file-tree shape: the directories/files a correct delivery must contain (and must NOT).\n\
+- No unwired files: every module/file is imported/used by something; nothing dangling.\n\
+- No trash: no temp/scratch/`.bak` files, no dead dependencies, no commented-out code, no debug \
+prints/logging left in.\n\
+- Build + lint: the project builds and lints/type-checks clean with the stack's standard tooling.\n\
+- Docs: a README (or equivalent) is present and describes setup/run.\n\
+- Any project-specific correctness gates implied by the PRD/TRD.\n\
+Then a 'Grading rubric' section: a bulleted list of checks, each with an explicit point weight, \
+whose weights SUM TO EXACTLY 100.\n",
+    );
+    prompt.push_str(NO_ASSUME_CLAUSE);
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// Build the safeguard no-assume gate `(system, prompt)` for one drafting doc (ARCHITECTURE.md
+/// 6.2c). Given ONLY the user's own chat turns (transcript `User` entries) + the research notes
+/// + the doc itself, the safeguard lists every choice in the doc that the user did NOT state,
+/// research did NOT ground, and the user did NOT explicitly delegate. `doc_label` is the human
+/// label ("PRD"/"TRD"/"CRD"); `doc_body` is that doc's markdown. Pure + byte-bounded; the caller
+/// (kernel) emits it on the `safeguard_role`.
+pub fn build_assume_check_prompt(p: &Project, doc_label: &str, doc_body: &str) -> (String, String) {
+    let system = "You are a strict requirements safeguard. Your ONE job is to catch ungrounded \
+assumptions: choices a document asserts that the user never stated, that were not established by \
+research, and that the user did not explicitly delegate. You do not rewrite the document; you \
+only audit it for unapproved assumptions. Be precise and terse."
+        .to_string();
+
+    // Only the user's OWN turns are ground truth — the office's prior replies are not (an
+    // assumption the office already made is exactly what we are trying to catch).
+    let user_turns: String = p
+        .office_transcript
+        .iter()
+        .filter(|m| matches!(m.who, ChatAuthor::User))
+        .map(|m| format!("- {}\n", m.text))
+        .collect();
+
+    let mut prompt = String::new();
+    prompt.push_str("USER STATEMENTS (the ONLY things the user actually said — ground truth):\n");
+    if user_turns.trim().is_empty() {
+        prompt.push_str("(none recorded)\n");
+    } else {
+        prompt.push_str(&truncate_bytes(&user_turns, HARD_PROMPT_CAP / 4));
+    }
+    if !p.research_notes.trim().is_empty() {
+        prompt.push_str("\nRESEARCH FINDINGS (also count as grounded):\n");
+        prompt.push_str(&truncate_bytes(&p.research_notes, HARD_PROMPT_CAP / 4));
+    }
+    prompt.push_str(&format!("\n{} UNDER REVIEW:\n", doc_label));
+    prompt.push_str(&truncate_bytes(doc_body, HARD_PROMPT_CAP / 3));
+    prompt.push_str(
+        "\n\nList every choice in the document that the user did NOT state, research did NOT \
+ground, and the user did NOT explicitly delegate ('you decide' / 'up to you' / recorded as a \
+'Delegated decision'). A delegated or research-grounded choice is NOT an assumption. Output \
+ONLY this block, nothing else:\n\
+ASSUME-CHECK\n\
+verdict: clean | assumptions\n\
+- <one ungrounded assumption per line; omit these lines entirely when verdict is clean>\n",
     );
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }

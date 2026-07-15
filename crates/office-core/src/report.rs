@@ -144,6 +144,32 @@ fn parse_ack_comments(map: &HashMap<String, Vec<String>>) -> Vec<CommentId> {
 const REPORT_KEYS: &[&str] = &["status", "summary", "delivered", "ack-comments", "blocked-reason"];
 const REVIEW_KEYS: &[&str] = &["verdict", "reasons"];
 const RESEARCH_KEYS: &[&str] = &["findings"];
+const AUDIT_KEYS: &[&str] = &["grade", "failures"];
+const ASSUME_KEYS: &[&str] = &["verdict"];
+
+/// A parsed `OFFICE-AUDIT` block (ARCHITECTURE.md 6.2c). `grade` is `None` when no numeric
+/// grade could be read (an inconclusive audit); the kernel fails OPEN on that (completes with a
+/// notice) rather than punishing the delivery for the auditor's formatting slip.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditReport {
+    pub grade: Option<u32>,
+    pub failures: Vec<String>,
+}
+
+/// The verdict of an `ASSUME-CHECK` block (ARCHITECTURE.md 6.2c safeguard gate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssumeVerdict {
+    Clean,
+    Assumptions,
+}
+
+/// A parsed `ASSUME-CHECK` block. `items` are the ungrounded assumptions the safeguard listed
+/// (empty on a clean verdict).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssumeCheck {
+    pub verdict: AssumeVerdict,
+    pub items: Vec<String>,
+}
 
 /// Parse the LAST `OFFICE-RESEARCH` block's `findings` value out of `text` (ARCHITECTURE.md
 /// 6.2b), tolerant exactly like [`parse_report`]/[`parse_review`]: fence-tolerant marker
@@ -153,6 +179,82 @@ const RESEARCH_KEYS: &[&str] = &["findings"];
 pub fn parse_research(text: &str) -> Option<String> {
     let map = scan_block(text, "OFFICE-RESEARCH", RESEARCH_KEYS)?;
     joined(&map, "findings")
+}
+
+/// Strip a leading markdown/bullet marker (`- `, `* `, `1. `) and surrounding whitespace from a
+/// list line, so folded `failures:`/assumption lines read as plain items.
+fn strip_bullet(line: &str) -> String {
+    let t = line.trim();
+    let t = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("• "))
+        .unwrap_or(t);
+    t.trim().to_string()
+}
+
+/// Parse the LAST `OFFICE-AUDIT` block out of `text` (ARCHITECTURE.md 6.2c), tolerant like the
+/// other trailer scanners. `grade:` is read as a clamped 0..=100 integer (the first run of
+/// digits on the line, so `grade: 87/100` or `grade: 87 (pass)` both read 87); the `failures:`
+/// value and its folded continuation lines become the failure items (bullets stripped).
+pub fn parse_audit(text: &str) -> AuditReport {
+    let map = match scan_block(text, "OFFICE-AUDIT", AUDIT_KEYS) {
+        Some(m) => m,
+        None => return AuditReport::default(),
+    };
+
+    let grade = map
+        .get("grade")
+        .and_then(|v| v.first())
+        .and_then(|s| parse_first_u32(s))
+        .map(|n| n.min(100));
+
+    let failures = map
+        .get("failures")
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|l| strip_bullet(l))
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    AuditReport { grade, failures }
+}
+
+/// The first contiguous run of ASCII digits in `s`, parsed as `u32` (tolerates `87/100`,
+/// `grade 87`, surrounding prose).
+fn parse_first_u32(s: &str) -> Option<u32> {
+    let digits: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u32>().ok()
+}
+
+/// Parse the LAST `ASSUME-CHECK` block out of `text` (ARCHITECTURE.md 6.2c). The block is
+/// `verdict: clean|assumptions` followed by bare `- <item>` lines; since the scanner folds
+/// keyless continuation lines into the open `verdict` key, the FIRST folded line is the verdict
+/// word and the rest are the assumption items. `None` when no block is present — the kernel
+/// fails OPEN on that (proceeds) rather than wedging the pipeline.
+pub fn parse_assume_check(text: &str) -> Option<AssumeCheck> {
+    let map = scan_block(text, "ASSUME-CHECK", ASSUME_KEYS)?;
+    let lines = map.get("verdict")?;
+    let verdict_word = lines.first()?.trim().to_ascii_lowercase();
+    let verdict = if verdict_word.starts_with("clean") {
+        AssumeVerdict::Clean
+    } else {
+        AssumeVerdict::Assumptions
+    };
+    let items: Vec<String> = lines
+        .iter()
+        .skip(1)
+        .map(|l| strip_bullet(l))
+        .filter(|l| !l.is_empty())
+        .collect();
+    Some(AssumeCheck { verdict, items })
 }
 
 /// Parse the LAST `OFFICE-REPORT` trailer out of `text`.

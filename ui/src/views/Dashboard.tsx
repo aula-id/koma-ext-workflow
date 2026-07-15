@@ -50,6 +50,8 @@ const ProjectRow: React.FC<{ project: Project; onClick?: () => void }> = ({ proj
   if (running > 0) stats.push(`${running} running`);
   if (parked > 0) stats.push(`${parked} parked`);
   stats.push(total > 0 ? `${done}/${total} done` : 'no tasks');
+  // The last clean-build audit grade (6.2c), only when the project has been audited.
+  if (project.lastAuditGrade != null) stats.push(`audit ${project.lastAuditGrade}`);
 
   return (
     <div

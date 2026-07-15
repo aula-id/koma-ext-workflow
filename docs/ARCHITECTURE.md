@@ -723,6 +723,47 @@ Drafting or Ready; in Ready it does NOT re-run the breakdown automatically — t
 > restriction (web+read only) is pending host support, so read/web-only is enforced by the
 > spawn prompt for now.
 
+### 6.2c CRD + clean-build audit + no-assume safeguard
+
+Three deterministic additions harden the drafting pipeline and the completion of a project.
+
+**(A) CRD.** After the TRD (and its safeguard gate) the office authors a **Clean-build Requirement
+Document** — `InvokePurpose::Crd`, a ```crd fence captured by `office::extract_fenced` into
+`Project.crd_markdown`. The CRD is a CONCRETE, gradeable acceptance checklist for THIS project's
+delivered tree (expected file-tree shape; no unwired files; no trash — temp/`.bak`/dead deps/
+commented-out code/debug prints; build + lint pass; README present) plus a grading rubric whose
+weights sum to 100. A missing ```crd fence or any `Err` STILL requests the breakdown — the project
+then just completes without a clean-build audit (never wedges). A chat-authored ```crd updates it
+like a chat ```trd.
+
+**(B) Clean-build audit gate.** When the last task passes and a project would complete
+(`maybe_complete_project`), if `crd_markdown` is non-empty the kernel spawns the read-only
+`office-auditor` (`Project.audit`, `AgentKind::Auditor`, two-phase + reconcile-covered EXACTLY like
+`research`) INSTEAD of going Done. The auditor grades the delivery path against the CRD with
+read/grep/bash inspection ONLY — never writing — and files `OFFICE-AUDIT\ngrade: <0-100>\nfailures:
+...` (tolerant-parsed by `report::parse_audit`). Deterministic result handling:
+`grade >= config.crd_pass_grade` (default 98) -> Done + notice; `grade <` threshold with
+`audit_rounds < 2` -> one high-priority Todo "CRD remediation round R" task (flows worker->review,
+then re-audits when the board is Done again); after two rounds -> a PARKED remediation task
+(`ParkReason::AuditFailed`) that the existing halt machinery halts on. Every failure mode degrades
+to Done — no CRD, a dead/timed-out/cross-process auditor, or an unparseable grade never wedges
+completion. `last_audit_grade` rides the full snapshot, the dashboard row, and the MCP status line.
+
+**(C) No-assume safeguard gate.** The PRD/TRD/CRD authoring contracts each carry a no-assume clause:
+every choice not user-stated, research-grounded, or explicitly delegated ("you decide") belongs
+under "Open questions", never in the doc body; delegated choices are recorded as "Delegated
+decision: ...". After ANY prd/trd/crd fence capture, and BEFORE the pipeline proceeds (research
+spawn / CRD invoke / breakdown), the kernel issues an `InvokePurpose::AssumeCheck{Prd,Trd,Crd}`
+invoke on `config.safeguard_role` (default `"safeguard"`). Given ONLY the user's own chat turns +
+research notes + the doc, the safeguard emits `ASSUME-CHECK\nverdict: clean|assumptions\n- <item>`
+(tolerant-parsed by `report::parse_assume_check`). `clean` -> proceed with the deferred stage;
+`assumptions` -> STOP, storing `Project.pending_assumptions` and noticing the user (the doc is
+stored/visible; a chat answer + a fresh fence re-runs the gate, and a clean check clears the list);
+`Err` -> FAIL-OPEN (proceed). `config.assumption_check` (default true) skips the gate entirely when
+false. The deferred stage is a pure function of the doc identity on the check's purpose — no hidden
+"which stage" state is persisted, so the resume point is reconstructible from `phase` + which docs
+are non-empty + `pending_assumptions` + `assumption_check` (see the kernel.rs pipeline resume rule).
+
 ### 6.3 PRD -> breakdown -> authorization flow
 
 1. **Drafting**: user talks to the office (panel chat / workflow_brief / inbox). Office

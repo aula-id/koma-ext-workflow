@@ -59,6 +59,13 @@ export interface Project {
   trdMarkdown?: string;
   /** Web-research findings (full snapshot only, 6.2b); shown collapsed under the docs. */
   researchNotes?: string;
+  /** Clean-build Requirement Document (full snapshot only, 6.2c); rendered in the docs tab. */
+  crdMarkdown?: string;
+  /** The last clean-build audit grade 0-100 (6.2c), or null if never audited. */
+  lastAuditGrade?: number | null;
+  /** Ungrounded assumptions the safeguard flagged in the last doc gate (6.2c); rendered as an
+   * amber strip at the top of the docs tab while the drafting pipeline waits on the user. */
+  pendingAssumptions?: string[];
   officeTranscript?: ChatMsg[];
   officeSummary?: string;
   outbox?: OutboundNoticeView[];

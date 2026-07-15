@@ -10,7 +10,9 @@ pub use graph::*;
 pub mod prompts;
 
 pub mod report;
-pub use report::{ReportStatus, ReportTrailer, ReviewTrailer, Verdict};
+pub use report::{
+    AssumeCheck, AssumeVerdict, AuditReport, ReportStatus, ReportTrailer, ReviewTrailer, Verdict,
+};
 
 pub mod digest;
 pub use digest::SnapshotMode;

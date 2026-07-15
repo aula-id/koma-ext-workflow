@@ -265,6 +265,56 @@ pub fn research(project: &Project) -> String {
     out
 }
 
+/// The CRD checklist is folded whole (capped) into the auditor prompt so it grades against
+/// every concrete item + the rubric, while the assembled prompt stays bounded.
+const CAP_AUDIT_CRD: usize = 8000;
+
+/// Build the clean-build auditor spawn prompt for the `office-auditor` sub-agent (ARCHITECTURE.md
+/// 6.2c). Pure string assembly like [`research`]: it hands the auditor the CRD checklist + the
+/// delivery path and instructs it to grade the delivered tree against the CRD using ONLY
+/// read/grep/bash INSPECTION — never writing, modifying, or touching VCS — and to file an
+/// `OFFICE-AUDIT` block with a 0-100 rubric grade and the failing items (tolerant-parsed by
+/// [`crate::report::parse_audit`]).
+pub fn auditor(project: &Project, delivery: &Path) -> String {
+    let project_name = truncate_bytes(&project.name, CAP_TITLE);
+    let intent = project_intent(project);
+    let crd = truncate_bytes(&project.crd_markdown, CAP_AUDIT_CRD);
+
+    let mut out = String::new();
+    out.push_str(
+        "You are the Workflow clean-build auditor. The production line believes this project is \
+complete. Before it is marked done, grade the DELIVERED code against the Clean-build Requirement \
+Document (CRD) below. Work autonomously; no human will answer questions mid-task.\n\n",
+    );
+    out.push_str(&format!("PROJECT: {} — {}\n\n", project_name, intent));
+    out.push_str(&format!("DELIVERY PATH (the tree to audit): {}\n\n", delivery.display()));
+    out.push_str("CLEAN-BUILD REQUIREMENT DOCUMENT (grade against every item + the rubric):\n");
+    out.push_str(&crd);
+    out.push_str("\n\n");
+
+    out.push_str("YOUR JOB\n");
+    out.push_str(
+        "- Inspect the delivered tree at the path above against every CRD item: expected file-tree \
+shape, no unwired files, no trash (temp/.bak/dead deps/commented-out code/debug prints), build + \
+lint pass, README present, and any project-specific gates.\n\
+- Use ONLY read / grep / bash INSPECTION commands (listing, reading, building, linting, \
+type-checking). NEVER write, create, modify, or delete any file, and NEVER touch VCS state. You \
+are grading, not fixing.\n\
+- Compute the rubric grade as an integer 0-100 by summing the points earned across the rubric \
+items. List every item that failed or partially failed.\n\n",
+    );
+
+    out.push_str(
+        "REPORT PROTOCOL — end your final message with exactly this block:\n\
+         OFFICE-AUDIT\n\
+         grade: <integer 0-100>\n\
+         failures:\n\
+         - <one failing/partial CRD item per line; omit these lines when nothing failed>\n",
+    );
+
+    out
+}
+
 /// The fixed front-office persona head for `models.invoke` `system`, with the
 /// compact board digest (`digest::context_blob`, or a similar compact rendering)
 /// appended (ARCHITECTURE.md 6.2).

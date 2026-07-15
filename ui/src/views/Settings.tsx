@@ -45,6 +45,8 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     maxWorkers: 2,
     bounceBudget: 3,
     keepDesks: false,
+    crdPassGrade: 98,
+    assumptionCheck: true,
   });
 
   useEffect(() => {
@@ -72,6 +74,9 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
       maxWorkers: project.config?.maxWorkers || 2,
       bounceBudget: project.config?.bounceBudget || 3,
       keepDesks: project.config?.keepDesks || false,
+      // `??` not `||` so a legitimate 0 is not coerced to the default.
+      crdPassGrade: project.config?.crdPassGrade ?? 98,
+      assumptionCheck: project.config?.assumptionCheck ?? true,
     });
   };
 
@@ -100,6 +105,17 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
     setFormData({ ...formData, keepDesks: !formData.keepDesks });
   };
 
+  const handleCrdPassGradeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseInt(e.target.value, 10);
+    if (!isNaN(value)) {
+      setFormData({ ...formData, crdPassGrade: Math.max(0, Math.min(100, value)) });
+    }
+  };
+
+  const handleAssumptionCheckToggle = () => {
+    setFormData({ ...formData, assumptionCheck: !formData.assumptionCheck });
+  };
+
   const handleThemeChange = (newTheme: Theme) => {
     themeManager.setTheme(newTheme);
     setTheme(newTheme);
@@ -121,6 +137,8 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
         maxWorkers: clampedMaxWorkers,
         bounceBudget: formData.bounceBudget,
         keepDesks: formData.keepDesks,
+        crdPassGrade: formData.crdPassGrade,
+        assumptionCheck: formData.assumptionCheck,
       };
 
       const result = await bridge.send(payload);
@@ -365,6 +383,42 @@ const Settings: React.FC<SettingsProps> = ({ projectId, onBack }) => {
                       <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Keep desks after completion</span>
                       <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
                         retain task working directories for debugging
+                      </span>
+                    </span>
+                  </label>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={formData.crdPassGrade}
+                      onChange={handleCrdPassGradeChange}
+                      data-testid="settings-crd-pass-grade"
+                      style={{ width: 64 }}
+                    />
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>Clean-build pass grade</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        0-100; the minimum audit grade to complete instead of opening a remediation round
+                      </span>
+                    </span>
+                  </label>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      aria-checked={formData.assumptionCheck}
+                      checked={formData.assumptionCheck}
+                      data-testid="settings-assumption-check-toggle"
+                      onChange={handleAssumptionCheckToggle}
+                      style={{ width: 16, height: 16, accentColor: 'var(--wf-accent)' }}
+                    />
+                    <span>
+                      <span style={{ color: 'var(--wf-fg)', fontSize: '0.82rem' }}>No-assume safeguard checks</span>
+                      <span style={{ color: 'var(--wf-dim)', fontSize: '0.72rem', display: 'block' }}>
+                        gate each drafting doc (PRD/TRD/CRD) for ungrounded assumptions before the pipeline proceeds
                       </span>
                     </span>
                   </label>

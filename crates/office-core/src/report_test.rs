@@ -136,4 +136,76 @@ mod tests {
         assert_eq!(r.verdict, Verdict::Fail);
         assert_eq!(r.reasons.as_deref(), Some("strict is strict"));
     }
+
+    // --- OFFICE-AUDIT (6.2c) ---------------------------------------------
+
+    use crate::report::{parse_assume_check, parse_audit, AssumeVerdict};
+
+    #[test]
+    fn parses_audit_grade_and_failures() {
+        let text = "I inspected the tree.\nOFFICE-AUDIT\ngrade: 72\nfailures:\n- module utils.rs is unwired\n- debug prints left in main.rs\n";
+        let r = parse_audit(text);
+        assert_eq!(r.grade, Some(72));
+        assert_eq!(
+            r.failures,
+            vec!["module utils.rs is unwired".to_string(), "debug prints left in main.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn audit_grade_tolerates_slash_and_prose_and_clamps() {
+        assert_eq!(parse_audit("OFFICE-AUDIT\ngrade: 87/100\n").grade, Some(87));
+        assert_eq!(parse_audit("OFFICE-AUDIT\ngrade: 95 (pass)\n").grade, Some(95));
+        assert_eq!(parse_audit("OFFICE-AUDIT\ngrade: 250\n").grade, Some(100), "clamped to 100");
+    }
+
+    #[test]
+    fn audit_missing_block_or_grade_is_inconclusive() {
+        assert_eq!(parse_audit("no block here").grade, None);
+        assert!(parse_audit("no block here").failures.is_empty());
+        // Block present but no numeric grade -> inconclusive (None), fail-open in the kernel.
+        assert_eq!(parse_audit("OFFICE-AUDIT\ngrade: pending\n").grade, None);
+    }
+
+    #[test]
+    fn audit_case_and_fence_tolerant_pass_with_no_failures() {
+        let text = "```\noffice-audit\nGRADE: 100\n```\n";
+        let r = parse_audit(text);
+        assert_eq!(r.grade, Some(100));
+        assert!(r.failures.is_empty());
+    }
+
+    // --- ASSUME-CHECK (6.2c) ---------------------------------------------
+
+    #[test]
+    fn parses_assume_check_clean() {
+        let c = parse_assume_check("Looks grounded.\nASSUME-CHECK\nverdict: clean\n").unwrap();
+        assert_eq!(c.verdict, AssumeVerdict::Clean);
+        assert!(c.items.is_empty());
+    }
+
+    #[test]
+    fn parses_assume_check_assumptions_with_items() {
+        // The bare `- item` lines fold into the open verdict key; the parser peels the first
+        // (verdict word) from the rest (items).
+        let text = "ASSUME-CHECK\nverdict: assumptions\n- assumed Postgres, user never said\n- picked React, not stated\n";
+        let c = parse_assume_check(text).unwrap();
+        assert_eq!(c.verdict, AssumeVerdict::Assumptions);
+        assert_eq!(
+            c.items,
+            vec!["assumed Postgres, user never said".to_string(), "picked React, not stated".to_string()]
+        );
+    }
+
+    #[test]
+    fn assume_check_missing_block_is_none() {
+        assert!(parse_assume_check("the safeguard forgot the block").is_none());
+    }
+
+    #[test]
+    fn assume_check_case_and_fence_tolerant() {
+        let c = parse_assume_check("```\nassume-check\nVERDICT: Assumptions\n- x\n```\n").unwrap();
+        assert_eq!(c.verdict, AssumeVerdict::Assumptions);
+        assert_eq!(c.items, vec!["x".to_string()]);
+    }
 }

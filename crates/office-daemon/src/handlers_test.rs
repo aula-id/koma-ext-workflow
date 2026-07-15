@@ -345,7 +345,9 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
                 "bounceBudget": 2,
                 "workerModel": "gpt-5",
                 "reviewerModel": "opus",
-                "keepDesks": true
+                "keepDesks": true,
+                "crdPassGrade": 92,
+                "assumptionCheck": false
             }
         }),
         &tx,
@@ -359,6 +361,8 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
             worker_model: Some("gpt-5".to_string()),
             reviewer_model: Some("opus".to_string()),
             keep_desks: Some(true),
+            crd_pass_grade: Some(92),
+            assumption_check: Some(false),
         }
     );
 

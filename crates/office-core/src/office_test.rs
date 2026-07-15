@@ -15,6 +15,11 @@ fn project(phase: ProjectPhase) -> Project {
         trd_markdown: String::new(),
         research_notes: String::new(),
         research: None,
+        crd_markdown: String::new(),
+        audit: None,
+        audit_rounds: 0,
+        last_audit_grade: None,
+        pending_assumptions: vec![],
         office_transcript: vec![],
         office_summary: String::new(),
         delivery_path: None,
@@ -357,4 +362,62 @@ fn build_breakdown_prompt_folds_the_trd_when_present() {
     let (_s2, compact) = office::build_breakdown_prompt(&p, None, true);
     assert!(compact.contains("axum 0.7"), "compact mode gets the TRD slice too");
     assert!(compact.contains("COMPACT MODE"));
+}
+
+// ---- CRD + safeguard prompt builders (6.2c) ----
+
+#[test]
+fn build_crd_prompt_folds_prd_and_trd_with_the_crd_contract_and_rubric() {
+    let mut p = project(ProjectPhase::Drafting);
+    p.prd_markdown = "# PRD\nCrawler.".to_string();
+    p.trd_markdown = "# TRD\nUse axum 0.7".to_string();
+    let (system, prompt) = office::build_crd_prompt(&p);
+    assert!(system.contains("front office"));
+    assert!(prompt.contains("Crawler"), "PRD is folded in");
+    assert!(prompt.contains("axum 0.7"), "TRD is folded in when present");
+    assert!(prompt.contains("```crd"), "the ```crd capture contract is stated");
+    assert!(prompt.contains("rubric") || prompt.contains("Grading rubric"), "asks for a grading rubric");
+    assert!(prompt.contains("SUM TO EXACTLY 100"), "rubric weights must total 100");
+    assert!(prompt.len() <= office::HARD_PROMPT_CAP);
+}
+
+#[test]
+fn build_crd_prompt_omits_trd_section_when_absent() {
+    let mut p = project(ProjectPhase::Drafting);
+    p.prd_markdown = "# PRD".to_string();
+    let (_s, prompt) = office::build_crd_prompt(&p);
+    assert!(!prompt.contains("TRD (technical requirements"), "no TRD section without a TRD");
+}
+
+#[test]
+fn no_assume_clause_is_on_every_doc_contract() {
+    let p = project(ProjectPhase::Drafting);
+    // The PRD persona contract, the TRD prompt, and the CRD prompt all carry the no-assume gate.
+    let (_s1, prd_prompt) = office::build_invoke(&p, "write the PRD");
+    let (_s2, trd_prompt) = office::build_trd_prompt(&p);
+    let (_s3, crd_prompt) = office::build_crd_prompt(&p);
+    for prompt in [&prd_prompt, &trd_prompt, &crd_prompt] {
+        assert!(prompt.contains("Do NOT assume"), "no-assume clause present");
+        assert!(prompt.contains("Open questions"), "ungrounded choices routed to Open questions");
+        assert!(prompt.contains("Delegated decision"), "delegated choices are recorded, not assumed");
+    }
+}
+
+#[test]
+fn build_assume_check_prompt_uses_only_user_turns_and_states_the_block() {
+    let mut p = project(ProjectPhase::Drafting);
+    p.office_transcript = vec![
+        turn(ChatAuthor::User, "build a todo app"),
+        turn(ChatAuthor::Office, "I assumed you want Postgres"),
+    ];
+    p.research_notes = "reqwest 0.12 is current".to_string();
+    let (system, prompt) = office::build_assume_check_prompt(&p, "PRD", "# PRD\nUses Postgres.");
+    assert!(system.contains("safeguard"), "system frames the safeguard role");
+    assert!(prompt.contains("build a todo app"), "the user's own turn is ground truth");
+    assert!(!prompt.contains("I assumed you want Postgres"), "the office's own reply is NOT ground truth");
+    assert!(prompt.contains("reqwest 0.12"), "research notes also count as grounded");
+    assert!(prompt.contains("PRD UNDER REVIEW"), "the doc under review is labelled");
+    assert!(prompt.contains("ASSUME-CHECK"), "the output block contract is stated");
+    assert!(prompt.contains("verdict: clean | assumptions"));
+    assert!(prompt.len() <= office::HARD_PROMPT_CAP);
 }

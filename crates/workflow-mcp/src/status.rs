@@ -95,13 +95,18 @@ fn project_block(p: &Project) -> String {
     s.push_str(&format!("  bounces: {bounces}\n"));
     let pending = p.outbox.iter().filter(|n| !n.sent).count();
     s.push_str(&format!("  outbox: {pending} pending\n"));
-    // Drafting-pipeline docs presence (ARCHITECTURE.md 6.2b): PRD -> research -> TRD.
+    // Drafting-pipeline docs presence (ARCHITECTURE.md 6.2b/6.2c): PRD -> research -> TRD -> CRD.
     s.push_str(&format!(
-        "  docs: prd {}, trd {}, research {}\n",
+        "  docs: prd {}, trd {}, research {}, crd {}\n",
         yn(!p.prd_markdown.trim().is_empty()),
         yn(!p.trd_markdown.trim().is_empty()),
         yn(!p.research_notes.trim().is_empty()),
+        yn(!p.crd_markdown.trim().is_empty()),
     ));
+    // The last clean-build audit grade (6.2c), only when the project has been audited.
+    if let Some(g) = p.last_audit_grade {
+        s.push_str(&format!("  audit: {g}\n"));
+    }
     s
 }
 
@@ -181,6 +186,7 @@ fn park_reason_label(reason: &ParkReason) -> String {
         ParkReason::ReviewBounceBudget => "bounce budget exceeded".to_string(),
         ParkReason::WorkerBlocked(r) => format!("worker blocked: {r}"),
         ParkReason::SpawnFailed(r) => format!("spawn failed: {r}"),
+        ParkReason::AuditFailed(r) => format!("audit failed: {r}"),
     }
 }
 

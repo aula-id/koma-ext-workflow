@@ -133,6 +133,38 @@ describe('Settings (real component, rendered)', () => {
     );
   });
 
+  it('reflects the assumptionCheck config on the toggle and submits it flipped (6.2c)', async () => {
+    seedProject({ assumptionCheck: true, crdPassGrade: 98 });
+    renderSettings();
+
+    const toggle = container.querySelector('[data-testid="settings-assumption-check-toggle"]') as HTMLInputElement;
+    expect(toggle).toBeTruthy();
+    expect(toggle.getAttribute('aria-checked')).toBe('true');
+    act(() => {
+      toggle.click();
+    });
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
+
+    await submitForm();
+
+    expect(bridge.send).toHaveBeenCalledWith(
+      expect.objectContaining({ op: 'config_set', project: 'p1', assumptionCheck: false }),
+    );
+  });
+
+  it('submits crdPassGrade from the real numeric input (6.2c)', async () => {
+    seedProject({ crdPassGrade: 98 });
+    renderSettings();
+
+    const input = container.querySelector('[data-testid="settings-crd-pass-grade"]') as HTMLInputElement;
+    expect(input.value).toBe('98');
+    setInputValue(input, '90');
+
+    await submitForm();
+
+    expect(bridge.send).toHaveBeenCalledWith(expect.objectContaining({ crdPassGrade: 90 }));
+  });
+
   it('submits the clamped maxWorkers value from the real input, via the real clamp function', async () => {
     seedProject();
     renderSettings();

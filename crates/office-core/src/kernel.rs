@@ -26,6 +26,32 @@
 //! kernel keeps those ledgers in `history` as tagged events and derives them with
 //! the helpers below (`next_attempt`, `spawn_failure_streak`). `bounces` is the one
 //! counter the domain models directly, and it is used verbatim.
+//!
+//! ## Drafting pipeline + resume rule (6.2b / 6.2c)
+//! Drafting is a linear pipeline: `PRD -> [gate] -> research -> TRD -> [gate] -> CRD -> [gate] ->
+//! breakdown -> Ready`. Each `[gate]` is the safeguard no-assume check (feature C): after a
+//! ```prd/```trd/```crd fence is captured, the kernel emits an `AssumeCheck{Prd,Trd,Crd}` invoke
+//! whose CLEAN verdict proceeds to that doc's successor stage (PRD->research, TRD->CRD,
+//! CRD->breakdown), and whose ASSUMPTIONS verdict STOPS the pipeline by storing
+//! `Project.pending_assumptions` and noticing the user.
+//!
+//! **No hidden "which stage is deferred" state is kept.** The successor stage is a pure function
+//! of the doc identity carried on the check's `InvokePurpose`, so it is always recomputable and
+//! survives a store reload. `pending_assumptions` (persisted) records only that the LAST gate
+//! found ungrounded assumptions; ANY subsequent clean check clears it. A stopped gate is
+//! re-entered the only way a doc is ever captured — the user answers in chat, the persona
+//! re-emits the fence, and the fresh capture re-runs the gate. If a reload lands mid-invoke the
+//! in-flight check is simply lost (like any invoke) and the next `OfficeMessage` re-runs it. So
+//! the resume point is reconstructible from pure state: `phase` + which docs are non-empty +
+//! `pending_assumptions` + `assumption_check`.
+//!
+//! ## Completion audit gate (6.2c)
+//! When the last task passes and the project would complete, [`maybe_complete_project`] spawns
+//! the project-level clean-build auditor (`Project.audit`, two-phase + reconcile-covered exactly
+//! like `research`) INSTEAD of going Done, whenever a CRD exists. The audit grade then gates Done
+//! vs. up to two automated remediation rounds vs. a parked task (`audit_rounds`, persisted). Every
+//! failure mode degrades to Done — a missing CRD, a dead/timed-out auditor, or an unparseable
+//! grade never wedges completion.
 
 use std::path::{Path, PathBuf};
 
@@ -114,6 +140,8 @@ pub enum Command {
         worker_model: Option<String>,
         reviewer_model: Option<String>,
         keep_desks: Option<bool>,
+        crd_pass_grade: Option<u32>,
+        assumption_check: Option<bool>,
     },
 }
 
@@ -143,6 +171,12 @@ pub enum HostEvent {
     /// capacity, or a cross-process `{status:"sent"}` reply (6.2b). Drafting degrades to a
     /// PRD-only TRD; a dead/hung researcher (killed path, runtime ceiling) degrades the same way.
     ResearchFailed { reason: String },
+    /// The driver executed a `SpawnAudit` and learned the real auditor agent id (6.2c).
+    AuditSpawned { agent_id: u64, spawned_at_ms: u64 },
+    /// A `SpawnAudit` failed before producing a verdict — grant denied, unknown agent, capacity,
+    /// a cross-process `{status:"sent"}` reply, a dead/killed auditor, or the runtime ceiling
+    /// (6.2c). The project degrades to Done WITHOUT an audit (never wedges completion).
+    AuditFailed { reason: String },
 }
 
 /// Side effects for the driver to execute. `InvokeModel`/`PublishContext` are part
@@ -161,6 +195,13 @@ pub enum Effect {
     /// agent id back as `HostEvent::ResearchSpawned` (or `ResearchFailed`). No task/model — it
     /// is a one-shot analyst on the whole PRD, inheriting the office role's model.
     SpawnResearch {
+        prompt: String,
+    },
+    /// Spawn the project-level `office-auditor` at completion (ARCHITECTURE.md 6.2c). Two-phase
+    /// like `SpawnResearch`: the driver runs it via the SAME `sessions.spawn_into` path and feeds
+    /// the real agent id back as `HostEvent::AuditSpawned` (or `AuditFailed`, which degrades the
+    /// project to Done without an audit). Read-only auditor persona; inherits the office model.
+    SpawnAudit {
         prompt: String,
     },
     Kill {
@@ -305,6 +346,8 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
             worker_model,
             reviewer_model,
             keep_desks,
+            crd_pass_grade,
+            assumption_check,
         } => {
             if let Some(w) = max_workers {
                 p.config.max_workers = w.clamp(1, MAX_PROJECT_WORKERS);
@@ -324,6 +367,15 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
             }
             if let Some(k) = keep_desks {
                 p.config.keep_desks = k;
+                ctx.dirty = true;
+            }
+            if let Some(g) = crd_pass_grade {
+                // Clamp to a valid rubric grade; 0 disables the gate in effect (any audit passes).
+                p.config.crd_pass_grade = g.min(100);
+                ctx.dirty = true;
+            }
+            if let Some(a) = assumption_check {
+                p.config.assumption_check = a;
                 ctx.dirty = true;
             }
         }
@@ -434,10 +486,10 @@ fn start_trd_invoke(p: &mut Project, ctx: &mut Ctx) {
     emit_invoke(ctx, InvokePurpose::Trd, &p.config.office_role, system, prompt);
 }
 
-/// The TRD invoke returned (6.2b). `Ok` with a ```trd fence -> store it and announce the
-/// breakdown. A missing fence, or any `Err` (e.g. a second timeout after the driver's one
-/// pool-level retry), STILL requests the breakdown — from whatever docs exist — so Drafting
-/// never wedges on a TRD failure.
+/// The TRD invoke returned (6.2b). `Ok` with a ```trd fence -> store it and run the safeguard
+/// gate (feature C) whose clean verdict proceeds to the CRD (feature A). A missing fence, or any
+/// `Err` (e.g. a second timeout after the driver's one pool-level retry), still proceeds to the
+/// CRD invoke — from whatever docs exist — so Drafting never wedges on a TRD failure.
 fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
     match outcome {
         Ok(text) => match office::extract_fenced(&text, "trd") {
@@ -446,15 +498,22 @@ fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
                 queue_notice(
                     p,
                     now_ms,
-                    format!("office[{}]: TRD drafted (panel) — breaking the work down now.", p.id.0),
+                    format!(
+                        "office[{}]: TRD drafted (panel) — checking assumptions before the clean-build requirements.",
+                        p.id.0
+                    ),
                     ctx,
                 );
+                let body = p.trd_markdown.clone();
+                gate_doc(p, InvokePurpose::AssumeCheckTrd, "TRD", &body, Deferred::Crd, now_ms, ctx);
+                ctx.dirty = true;
+                return;
             }
             None => queue_notice(
                 p,
                 now_ms,
                 format!(
-                    "office[{}]: TRD draft arrived without a fenced block; breaking down from the PRD.",
+                    "office[{}]: TRD draft arrived without a fenced block; drafting the clean-build requirements from the PRD.",
                     p.id.0
                 ),
                 ctx,
@@ -463,12 +522,193 @@ fn handle_trd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u
         Err(e) => queue_notice(
             p,
             now_ms,
-            format!("office[{}]: TRD call failed: {}; drafting continues from the PRD alone.", p.id.0, e),
+            format!(
+                "office[{}]: TRD call failed: {}; drafting the clean-build requirements from the PRD alone.",
+                p.id.0, e
+            ),
             ctx,
         ),
     }
+    // No TRD captured -> nothing to safeguard-check; proceed straight to the CRD invoke.
+    start_crd_invoke(p, ctx);
+    ctx.dirty = true;
+}
+
+/// Issue the CRD authoring invoke (6.2c): PRD (+ TRD when present) -> a ```crd fenced Clean-build
+/// Requirement Document. Off-loop, on the office role, like the TRD invoke.
+fn start_crd_invoke(p: &mut Project, ctx: &mut Ctx) {
+    let (system, prompt) = office::build_crd_prompt(p);
+    emit_invoke(ctx, InvokePurpose::Crd, &p.config.office_role, system, prompt);
+}
+
+/// The CRD invoke returned (6.2c). `Ok` with a ```crd fence -> store it and run the safeguard
+/// gate whose clean verdict requests the breakdown. A missing fence or any `Err` STILL requests
+/// the breakdown — the project simply completes without a clean-build audit (never wedges).
+fn handle_crd_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    match outcome {
+        Ok(text) => match office::extract_fenced(&text, "crd") {
+            Some(crd) => {
+                p.crd_markdown = crd;
+                queue_notice(
+                    p,
+                    now_ms,
+                    format!(
+                        "office[{}]: clean-build requirements drafted (panel) — checking assumptions before the breakdown.",
+                        p.id.0
+                    ),
+                    ctx,
+                );
+                let body = p.crd_markdown.clone();
+                gate_doc(p, InvokePurpose::AssumeCheckCrd, "CRD", &body, Deferred::Breakdown, now_ms, ctx);
+                ctx.dirty = true;
+                return;
+            }
+            None => queue_notice(
+                p,
+                now_ms,
+                format!(
+                    "office[{}]: CRD call skipped (no fenced block); the project will complete without a clean-build audit.",
+                    p.id.0
+                ),
+                ctx,
+            ),
+        },
+        Err(e) => queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: CRD call failed: {}; the project will complete without a clean-build audit.",
+                p.id.0, e
+            ),
+            ctx,
+        ),
+    }
+    // No CRD captured -> nothing to safeguard-check and no audit later; break down anyway.
     request_breakdown(p, ctx);
     ctx.dirty = true;
+}
+
+// ---------------------------------------------------------------------------
+// Safeguard no-assume gate (6.2c feature C) — Drafting doc captures
+// ---------------------------------------------------------------------------
+
+/// The pipeline stage a captured drafting doc proceeds to once its safeguard gate is clean. The
+/// gate is stateless: the AssumeCheck result's purpose (`AssumeCheck{Prd,Trd,Crd}`) names the
+/// doc, and this maps doc -> successor stage deterministically, so which stage was deferred is
+/// always recomputable and never needs persisting (kernel.rs pipeline resume rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deferred {
+    Research,
+    Crd,
+    Breakdown,
+}
+
+/// Run the pipeline stage a doc capture was gating (6.2c). PRD -> research, TRD -> CRD, CRD ->
+/// breakdown.
+fn run_deferred(p: &mut Project, deferred: Deferred, now_ms: u64, ctx: &mut Ctx) {
+    match deferred {
+        Deferred::Research => start_research(p, now_ms, ctx),
+        Deferred::Crd => start_crd_invoke(p, ctx),
+        Deferred::Breakdown => request_breakdown(p, ctx),
+    }
+}
+
+/// Gate a freshly-captured drafting doc through the safeguard no-assume check (6.2c). When the
+/// gate is disabled (`config.assumption_check == false`) it is a straight pass-through to the
+/// deferred stage. Otherwise it emits an `AssumeCheck*` invoke on the `safeguard_role`; the
+/// result (in [`handle_assume_check_result`]) either proceeds to `deferred` (clean / fail-open)
+/// or stops the pipeline with `pending_assumptions`.
+fn gate_doc(
+    p: &mut Project,
+    purpose: InvokePurpose,
+    label: &str,
+    body: &str,
+    deferred: Deferred,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    if !p.config.assumption_check {
+        run_deferred(p, deferred, now_ms, ctx);
+        return;
+    }
+    let (system, prompt) = office::build_assume_check_prompt(p, label, body);
+    emit_invoke(ctx, purpose, &p.config.safeguard_role, system, prompt);
+}
+
+/// A safeguard assumption-check returned (6.2c). `clean` (or an unparseable block) clears
+/// `pending_assumptions` and proceeds to the deferred stage; `assumptions` STOPS the pipeline,
+/// storing the flagged items and noticing the user (the doc is stored/visible either way, and a
+/// subsequent chat + fresh fence re-runs this gate). `Err` FAILS OPEN: proceed with a notice —
+/// a flaky safeguard must never wedge Drafting.
+fn handle_assume_check_result(
+    p: &mut Project,
+    deferred: Deferred,
+    doc_label: &str,
+    outcome: Result<String, String>,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    match outcome {
+        Err(e) => {
+            queue_notice(
+                p,
+                now_ms,
+                format!("office[{}]: assumption check skipped: {}; continuing.", p.id.0, e),
+                ctx,
+            );
+            p.pending_assumptions.clear();
+            run_deferred(p, deferred, now_ms, ctx);
+        }
+        Ok(text) => match report::parse_assume_check(&text) {
+            Some(check)
+                if check.verdict == report::AssumeVerdict::Assumptions && !check.items.is_empty() =>
+            {
+                let items = clip_assumptions(&check.items);
+                let n = check.items.len();
+                queue_notice(
+                    p,
+                    now_ms,
+                    format!(
+                        "office[{}]: {} drafted but contains {} unapproved assumption{}: {} — approve them, answer in chat, or say 'you decide'.",
+                        p.id.0,
+                        doc_label,
+                        n,
+                        if n == 1 { "" } else { "s" },
+                        items
+                    ),
+                    ctx,
+                );
+                p.pending_assumptions = check.items;
+                // STOP: the doc is stored/visible; the user must act before the pipeline proceeds.
+            }
+            _ => {
+                // Clean, or an unparseable/inconclusive block -> fail open and proceed.
+                p.pending_assumptions.clear();
+                run_deferred(p, deferred, now_ms, ctx);
+            }
+        },
+    }
+    ctx.dirty = true;
+}
+
+/// Clip the assumption list to a short, single-line preview for a chat notice (the full list is
+/// on the panel via `pending_assumptions`).
+fn clip_assumptions(items: &[String]) -> String {
+    const MAX_ITEMS: usize = 3;
+    const MAX_LEN: usize = 400;
+    let mut preview: Vec<String> = items.iter().take(MAX_ITEMS).cloned().collect();
+    if items.len() > MAX_ITEMS {
+        preview.push(format!("(+{} more)", items.len() - MAX_ITEMS));
+    }
+    let joined = preview.join("; ");
+    if joined.len() <= MAX_LEN {
+        return joined;
+    }
+    let mut cut = MAX_LEN;
+    while !joined.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &joined[..cut])
 }
 
 /// The hard authorization gate (6.3.3). The driver has already validated + created the
@@ -520,10 +760,12 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             // replies are clipped for the notice — the full text is always in the
             // panel transcript.
             //
-            // PRD capture (6.2 / 6.2b): a ```prd fenced block in a Drafting reply IS the PRD.
-            // Land it and kick the pipeline's FIRST step — web-research — NOT the breakdown
-            // directly. The flow is PRD -> research -> TRD -> breakdown; without capture the
-            // persona chats forever while the board stays empty (live-test 2026-07-15).
+            // Drafting doc captures (6.2 / 6.2b / 6.2c): a ```prd / ```trd / ```crd fence in a
+            // Drafting reply IS that doc. Land it, then run the safeguard gate (feature C) whose
+            // clean verdict PROCEEDS to that doc's pipeline stage — PRD -> research, TRD -> CRD,
+            // CRD -> breakdown. Without capture the persona chats forever while the board stays
+            // empty (live-test 2026-07-15). A re-emitted fence after a stopped gate re-runs the
+            // check (kernel.rs pipeline resume rule).
             if matches!(p.phase, ProjectPhase::Drafting) {
                 if let Some(prd) = office::extract_prd(&reply) {
                     p.prd_markdown = prd;
@@ -531,33 +773,49 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                         p,
                         now_ms,
                         format!(
-                            "office[{}]: PRD drafted (full text in the Workflow panel) — researching the stack before the TRD. I will report as the board fills in; do not authorize yet.",
+                            "office[{}]: PRD drafted (full text in the Workflow panel) — checking assumptions before I research the stack. I will report as the board fills in; do not authorize yet.",
                             p.id.0
                         ),
                         ctx,
                     );
-                    start_research(p, now_ms, ctx);
+                    let body = p.prd_markdown.clone();
+                    gate_doc(p, InvokePurpose::AssumeCheckPrd, "PRD", &body, Deferred::Research, now_ms, ctx);
+                    ctx.dirty = true;
+                    return;
+                }
+                if let Some(trd) = office::extract_fenced(&reply, "trd") {
+                    p.trd_markdown = trd;
+                    queue_notice(p, now_ms, format!("office[{}]: TRD updated (panel).", p.id.0), ctx);
+                    let body = p.trd_markdown.clone();
+                    gate_doc(p, InvokePurpose::AssumeCheckTrd, "TRD", &body, Deferred::Crd, now_ms, ctx);
+                    ctx.dirty = true;
+                    return;
+                }
+                if let Some(crd) = office::extract_fenced(&reply, "crd") {
+                    p.crd_markdown = crd;
+                    queue_notice(p, now_ms, format!("office[{}]: CRD updated (panel).", p.id.0), ctx);
+                    let body = p.crd_markdown.clone();
+                    gate_doc(p, InvokePurpose::AssumeCheckCrd, "CRD", &body, Deferred::Breakdown, now_ms, ctx);
                     ctx.dirty = true;
                     return;
                 }
             }
 
-            // TRD capture from a chat reply (6.2b): the user asked the office to (re)draft the
-            // TRD in conversation. Capture it in Drafting or Ready. NEVER auto-run the breakdown
-            // here — that only follows the deterministic Trd invoke — so in Ready the notice
-            // points at workflow_breakdown to re-plan from the revised TRD.
-            if matches!(p.phase, ProjectPhase::Drafting | ProjectPhase::Ready) {
+            // A chat-authored ```trd in Ready is a RE-PLAN trigger, not a pipeline stage (6.2b):
+            // capture it and point at workflow_breakdown. It does NOT run the gate or auto-run
+            // CRD/breakdown — the deterministic pipeline is what drives those.
+            if matches!(p.phase, ProjectPhase::Ready) {
                 if let Some(trd) = office::extract_fenced(&reply, "trd") {
                     p.trd_markdown = trd;
-                    let notice = if matches!(p.phase, ProjectPhase::Ready) {
+                    queue_notice(
+                        p,
+                        now_ms,
                         format!(
                             "office[{}]: TRD updated (panel). Run workflow_breakdown to re-plan the board from the revised TRD.",
                             p.id.0
-                        )
-                    } else {
-                        format!("office[{}]: TRD updated (panel).", p.id.0)
-                    };
-                    queue_notice(p, now_ms, notice, ctx);
+                        ),
+                        ctx,
+                    );
                     ctx.dirty = true;
                     return;
                 }
@@ -581,6 +839,16 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
         InvokePurpose::BreakdownReask => handle_breakdown_reask_result(p, outcome, now_ms, ctx),
         InvokePurpose::BreakdownCompact => handle_breakdown_compact_result(p, outcome, now_ms, ctx),
         InvokePurpose::Trd => handle_trd_result(p, outcome, now_ms, ctx),
+        InvokePurpose::Crd => handle_crd_result(p, outcome, now_ms, ctx),
+        InvokePurpose::AssumeCheckPrd => {
+            handle_assume_check_result(p, Deferred::Research, "PRD", outcome, now_ms, ctx)
+        }
+        InvokePurpose::AssumeCheckTrd => {
+            handle_assume_check_result(p, Deferred::Crd, "TRD", outcome, now_ms, ctx)
+        }
+        InvokePurpose::AssumeCheckCrd => {
+            handle_assume_check_result(p, Deferred::Breakdown, "CRD", outcome, now_ms, ctx)
+        }
     }
 }
 
@@ -801,6 +1069,10 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
             on_research_spawned(p, agent_id, spawned_at_ms, ctx)
         }
         HostEvent::ResearchFailed { reason } => research_degrade(p, reason, now_ms, ctx),
+        HostEvent::AuditSpawned { agent_id, spawned_at_ms } => {
+            on_audit_spawned(p, agent_id, spawned_at_ms, ctx)
+        }
+        HostEvent::AuditFailed { reason } => audit_degrade(p, reason, now_ms, ctx),
     }
 }
 
@@ -838,6 +1110,16 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx
         }
         return;
     }
+    // The clean-build auditor binding (6.2c) is project-level like research: `done` fetches the
+    // OFFICE-AUDIT verdict; anything else is a dead auditor and degrades to Done (never wedges).
+    if audit_bound_to(p, agent_id) {
+        if status.eq_ignore_ascii_case("done") {
+            ctx.fx.push(Effect::FetchResult { ext_agent_id: agent_id });
+        } else {
+            audit_degrade(p, format!("auditor {status}"), now_ms, ctx);
+        }
+        return;
+    }
     let idx = match find_by_agent(p, agent_id) {
         Some(i) => i,
         None => return,
@@ -853,9 +1135,14 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, now_ms: u64, ctx
 
 /// A fetched terminal report. Dispatch to the worker or reviewer path by binding kind.
 fn on_result(p: &mut Project, agent_id: u64, text: String, now_ms: u64, ctx: &mut Ctx) {
-    // Research findings (6.2b) route to the project-level handler, before the task lookup.
+    // Research findings (6.2b) + audit verdict (6.2c) route to their project-level handlers,
+    // before the task lookup.
     if research_bound_to(p, agent_id) {
         on_research_result(p, text, now_ms, ctx);
+        return;
+    }
+    if audit_bound_to(p, agent_id) {
+        on_audit_result(p, text, now_ms, ctx);
         return;
     }
     let idx = match find_by_agent(p, agent_id) {
@@ -865,9 +1152,9 @@ fn on_result(p: &mut Project, agent_id: u64, text: String, now_ms: u64, ctx: &mu
     match binding_kind(&p.tasks[idx].state) {
         Some(AgentKind::Worker) => on_worker_result(p, idx, text, now_ms, ctx),
         Some(AgentKind::Reviewer) => on_reviewer_result(p, idx, text, now_ms, ctx),
-        // A task binding is only ever Worker/Reviewer; a Researcher is project-level and
-        // never reaches this task path (research routes above, in `on_result`).
-        Some(AgentKind::Researcher) | None => {}
+        // A task binding is only ever Worker/Reviewer; Researcher/Auditor are project-level and
+        // never reach this task path (they route above, in `on_result`).
+        Some(AgentKind::Researcher) | Some(AgentKind::Auditor) | None => {}
     }
 }
 
@@ -926,7 +1213,7 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
             record(&mut p.tasks[idx], now_ms, "review:pass");
             p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
             ctx.dirty = true;
-            maybe_complete_project(p, now_ms);
+            maybe_complete_project(p, now_ms, ctx);
             check_halt(p, now_ms, ctx);
         }
         Verdict::Fail | Verdict::Unparseable => {
@@ -1025,6 +1312,17 @@ fn runtime_ceiling(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
             let agent_id = b.ext_agent_id;
             ctx.fx.push(Effect::Kill { ext_agent_id: agent_id });
             research_degrade(p, "runtime ceiling".to_string(), now_ms, ctx);
+        }
+    }
+
+    // The project-level audit binding (6.2c) shares the same ceiling. An over-age auditor is
+    // force-killed and the project degrades to Done WITHOUT an audit — a hung auditor never
+    // wedges completion.
+    if let Some(b) = &p.audit {
+        if b.ext_agent_id != PROVISIONAL && now_ms.saturating_sub(b.spawned_at_ms) > ceiling {
+            let agent_id = b.ext_agent_id;
+            ctx.fx.push(Effect::Kill { ext_agent_id: agent_id });
+            audit_degrade(p, "runtime ceiling".to_string(), now_ms, ctx);
         }
     }
 }
@@ -1236,16 +1534,242 @@ fn check_halt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     }
 }
 
-/// If every task is Done, close the project.
-fn maybe_complete_project(p: &mut Project, now_ms: u64) {
-    if matches!(p.phase, ProjectPhase::Running)
-        && p.tasks.iter().all(|t| matches!(t.state, TaskState::Done { .. }))
-        && !p.tasks.is_empty()
-    {
-        if let Ok(ph) = step_project(&p.phase, ProjectTransition::Complete { at_ms: now_ms }) {
-            p.phase = ph;
-        }
+/// Every task is Done (6.2c). If the project carries a CRD and no audit is already in flight,
+/// spawn the read-only clean-build auditor INSTEAD of completing — the audit gate
+/// ([`on_audit_result`]) decides Done vs a remediation round. Otherwise (no CRD) complete
+/// normally. No-op unless Running with a non-empty, fully-Done board.
+fn maybe_complete_project(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if !matches!(p.phase, ProjectPhase::Running) {
+        return;
     }
+    if p.tasks.is_empty() || !p.tasks.iter().all(|t| matches!(t.state, TaskState::Done { .. })) {
+        return;
+    }
+    // A CRD present + no audit already running -> gate completion on a clean-build audit. If the
+    // grade was already passing the project would be Done (phase != Running) and we would not be
+    // here, so no explicit "already audited" flag is needed.
+    if !p.crd_markdown.trim().is_empty() && p.audit.is_none() {
+        start_audit(p, now_ms, ctx);
+        return;
+    }
+    complete_project(p, now_ms);
+}
+
+/// Transition Running -> Done (the terminal completion). Pure phase step; the caller owns the
+/// dirty flag / notice.
+fn complete_project(p: &mut Project, now_ms: u64) {
+    if let Ok(ph) = step_project(&p.phase, ProjectTransition::Complete { at_ms: now_ms }) {
+        p.phase = ph;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clean-build audit gate (6.2c feature B) — Running-only, deterministic, graceful-degrade
+// ---------------------------------------------------------------------------
+
+/// Whether `agent_id` is this project's live auditor binding (6.2c). Provisional (id 0) bindings
+/// never match a real host event.
+fn audit_bound_to(p: &Project, agent_id: u64) -> bool {
+    matches!(&p.audit, Some(b) if b.ext_agent_id == agent_id && agent_id != PROVISIONAL)
+}
+
+/// Spawn the read-only clean-build auditor (6.2c). Two-phase like the researcher: emit
+/// `SpawnAudit` and record a PROVISIONAL project-level binding so the reconcile ceiling sees it;
+/// the driver runs the spawn and feeds back `AuditSpawned` (or `AuditFailed`, which degrades to
+/// Done). The project stays Running while grading; dispatch is a no-op with every task Done.
+fn start_audit(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let delivery = match &p.delivery_path {
+        Some(d) => d.clone(),
+        None => {
+            // A Running project always has a delivery path; guard anyway so a malformed project
+            // completes rather than wedging.
+            complete_project(p, now_ms);
+            return;
+        }
+    };
+    let prompt = prompts::auditor(p, &delivery);
+    ctx.fx.push(Effect::SpawnAudit { prompt });
+    p.audit = Some(AgentBinding {
+        ext_agent_id: PROVISIONAL,
+        session: p.bound_session.clone().unwrap_or_default(),
+        spawned_at_ms: now_ms,
+        kind: AgentKind::Auditor,
+    });
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: all tasks done — running the clean-build audit before I mark it complete.",
+            p.id.0
+        ),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
+/// The driver recorded the real auditor agent id onto the provisional binding (6.2c).
+fn on_audit_spawned(p: &mut Project, agent_id: u64, spawned_at_ms: u64, ctx: &mut Ctx) {
+    if let Some(b) = &mut p.audit {
+        b.ext_agent_id = agent_id;
+        b.spawned_at_ms = spawned_at_ms;
+        ctx.dirty = true;
+    }
+}
+
+/// The auditor could not run or died (6.2c) — spawn failure, cross-process, dead auditor, or the
+/// runtime ceiling. Degrade gracefully: clear the binding, complete the project WITHOUT an audit,
+/// and tell the user. Never wedges completion.
+fn audit_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
+    p.audit = None;
+    complete_project(p, now_ms);
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: audit skipped: {} — project done.", p.id.0, reason),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
+/// The auditor finished (6.2c): parse the OFFICE-AUDIT grade + failures (tolerant), clear the
+/// binding, record the grade, and apply the deterministic gate:
+///   grade >= crd_pass_grade            -> Done + notice.
+///   grade <  threshold, rounds 1-2     -> one Todo remediation task (high priority, no deps).
+///   grade <  threshold, after 2 rounds -> a PARKED remediation task (halt machinery takes over).
+/// A missing/unparseable grade FAILS OPEN (Done + notice) — never punishing a formatting slip.
+fn on_audit_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
+    p.audit = None;
+    let report = report::parse_audit(&text);
+    let grade = match report.grade {
+        Some(g) => g,
+        None => {
+            complete_project(p, now_ms);
+            queue_notice(
+                p,
+                now_ms,
+                format!(
+                    "office[{}]: audit inconclusive (no grade reported) — project done.",
+                    p.id.0
+                ),
+                ctx,
+            );
+            ctx.dirty = true;
+            return;
+        }
+    };
+    p.last_audit_grade = Some(grade);
+
+    if grade >= p.config.crd_pass_grade {
+        complete_project(p, now_ms);
+        queue_notice(
+            p,
+            now_ms,
+            format!("office[{}]: audit passed: grade {} — project done.", p.id.0, grade),
+            ctx,
+        );
+        ctx.dirty = true;
+        return;
+    }
+
+    // Sub-threshold. The first two failing audits open an actionable remediation task; a third
+    // parks it for the user. `audit_rounds` is checked BEFORE the increment so the literal
+    // "audit_rounds < 2 -> Todo round R" ladder from the spec is preserved and survives a reload.
+    let failures = clip_failures(&report.failures);
+    if p.audit_rounds < 2 {
+        p.audit_rounds += 1;
+        let round = p.audit_rounds;
+        add_remediation_task(p, round, &report.failures, false, now_ms);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: audit grade {} < {} — opened CRD remediation round {}: {}",
+                p.id.0, grade, p.config.crd_pass_grade, round, failures
+            ),
+            ctx,
+        );
+    } else {
+        add_remediation_task(p, p.audit_rounds + 1, &report.failures, true, now_ms);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: audit still failing after 2 rounds (grade {}): {} — fix manually and unpark, or lower crd_pass_grade in settings.",
+                p.id.0, grade, failures
+            ),
+            ctx,
+        );
+        check_halt(p, now_ms, ctx);
+    }
+    ctx.dirty = true;
+}
+
+/// Create a CRD remediation task (6.2c). `parked=false` -> Todo (high priority, no deps) for an
+/// automated round; `parked=true` -> Parked(AuditFailed) once the automated rounds are exhausted,
+/// so the existing halt machinery takes over. The task id carries the round so re-audits never
+/// collide.
+fn add_remediation_task(p: &mut Project, round: u32, failures: &[String], parked: bool, now_ms: u64) {
+    let id = TaskId(format!("{}/crd-remediation-round-{}", p.id.0, round));
+    let description = if failures.is_empty() {
+        "The clean-build audit graded the delivery below the pass threshold. Bring the delivery \
+into full compliance with the Clean-build Requirement Document (docs tab)."
+            .to_string()
+    } else {
+        format!(
+            "The clean-build audit graded the delivery below the pass threshold. Fix these failing CRD items:\n- {}",
+            failures.join("\n- ")
+        )
+    };
+    let state = if parked {
+        TaskState::Parked {
+            reason: ParkReason::AuditFailed(clip_failures(failures)),
+            attempt: 1,
+        }
+    } else {
+        TaskState::Todo
+    };
+    let mut task = Task {
+        id,
+        title: format!("CRD remediation round {}", round),
+        description,
+        acceptance: vec![
+            "Every failing CRD item from the audit is resolved".to_string(),
+            "The delivery satisfies the Clean-build Requirement Document".to_string(),
+        ],
+        blocked_by: Vec::new(),
+        priority: 100,
+        state,
+        bounces: 0,
+        comments: Vec::new(),
+        desk: None,
+        last_report: None,
+        last_review: None,
+        history: Vec::new(),
+    };
+    record(&mut task, now_ms, format!("crd-remediation:round-{}", round));
+    p.tasks.push(task);
+}
+
+/// Clip an audit failure list to a short, single-line preview for a chat notice.
+fn clip_failures(failures: &[String]) -> String {
+    if failures.is_empty() {
+        return "see the CRD checklist".to_string();
+    }
+    const MAX_ITEMS: usize = 3;
+    const MAX_LEN: usize = 300;
+    let mut preview: Vec<String> = failures.iter().take(MAX_ITEMS).cloned().collect();
+    if failures.len() > MAX_ITEMS {
+        preview.push(format!("(+{} more)", failures.len() - MAX_ITEMS));
+    }
+    let joined = preview.join("; ");
+    if joined.len() <= MAX_LEN {
+        return joined;
+    }
+    let mut cut = MAX_LEN;
+    while !joined.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &joined[..cut])
 }
 
 /// Clip a persona reply to fit an outbox notice (driver sends <=4KB per tick; the
