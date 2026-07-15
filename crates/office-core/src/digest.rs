@@ -3,6 +3,7 @@
 
 use crate::domain::{ChatAuthor, Column, Comment, CommentAuthor, ParkReason, Project, ProjectPhase, Receipt, Task, TaskState};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// Host cap for `context.set` is 8192 bytes, boundary-inclusive
 /// (broker.rs:2784); we self-limit to 7900 to leave headroom.
@@ -140,6 +141,15 @@ pub enum SnapshotMode {
     Summary,
 }
 
+/// The office brain's current live activity for a project (e.g. "drafting the TRD"), plus
+/// when it started — surfaced on the panel snapshot (full mode only) and used to drive an
+/// elapsed-time display. See the driver's `office_activity` for how this is derived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfficeActivity {
+    pub label: String,
+    pub since_ms: u64,
+}
+
 fn column_str(c: Column) -> &'static str {
     match c {
         Column::Backlog => "backlog",
@@ -251,7 +261,7 @@ fn phase_value(phase: &ProjectPhase) -> Value {
     }
 }
 
-fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
+fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeActivity>) -> Value {
     let tasks: Vec<Value> = p.tasks.iter().map(|t| task_to_value(t, mode)).collect();
 
     let mut obj = json!({
@@ -279,6 +289,12 @@ fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
         // mode only.
         obj["researchActive"] = json!(p.research.is_some());
         obj["auditActive"] = json!(p.audit.is_some());
+        // The office brain's current live activity (e.g. "drafting the TRD") with a start
+        // timestamp, for an elapsed-time display; additive, full mode only, omitted (not
+        // null) when nothing is currently live.
+        if let Some(a) = activity {
+            obj["officeActivity"] = json!({ "label": a.label, "sinceMs": a.since_ms });
+        }
         // Ungrounded assumptions the safeguard flagged in the last doc gate (6.2c): the docs tab
         // renders these as an amber pending-assumptions strip while the pipeline waits.
         obj["pendingAssumptions"] = json!(p.pending_assumptions);
@@ -309,5 +325,20 @@ fn project_to_value(p: &Project, mode: SnapshotMode) -> Value {
 /// JSON array — the driver (W7) wraps it in the frozen envelope
 /// `{ kind: "snapshot", seq, projects: [...] }` and applies the 900KB size guard.
 pub fn panel_snapshot(projects: &[Project], mode: SnapshotMode) -> Value {
-    Value::Array(projects.iter().map(|p| project_to_value(p, mode)).collect())
+    panel_snapshot_with_activity(projects, mode, None)
+}
+
+/// Like [`panel_snapshot`], but additionally threads in each project's live "office
+/// activity" (keyed by project id), when the caller has one to report.
+pub fn panel_snapshot_with_activity(
+    projects: &[Project],
+    mode: SnapshotMode,
+    activity: Option<&HashMap<String, OfficeActivity>>,
+) -> Value {
+    Value::Array(
+        projects
+            .iter()
+            .map(|p| project_to_value(p, mode, activity.and_then(|m| m.get(&p.id.0))))
+            .collect(),
+    )
 }

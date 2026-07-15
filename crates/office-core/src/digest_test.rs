@@ -1,7 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use crate::digest::{context_blob, panel_snapshot, SnapshotMode, CONTEXT_BLOB_CAP};
+    use crate::digest::{
+        context_blob, panel_snapshot, panel_snapshot_with_activity, OfficeActivity, SnapshotMode,
+        CONTEXT_BLOB_CAP,
+    };
     use crate::domain::*;
+    use std::collections::HashMap;
 
     fn task(id: &str, state: TaskState) -> Task {
         Task {
@@ -223,5 +227,39 @@ mod tests {
         let obj = &snap.as_array().expect("array")[0];
         assert!(obj["lastAuditGrade"].is_null(), "an unaudited project reports null, not 0");
         assert_eq!(obj["crdMarkdown"], "");
+    }
+
+    #[test]
+    fn panel_snapshot_with_activity_full_mode_includes_and_omits_office_activity() {
+        let projects = vec![
+            project("p1", 1, ProjectPhase::Running, vec![]),
+            project("p2", 2, ProjectPhase::Running, vec![]),
+        ];
+        let mut activity: HashMap<String, OfficeActivity> = HashMap::new();
+        activity.insert(
+            "p1".to_string(),
+            OfficeActivity { label: "drafting the TRD".to_string(), since_ms: 12_345 },
+        );
+        let snap = panel_snapshot_with_activity(&projects, SnapshotMode::Full, Some(&activity));
+        let arr = snap.as_array().expect("array");
+        assert_eq!(arr[0]["officeActivity"]["label"], "drafting the TRD");
+        assert_eq!(arr[0]["officeActivity"]["sinceMs"], 12_345);
+        assert!(arr[1].get("officeActivity").is_none(), "no activity entry for p2");
+    }
+
+    #[test]
+    fn panel_snapshot_with_activity_summary_mode_omits_office_activity() {
+        let projects = vec![project("p1", 1, ProjectPhase::Running, vec![])];
+        let mut activity: HashMap<String, OfficeActivity> = HashMap::new();
+        activity.insert(
+            "p1".to_string(),
+            OfficeActivity { label: "drafting the TRD".to_string(), since_ms: 12_345 },
+        );
+        let snap = panel_snapshot_with_activity(&projects, SnapshotMode::Summary, Some(&activity));
+        let arr = snap.as_array().expect("array");
+        assert!(
+            arr[0].get("officeActivity").is_none(),
+            "summary mode omits officeActivity even when live"
+        );
     }
 }

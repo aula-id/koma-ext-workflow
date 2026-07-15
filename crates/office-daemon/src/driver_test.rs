@@ -8,6 +8,7 @@
 use super::*;
 use crate::handlers;
 use crate::host::FakeHost;
+use office_core::digest::OfficeActivity;
 use office_core::{
     AgentBinding, AgentKind, ChatAuthor, InvokePurpose, OutboundNotice, Project, ProjectConfig,
     ProjectPhase, Task, TaskId, TaskState,
@@ -793,6 +794,118 @@ fn reconcile_runtime_ceiling_kills_over_age_researcher_and_degrades() {
         fake.jobs.lock().unwrap().iter().any(|j| j.purpose == InvokePurpose::Trd),
         "Drafting degrades to a PRD-only TRD invoke"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8a. office_activity() derivation (live "office activity" for the panel/MCP status)
+// ---------------------------------------------------------------------------
+
+fn invoke_job(req_id: u64, proj_slug: &str, purpose: InvokePurpose, submitted_at_ms: u64) -> InvokeJob {
+    InvokeJob {
+        req_id,
+        submitted_at_ms,
+        proj_slug: proj_slug.to_string(),
+        purpose,
+        role: String::new(),
+        system: String::new(),
+        prompt: String::new(),
+        retried: false,
+        format: None,
+    }
+}
+
+fn research_binding(agent_id: u64, spawned_at_ms: u64) -> AgentBinding {
+    AgentBinding {
+        ext_agent_id: agent_id,
+        session: "sess-x".to_string(),
+        spawned_at_ms,
+        kind: AgentKind::Researcher,
+        persona: String::new(),
+    }
+}
+
+fn audit_binding(agent_id: u64, spawned_at_ms: u64) -> AgentBinding {
+    AgentBinding {
+        ext_agent_id: agent_id,
+        session: "sess-x".to_string(),
+        spawned_at_ms,
+        kind: AgentKind::Auditor,
+        persona: String::new(),
+    }
+}
+
+#[test]
+fn office_activity_labels_every_invoke_purpose() {
+    let cases: Vec<(InvokePurpose, &str)> = vec![
+        (InvokePurpose::Persona, "office is replying"),
+        (InvokePurpose::Fold, "summarizing the conversation"),
+        (InvokePurpose::AssumeCheckPrd, "fact-checking the PRD"),
+        (InvokePurpose::AssumeCheckTrd, "fact-checking the TRD"),
+        (InvokePurpose::AssumeCheckCrd, "fact-checking the CRD"),
+        (InvokePurpose::Trd, "drafting the TRD"),
+        (InvokePurpose::Crd, "drafting the CRD"),
+        (InvokePurpose::Breakdown, "breaking down the plan"),
+        (InvokePurpose::BreakdownReask, "breaking down the plan"),
+        (InvokePurpose::BreakdownCompact, "breaking down the plan"),
+    ];
+    for (purpose, expected_label) in cases {
+        let mut pending: HashMap<u64, InvokeJob> = HashMap::new();
+        pending.insert(1, invoke_job(1, "a", purpose, 500));
+        let p = drafting("a");
+        let activity = office_activity(&pending, &p).expect("an activity for a pending invoke");
+        assert_eq!(activity.label, expected_label, "purpose {purpose:?}");
+        assert_eq!(activity.since_ms, 500);
+    }
+}
+
+#[test]
+fn office_activity_research_only_yields_research_label() {
+    let pending: HashMap<u64, InvokeJob> = HashMap::new();
+    let mut p = drafting("a");
+    p.research = Some(research_binding(700, 1_000));
+    let activity = office_activity(&pending, &p).expect("research activity");
+    assert_eq!(activity.label, "researching the stack");
+    assert_eq!(activity.since_ms, 1_000);
+}
+
+#[test]
+fn office_activity_audit_only_yields_audit_label() {
+    let pending: HashMap<u64, InvokeJob> = HashMap::new();
+    let mut p = drafting("a");
+    p.audit = Some(audit_binding(701, 2_000));
+    let activity = office_activity(&pending, &p).expect("audit activity");
+    assert_eq!(activity.label, "auditing the delivery");
+    assert_eq!(activity.since_ms, 2_000);
+}
+
+#[test]
+fn office_activity_pending_invoke_wins_over_research_and_audit() {
+    let mut pending: HashMap<u64, InvokeJob> = HashMap::new();
+    pending.insert(1, invoke_job(1, "a", InvokePurpose::Trd, 3_000));
+    let mut p = drafting("a");
+    p.research = Some(research_binding(700, 1_000));
+    p.audit = Some(audit_binding(701, 2_000));
+    let activity = office_activity(&pending, &p).expect("invoke activity wins");
+    assert_eq!(activity.label, "drafting the TRD");
+    assert_eq!(activity.since_ms, 3_000);
+}
+
+#[test]
+fn office_activity_research_wins_over_audit_when_both_live() {
+    let pending: HashMap<u64, InvokeJob> = HashMap::new();
+    let mut p = drafting("a");
+    p.research = Some(research_binding(700, 1_000));
+    p.audit = Some(audit_binding(701, 2_000));
+    let activity = office_activity(&pending, &p).expect("research wins over audit");
+    assert_eq!(activity.label, "researching the stack");
+    assert_eq!(activity.since_ms, 1_000);
+}
+
+#[test]
+fn office_activity_none_when_nothing_live() {
+    let pending: HashMap<u64, InvokeJob> = HashMap::new();
+    let p = drafting("a");
+    assert_eq!(office_activity(&pending, &p), None::<OfficeActivity>);
 }
 
 // ---------------------------------------------------------------------------

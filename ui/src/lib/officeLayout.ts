@@ -214,3 +214,25 @@ export function isResearchLive(project: OfficeProject | null | undefined): boole
 export function isAuditLive(project: OfficeProject | null | undefined): boolean {
   return Boolean(project?.auditActive || project?.audit);
 }
+
+// ---------------------------------------------------------------------------
+// Live office activity (6.2d)
+// ---------------------------------------------------------------------------
+
+/** Formats an elapsed duration since `sinceMs` as "Ns" under a minute, else "m:ss". */
+export function formatElapsed(nowMs: number, sinceMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor((nowMs - sinceMs) / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+const NON_DRAFTING_LABELS = new Set(['researching the stack', 'auditing the delivery']);
+
+/** Whether an officeActivity label is a "drafting family" activity (drafting/fact-checking/
+ * breaking-down/replying/summarizing) as opposed to research/audit, which have their own
+ * dedicated staff animations elsewhere in the office map. */
+export function isDraftingFamilyActivity(label: string | undefined | null): boolean {
+  return Boolean(label) && !NON_DRAFTING_LABELS.has(label as string);
+}

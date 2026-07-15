@@ -35,6 +35,9 @@ export interface Project {
   config?: ProjectConfig;
   /** The last clean-build audit grade (0-100), full snapshot only (6.2c); shown on the row. */
   lastAuditGrade?: number | null;
+  /** Live office activity (full snapshot only, 6.2d), present only while an activity is in
+   * flight; omitted entirely (not null) when idle. At most one is live at a time. */
+  officeActivity?: { label: string; sinceMs: number } | null;
   [key: string]: any;
 }
 
@@ -76,6 +79,7 @@ export const useStore = create<StoreState>((set, get) => ({
         parkedCount: p.tasks ? p.tasks.filter((t: any) => t.state === 'parked').length : 0,
         lastNotice: p.outbox && p.outbox.length > 0 ? p.outbox[0].text : undefined,
         lastAuditGrade: p.lastAuditGrade ?? null,
+        officeActivity: p.officeActivity ?? null,
       })),
     });
   },

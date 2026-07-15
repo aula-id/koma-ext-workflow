@@ -27,7 +27,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
 use koma_extension::Koma;
-use office_core::digest::{context_blob, panel_snapshot};
+use office_core::digest::{context_blob, panel_snapshot_with_activity, OfficeActivity};
 use office_core::office::{self, InvokePurpose};
 use office_core::{
     kernel, CommentAuthor, CommentId, Effect, Project, ProjectPhase, SnapshotMode, TaskId,
@@ -149,6 +149,8 @@ struct Owned {
 pub struct InvokeJob {
     /// Driver-minted id, matched against the pending map on completion (and on retry).
     pub req_id: u64,
+    /// When this invoke was submitted (ms), used to derive live "office activity" elapsed time.
+    pub submitted_at_ms: u64,
     /// The project slug this invoke belongs to (resolved to an index on completion, so a
     /// reorder of the projects vec cannot misroute a late result).
     pub proj_slug: String,
@@ -768,7 +770,7 @@ impl<H: Host> Driver<H> {
                     prompt,
                     format,
                     ..
-                } => self.submit_invoke(idx, purpose, role, system, prompt, format),
+                } => self.submit_invoke(idx, purpose, role, system, prompt, format, now_ms),
             }
         }
     }
@@ -1161,11 +1163,13 @@ impl<H: Host> Driver<H> {
         system: String,
         prompt: String,
         format: Option<&'static str>,
+        now_ms: u64,
     ) {
         self.next_req_id += 1;
         let req_id = self.next_req_id;
         let job = InvokeJob {
             req_id,
+            submitted_at_ms: now_ms,
             proj_slug: self.projects[idx].project.id.0.clone(),
             purpose,
             role,
@@ -1176,6 +1180,9 @@ impl<H: Host> Driver<H> {
         };
         self.invoke_pending.insert(req_id, job);
         self.start_or_queue_invoke(req_id);
+        // An invoke just began: mark the board dirty so the live "office activity" label
+        // (drafting/fact-checking/breaking-down) reaches the panel.
+        self.push_board(now_ms, false);
     }
 
     fn start_or_queue_invoke(&mut self, req_id: u64) {
@@ -1213,6 +1220,8 @@ impl<H: Host> Driver<H> {
         }
 
         self.invoke_pending.remove(&req_id);
+        // The activity just ended: mark the board dirty so the panel drops the label.
+        self.push_board(now_ms, false);
         self.invoke_in_flight = self.invoke_in_flight.saturating_sub(1);
         if let Some(idx) = self.projects.iter().position(|o| o.project.id.0 == job.proj_slug) {
             self.step(
@@ -1386,11 +1395,17 @@ impl<H: Host> Driver<H> {
     }
 
     fn envelope(&self, projects: &[Project], mode: SnapshotMode, truncated: bool) -> Value {
+        let mut activity: HashMap<String, OfficeActivity> = HashMap::new();
+        for o in &self.projects {
+            if let Some(a) = office_activity(&self.invoke_pending, &o.project) {
+                activity.insert(o.project.id.0.clone(), a);
+            }
+        }
         json!({
             "kind": "snapshot",
             "seq": self.push_seq,
             "truncated": truncated,
-            "projects": panel_snapshot(projects, mode),
+            "projects": panel_snapshot_with_activity(projects, mode, Some(&activity)),
         })
     }
 
@@ -1641,6 +1656,34 @@ fn project_in_flight(p: &Project) -> u32 {
             )
         })
         .count() as u32
+}
+
+/// Derives the live "office activity" for a project, if any. Priority when multiple sources
+/// are live: a pending invoke wins over research, which wins over audit (an invoke result
+/// often clears research/audit synchronously, so this keeps the label from flickering).
+fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Option<OfficeActivity> {
+    if let Some(job) = pending.values().find(|j| j.proj_slug == project.id.0) {
+        let label = match job.purpose {
+            InvokePurpose::Persona => "office is replying",
+            InvokePurpose::Fold => "summarizing the conversation",
+            InvokePurpose::AssumeCheckPrd => "fact-checking the PRD",
+            InvokePurpose::AssumeCheckTrd => "fact-checking the TRD",
+            InvokePurpose::AssumeCheckCrd => "fact-checking the CRD",
+            InvokePurpose::Trd => "drafting the TRD",
+            InvokePurpose::Crd => "drafting the CRD",
+            InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {
+                "breaking down the plan"
+            }
+        };
+        return Some(OfficeActivity { label: label.to_string(), since_ms: job.submitted_at_ms });
+    }
+    if let Some(b) = &project.research {
+        return Some(OfficeActivity { label: "researching the stack".to_string(), since_ms: b.spawned_at_ms });
+    }
+    if let Some(b) = &project.audit {
+        return Some(OfficeActivity { label: "auditing the delivery".to_string(), since_ms: b.spawned_at_ms });
+    }
+    None
 }
 
 fn binding_agent_id(state: &TaskState) -> Option<u64> {

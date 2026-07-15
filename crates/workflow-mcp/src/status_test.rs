@@ -181,3 +181,50 @@ fn empty_store_reports_no_projects() {
     let out = status_digest_at(tmp.path(), None);
     assert_eq!(out, "No Workflow projects yet.");
 }
+
+#[test]
+fn research_binding_surfaces_activity_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let store = Store::open(&root).unwrap();
+
+    let mut p = project("shop", "Online Shop", ProjectPhase::Drafting, vec![], 1);
+    p.research = Some(AgentBinding {
+        ext_agent_id: 7,
+        session: "sess".to_string(),
+        spawned_at_ms: 1,
+        kind: AgentKind::Researcher,
+        persona: String::new(),
+    });
+    store.save_project(&p).unwrap();
+
+    let out = status_digest_at(&root, None);
+    assert!(out.contains("activity: researching the stack"), "{out}");
+}
+
+#[test]
+fn audit_binding_surfaces_activity_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let store = Store::open(&root).unwrap();
+
+    let mut p = project("shop", "Online Shop", ProjectPhase::Running, vec![], 1);
+    p.audit = Some(AgentBinding {
+        ext_agent_id: 7,
+        session: "sess".to_string(),
+        spawned_at_ms: 1,
+        kind: AgentKind::Auditor,
+        persona: String::new(),
+    });
+    store.save_project(&p).unwrap();
+
+    let out = status_digest_at(&root, None);
+    assert!(out.contains("activity: auditing the delivery"), "{out}");
+}
+
+#[test]
+fn no_activity_line_when_neither_research_nor_audit_is_live() {
+    let (_tmp, root) = seed();
+    let out = status_digest_at(&root, None);
+    assert!(!out.contains("activity:"), "{out}");
+}

@@ -3,7 +3,9 @@ import {
   PERSONA_ORDER,
   clampMaxWorkers,
   deskCountFor,
+  formatElapsed,
   isAuditLive,
+  isDraftingFamilyActivity,
   isResearchLive,
   occupiedCount,
   presenceFor,
@@ -199,5 +201,32 @@ describe('fixed-staff liveness', () => {
     expect(isAuditLive({ auditActive: true })).toBe(true);
     expect(isAuditLive({ audit: { extAgentId: 2 } })).toBe(true);
     expect(isAuditLive({})).toBe(false);
+  });
+});
+
+describe('formatElapsed', () => {
+  it('formats sub-minute durations as "Ns"', () => {
+    expect(formatElapsed(1000, 1000)).toBe('0s');
+    expect(formatElapsed(46000, 1000)).toBe('45s');
+    expect(formatElapsed(60000, 1000)).toBe('59s');
+  });
+
+  it('formats minute-plus durations as "m:ss"', () => {
+    expect(formatElapsed(61000, 1000)).toBe('1:00');
+    expect(formatElapsed(126000, 1000)).toBe('2:05');
+  });
+
+  it('clamps to "0s" when nowMs is before sinceMs (never goes negative)', () => {
+    expect(formatElapsed(1000, 5000)).toBe('0s');
+  });
+});
+
+describe('isDraftingFamilyActivity', () => {
+  it('classifies drafting-family labels as true, research/audit as false', () => {
+    expect(isDraftingFamilyActivity('drafting the TRD')).toBe(true);
+    expect(isDraftingFamilyActivity('researching the stack')).toBe(false);
+    expect(isDraftingFamilyActivity('auditing the delivery')).toBe(false);
+    expect(isDraftingFamilyActivity(undefined)).toBe(false);
+    expect(isDraftingFamilyActivity(null)).toBe(false);
   });
 });

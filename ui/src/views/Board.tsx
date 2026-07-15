@@ -79,6 +79,9 @@ export interface Project {
   audit?: unknown;
   /** Config subset the office view reads — `maxWorkers` chooses the office layout tier. */
   config?: { maxWorkers?: number | null };
+  /** Live office activity (full snapshot only, 6.2d), present only while an activity is in
+   * flight; omitted entirely (not null) when idle. At most one is live at a time. */
+  officeActivity?: { label: string; sinceMs: number } | null;
 }
 
 const COLUMNS: { key: ColumnKey; label: string }[] = [

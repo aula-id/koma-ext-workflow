@@ -94,6 +94,7 @@ Envelope = {
   prdMarkdown, officeTranscript: [ { who: "user"|"office", text } ], officeSummary,
   trdMarkdown, researchNotes,   // 6.2b Drafting pipeline docs; full mode only, drop in summary
   researchActive: <bool>, auditActive: <bool>,   // fixed-staff liveness for the office view; ADDITIVE
+  officeActivity?: { label: <string>, sinceMs: <u64> },   // live office-brain activity; ADDITIVE
   config: { maxWorkers, bounceBudget, workerModel: <string|null>,
             reviewerModel: <string|null>, keepDesks: <bool> }   // config_set round-trip
 }
@@ -103,6 +104,12 @@ Envelope = {
 authored in the Drafting pipeline (PRD -> research -> TRD -> breakdown, ARCHITECTURE.md 6.2b).
 Both are full-mode only and are dropped in summary mode, exactly like `prdMarkdown`. Additive:
 older panels ignore the extra keys; the schema stays `workflow/1`.
+
+`officeActivity` (full mode only, omitted entirely when nothing is live) surfaces what the office
+brain is currently doing — drafting the TRD/CRD, fact-checking a doc, breaking down the plan,
+researching the stack, or auditing the delivery — with `sinceMs` (the activity's start timestamp)
+so the panel can render an elapsed-time display. Additive: older panels ignore it, schema stays
+`workflow/1`.
 
 ### 2.2 `Task` (full mode; summary mode omits the body fields)
 

@@ -5,6 +5,7 @@ import {
   DESK,
   PersonaPresence,
   isAuditLive,
+  isDraftingFamilyActivity,
   isResearchLive,
   clampMaxWorkers,
   occupiedCount,
@@ -350,7 +351,11 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
               fontSize: '0.62rem', color: 'var(--wf-dim)', zIndex: 5, whiteSpace: 'nowrap',
             }}
           >
-            {pmPacing ? 'front office' : 'PM · standup'}
+            {pmPacing
+              ? 'front office'
+              : isDraftingFamilyActivity(project?.officeActivity?.label)
+                ? `PM · ${project.officeActivity!.label}`
+                : 'PM · standup'}
           </div>
         </motion.div>
       </div>

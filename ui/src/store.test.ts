@@ -109,3 +109,47 @@ describe('bridge push -> store wiring does not self-revert', () => {
     expect(useStore.getState().projects).toEqual(before.projects);
   });
 });
+
+/**
+ * `officeActivity` (6.2d): an optional field on the full-mode snapshot, present only while
+ * a live office activity is in flight and omitted entirely (not null) when idle.
+ * `updateSnapshot` must round-trip it when present and default to `null` when absent.
+ */
+describe('updateSnapshot officeActivity', () => {
+  beforeEach(() => {
+    useStore.setState({ snapshot: null, projects: [] });
+  });
+
+  it('round-trips officeActivity when present in the raw snapshot', () => {
+    useStore.getState().updateSnapshot({
+      kind: 'snapshot',
+      seq: 1,
+      projects: [
+        {
+          id: 'p1',
+          name: 'Alpha',
+          phase: { kind: 'drafting' },
+          tasks: [],
+          officeActivity: { label: 'drafting the TRD', sinceMs: 123 },
+        },
+      ],
+    });
+
+    expect(useStore.getState().getProject('p1')?.officeActivity).toEqual({
+      label: 'drafting the TRD',
+      sinceMs: 123,
+    });
+  });
+
+  it('defaults officeActivity to null when absent from the raw snapshot', () => {
+    useStore.getState().updateSnapshot({
+      kind: 'snapshot',
+      seq: 1,
+      projects: [
+        { id: 'p1', name: 'Alpha', phase: { kind: 'drafting' }, tasks: [] },
+      ],
+    });
+
+    expect(useStore.getState().getProject('p1')?.officeActivity).toBeNull();
+  });
+});

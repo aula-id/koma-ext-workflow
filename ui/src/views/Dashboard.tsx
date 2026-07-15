@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { useStore, Project } from '../store';
 import { bridge } from '../bridge';
+import { formatElapsed } from '../lib/officeLayout';
 
 interface DashboardProps {
   onProjectClick?: (projectId: string) => void;
@@ -38,7 +39,7 @@ const StatusDot: React.FC<{ colorVar: string; running: boolean; label: string }>
 
 /* One flat row per project: dot | name + phase | inline counts | last notice.
  * Hairline separators between rows, hover wash, no boxes. */
-const ProjectRow: React.FC<{ project: Project; onClick?: () => void }> = ({ project, onClick }) => {
+const ProjectRow: React.FC<{ project: Project; onClick?: () => void; nowMs: number }> = ({ project, onClick, nowMs }) => {
   const phaseKind = project.phase.kind;
   const colorVar = PHASE_COLOR_VAR[phaseKind] || 'var(--wf-dim)';
   const running = project.runningCount || 0;
@@ -78,10 +79,17 @@ const ProjectRow: React.FC<{ project: Project; onClick?: () => void }> = ({ proj
           </span>
           <span style={{ color: colorVar, fontSize: '0.75rem' }}>{phaseKind}</span>
         </div>
-        {project.lastNotice && (
-          <div className="truncate" style={{ color: 'var(--wf-dim)', fontSize: '0.75rem', marginTop: 2 }}>
-            {project.lastNotice}
+        {project.officeActivity ? (
+          <div className="truncate flex items-center gap-1" style={{ color: 'var(--wf-info)', fontSize: '0.75rem', marginTop: 2 }}>
+            <StatusDot colorVar="var(--wf-info)" running label={project.officeActivity.label} />
+            <span>{project.officeActivity.label} · {formatElapsed(nowMs, project.officeActivity.sinceMs)}</span>
           </div>
+        ) : (
+          project.lastNotice && (
+            <div className="truncate" style={{ color: 'var(--wf-dim)', fontSize: '0.75rem', marginTop: 2 }}>
+              {project.lastNotice}
+            </div>
+          )
         )}
       </div>
       <div className="flex-none" style={{ color: 'var(--wf-dim)', fontSize: '0.78rem' }}>
@@ -93,6 +101,16 @@ const ProjectRow: React.FC<{ project: Project; onClick?: () => void }> = ({ proj
 
 export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings }) => {
   const { projects, snapshot } = useStore();
+
+  // Ticking clock for live office activity elapsed times — only ticks while at least one
+  // project has a live activity, so idle dashboards never re-render on a timer.
+  const hasLiveActivity = projects.some((p) => p.officeActivity);
+  const [nowMs, setNowMs] = useState(Date.now());
+  useEffect(() => {
+    if (!hasLiveActivity) return;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [hasLiveActivity]);
 
   useEffect(() => {
     // Regression (found while wiring the mock harness/deep links): calling
@@ -181,6 +199,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onProjectClick, onSettings
               <ProjectRow
                 key={project.id}
                 project={project}
+                nowMs={nowMs}
                 onClick={() => onProjectClick?.(project.id)}
               />
             ))}

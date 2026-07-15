@@ -107,7 +107,33 @@ fn project_block(p: &Project) -> String {
     if let Some(g) = p.last_audit_grade {
         s.push_str(&format!("  audit: {g}\n"));
     }
+    // Live "office activity" line: this module reads persisted `Project` state straight off
+    // disk (no access to the driver's in-memory invoke bookkeeping), so it can only surface
+    // research/audit here — not invoke-based activity like drafting/fact-checking, which
+    // never persists to `Project`. Priority matches the driver's (research over audit).
+    if let Some(b) = &p.research {
+        s.push_str(&format!(
+            "  activity: researching the stack ({}s)\n",
+            elapsed_secs(b.spawned_at_ms)
+        ));
+    } else if let Some(b) = &p.audit {
+        s.push_str(&format!(
+            "  activity: auditing the delivery ({}s)\n",
+            elapsed_secs(b.spawned_at_ms)
+        ));
+    }
     s
+}
+
+/// Elapsed wall-clock seconds since `since_ms` (unix epoch millis), saturating at 0 if the
+/// clock is somehow behind (should not happen, but this is a display line, not a guard).
+fn elapsed_secs(since_ms: u64) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(since_ms);
+    now_ms.saturating_sub(since_ms) / 1000
 }
 
 fn yn(present: bool) -> &'static str {
