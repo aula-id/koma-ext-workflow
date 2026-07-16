@@ -2551,6 +2551,12 @@ fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     // `triage_pending` left `true` would suppress the persona doc-capture forever after resume. Clear
     // it; the track stays whatever it was (default "project"), which is the safe fallback.
     p.triage_pending = false;
+    // Sprint review ceremony (review finding, CRITICAL): same "process boundary" reasoning — an
+    // in-flight `SprintReview` invoke's eventual result is dropped by the `Interrupted` guard, so a
+    // hint left `true` would wrongly block `rearm_stranded_sprint_reviews` after resume. Clear it; the
+    // `Command::Resume` handler already re-fires the ceremony directly when it resumes into a sprint
+    // still `InReview`.
+    p.sprint_review_invoke_live = false;
     // Cut off the project-level drafting/completion analysts (research 6.2b, audit 6.2c). They
     // are NOT task bindings, so the normalization loop below never touches them; a dangling
     // researcher/auditor would keep burning tokens against an interrupted project (feature:
@@ -2609,6 +2615,9 @@ fn soft_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     p.gate_invoke_live_hint = false;
     // Intake triage (feature: sdlc-triage): clear the pending flag for the same reason.
     p.triage_pending = false;
+    // Sprint review ceremony (review finding, CRITICAL): clear the live-invoke hint for the same
+    // reason — `Command::Resume` re-fires the ceremony directly when applicable.
+    p.sprint_review_invoke_live = false;
 }
 
 /// Kill the project-level analyst bindings (research 6.2b / audit 6.2c) on a hard interrupt
@@ -2638,7 +2647,13 @@ fn kill_project_bindings(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
     match e {
         HostEvent::Tick => {} // dispatch scan runs after every input
-        HostEvent::Reconcile => runtime_ceiling(p, now_ms, ctx),
+        HostEvent::Reconcile => {
+            runtime_ceiling(p, now_ms, ctx);
+            // Review finding (CRITICAL): the same periodic pass that force-kills a hung worker/
+            // research/audit binding also re-arms a sprint-review ceremony whose invoke was dropped
+            // by a daemon restart.
+            rearm_stranded_sprint_reviews(p, now_ms, ctx);
+        }
         HostEvent::Spawned {
             task,
             agent_id,
@@ -3445,10 +3460,41 @@ fn sprint_phase_active(p: &Project) -> bool {
 /// the earliest `Pending` sprint. In steady state `apply_breakdown` makes sprint 0 `Active` and
 /// `finish_sprint_review` activates the next, so this only fires defensively (e.g. an odd reload) —
 /// keeping the line from stalling with everything `Pending`.
+///
+/// Review finding (MINOR): the mirror-image invariant break — TWO (or more) sprints somehow `Active`
+/// at once (bad data / an old race) — self-heals here too. `active_sprint_idx` only ever returns the
+/// FIRST match, so `dispatch_scope`/`sprint_settled`/`maybe_review_active_sprint` already only ever
+/// see ONE of them; this keeps the LOWEST-index Active sprint (the one actually meant to be grinding)
+/// and demotes every other Active sprint back to `Pending`, traced. The demotion assigns the status
+/// directly (not via `step_sprint`) because this REPAIRS an invalid invariant rather than modeling a
+/// legal transition — `Active -> Pending` is not one of the machine's normal edges.
 fn ensure_active_sprint(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     if p.sprints.is_empty() {
         return;
     }
+
+    let active_idxs: Vec<usize> = p
+        .sprints
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s.status, SprintStatus::Active))
+        .map(|(i, _)| i)
+        .collect();
+    if active_idxs.len() > 1 {
+        let keep = active_idxs[0];
+        for &i in &active_idxs[1..] {
+            p.sprints[i].status = SprintStatus::Pending;
+            trace(
+                p,
+                now_ms,
+                "sprint",
+                format!("sprint {} demoted to Pending (multiple Active, keeping sprint {})", i + 1, keep + 1),
+                ctx,
+            );
+        }
+        ctx.dirty = true;
+    }
+
     if active_sprint_idx(p).is_some() || sprint_under_review_idx(p).is_some() {
         return;
     }
@@ -3487,14 +3533,54 @@ fn sprint_settled(p: &Project, sprint_idx: usize) -> bool {
 /// legacy flow, when no sprint is Active, or when the active sprint is still grinding. Called in
 /// `step` after each dispatch scan, so it fires exactly once per settle (the sprint flips to
 /// `InReview` and this guard then finds no Active sprint).
+///
+/// Review finding (MAJOR): an `Active` sprint with ZERO tasks (e.g. a PM `drop` adjustment removed
+/// every one of the next sprint's planned tasks with no carry-overs to fill it) can never "settle" its
+/// way to a ceremony invoke — nothing is running, nothing is ready, and the old empty-guard just
+/// returned, leaving it `Active` forever with the dispatch scope pointed at an empty task set (a
+/// silent stall). There is nothing to review, so it is auto-closed instead (`auto_close_empty_sprint`)
+/// rather than routed through the ceremony.
 fn maybe_review_active_sprint(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     let Some(si) = active_sprint_idx(p) else {
         return;
     };
-    if p.sprints[si].tasks.is_empty() || !sprint_settled(p, si) {
+    if p.sprints[si].tasks.is_empty() {
+        auto_close_empty_sprint(p, si, now_ms, ctx);
+        return;
+    }
+    if !sprint_settled(p, si) {
         return;
     }
     enter_sprint_review(p, si, now_ms, ctx);
+}
+
+/// Settle a task-less `Active` sprint directly to `Done` with NO ceremony invoke — there is nothing to
+/// review (review finding, MAJOR). Mirrors `finish_sprint_review`'s zero-carryover tail: activate the
+/// next `Pending` sprint if one exists, else the project is complete (existing audit/complete flow).
+fn auto_close_empty_sprint(p: &mut Project, sprint_idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    if let Ok(st) = step_sprint(&p.sprints[sprint_idx].status, SprintTransition::Review) {
+        p.sprints[sprint_idx].status = st;
+    }
+    if let Ok(st) = step_sprint(&p.sprints[sprint_idx].status, SprintTransition::Complete) {
+        p.sprints[sprint_idx].status = st;
+    }
+    trace(p, now_ms, "sprint", format!("sprint {} empty sprint auto-closed", sprint_idx + 1), ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: sprint {} had no tasks — auto-closed, no review needed.", p.id.0, sprint_idx + 1),
+        ctx,
+    );
+    ctx.dirty = true;
+
+    if let Some(i) = p.sprints.iter().position(|s| matches!(s.status, SprintStatus::Pending)) {
+        if let Ok(st) = step_sprint(&p.sprints[i].status, SprintTransition::Activate) {
+            p.sprints[i].status = st;
+            trace(p, now_ms, "sprint", format!("sprint {} activated", i + 1), ctx);
+        }
+    } else {
+        maybe_complete_project(p, now_ms, ctx);
+    }
 }
 
 /// Open a sprint's review ceremony (feature: sprints): flip it `Active -> InReview`, tag the delivery
@@ -3540,7 +3626,44 @@ fn fire_sprint_review(p: &mut Project, sprint_idx: usize, now_ms: u64, ctx: &mut
     // On the office_role like a persona reply, but NOT a doc-drafting invoke, so `emit_invoke` (no
     // `drafter_model` override) — see `InvokePurpose::SprintReview`.
     emit_invoke(ctx, InvokePurpose::SprintReview, &p.config.office_role, system, prompt);
+    // Review finding (CRITICAL): the ceremony invoke is memory-only — mark it live so a daemon
+    // restart / dropped result can be detected and re-armed (`rearm_stranded_sprint_reviews`) instead
+    // of silently freezing the whole project (`dispatch_scope` returns `Scope::None` while any sprint
+    // is `InReview`).
+    p.sprint_review_invoke_live = true;
     ctx.dirty = true;
+}
+
+/// Self-heal a stranded sprint-review ceremony (review finding, CRITICAL). The `SprintReview` invoke
+/// fired by `fire_sprint_review` is memory-only — nothing on disk records "a review invoke is
+/// outstanding" — so a daemon restart (or lease transfer) mid-ceremony drops it with no way for the
+/// normal result path to ever fire: `Command::Resume` only re-enters from `Interrupted` (illegal from
+/// `Running`), and neither `HostEvent::Tick` nor the ordinary `Reconcile` runtime-ceiling pass ever
+/// re-scans for it. Meanwhile `dispatch_scope` returns `Scope::None` for the WHOLE project while any
+/// sprint is `InReview`, so the strand freezes every task, not just the sprint. Checked on every
+/// rate-limited `Reconcile` pass (the same periodic cadence `runtime_ceiling` already uses): any
+/// sprint still `InReview` with `!sprint_review_invoke_live` — this process has no invoke in flight
+/// for it, whether because none was ever fired by THIS process (a fresh reload) or because the prior
+/// one already resolved and cleared the hint — gets re-armed. `fire_sprint_review` is idempotent (it
+/// REPLACES the sprint transcript rather than appending to it, and does not re-tag — tagging only
+/// happens once, at `enter_sprint_review`'s initial settle), so a re-fire can never double-count or
+/// duplicate work.
+///
+/// Gated to `Running` — mirrors the phase gate `step` already applies to `ensure_active_sprint`/
+/// `dispatch`/`maybe_review_active_sprint` — so this never races `Command::Resume`'s own unconditional
+/// re-fire for an `Interrupted` project resuming back into a still-`InReview` sprint (which would
+/// otherwise waste a duplicate model call whose result the `Interrupted` guard in `invoke_result`
+/// would just drop).
+fn rearm_stranded_sprint_reviews(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if !matches!(p.phase, ProjectPhase::Running) {
+        return;
+    }
+    if let Some(si) = sprint_under_review_idx(p) {
+        if !p.sprint_review_invoke_live {
+            trace(p, now_ms, "sprint", format!("sprint {} review re-armed (invoke lost)", si + 1), ctx);
+            fire_sprint_review(p, si, now_ms, ctx);
+        }
+    }
 }
 
 /// Assemble a sprint's review transcript PROGRAMMATICALLY from real task data (feature: sprints):
@@ -3660,6 +3783,10 @@ fn finish_sprint_review(p: &mut Project, outcome: Result<String, String>, now_ms
         return;
     };
     ctx.dirty = true;
+    // Review finding (CRITICAL): this is the ONE arm that handles BOTH the success and error outcome
+    // of a `SprintReview` invoke (the `Err` branch just falls back to a default plan below), so
+    // clearing the live-invoke hint here covers both terminal cases in one place.
+    p.sprint_review_invoke_live = false;
 
     let plan = match outcome {
         Ok(text) => report::parse_sprint_review(&text),
@@ -3809,6 +3936,24 @@ fn apply_sprint_adjustments(
                         p.sprints[target_idx].tasks.retain(|t| t != &tid);
                         p.tasks.retain(|t| t.id != tid);
                         trace(p, now_ms, "sprint", format!("adjustment: dropped {}", short_task(&tid)), ctx);
+                        // Review finding (MAJOR): a dropped id left dangling in another task's
+                        // `blocked_by` is never "done" (`graph::ready_set`) and never "poisoned"
+                        // (`graph::line_is_stuck` treats a missing blocker as NOT poisoned) — the
+                        // dependent waits forever with no halt signal. Strip it from every task.
+                        let stripped = strip_dangling_blocker(p, &tid);
+                        if stripped > 0 {
+                            trace(
+                                p,
+                                now_ms,
+                                "sprint",
+                                format!(
+                                    "adjustment: stripped dangling blocker {} from {} dependent task(s)",
+                                    short_task(&tid),
+                                    stripped
+                                ),
+                                ctx,
+                            );
+                        }
                     }
                 }
             }
@@ -3862,6 +4007,21 @@ fn apply_sprint_adjustments(
             }
         }
     }
+}
+
+/// Strip a dropped task id from every remaining task's `blocked_by` (review finding, MAJOR:
+/// `apply_sprint_adjustments`' `Drop` case used to retain the dangling dependency). Returns the
+/// number of tasks that actually had the id removed, for the caller's trace.
+fn strip_dangling_blocker(p: &mut Project, dropped: &TaskId) -> usize {
+    let mut stripped = 0usize;
+    for t in p.tasks.iter_mut() {
+        let before = t.blocked_by.len();
+        t.blocked_by.retain(|b| b != dropped);
+        if t.blocked_by.len() != before {
+            stripped += 1;
+        }
+    }
+    stripped
 }
 
 /// Resolve a PM adjustment `target` to a task id the target sprint owns (feature: sprints): match the

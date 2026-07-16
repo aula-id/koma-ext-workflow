@@ -1193,6 +1193,7 @@ impl<H: Host> Driver<H> {
             gate_invoke_live_hint: false,
             track: "project".to_string(),
             triage_pending: false,
+            sprint_review_invoke_live: false,
             seq: 0,
         };
         if self.store.create_project(&project).is_err() {

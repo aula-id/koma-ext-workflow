@@ -68,6 +68,7 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         gate_invoke_live_hint: false,
         track: "project".to_string(),
         triage_pending: false,
+        sprint_review_invoke_live: false,
         pending_breakdown: None,
         seq: 0,
         worktree_desks: false,
@@ -3997,4 +3998,176 @@ fn sprint_review_feeds_transcript_into_research_notes() {
     step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: pipeline shipped\n"), 1100, 4);
     assert!(p.research_notes.contains("Sprint 1 review"), "the transcript header is fed into research_notes");
     assert!(p.research_notes.contains("pipeline shipped"), "including the PM summary line");
+}
+
+// ---------------------------------------------------------------------------
+// Sprint review self-heal (review finding, CRITICAL): a daemon restart mid-ceremony strands the
+// project with `dispatch_scope` returning `Scope::None`. `sprint_review_invoke_live` is the
+// process-boundary hint (mirrors `gate_invoke_live_hint`); `Reconcile` re-arms it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stranded_sprint_review_rearms_on_reconcile_after_reload() {
+    // (a) A serde round-trip resets the `#[serde(skip)]` hint to `false` regardless of what it was
+    // before — exactly the "process boundary" a daemon restart mid-ceremony produces. The next
+    // Reconcile must re-arm the ceremony with EXACTLY one fresh invoke.
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::InReview)];
+    p.sprint_review_invoke_live = true; // as if a review invoke WAS in flight when this was saved
+
+    let json = serde_json::to_string(&p).expect("serialize");
+    let mut reloaded: Project = serde_json::from_str(&json).expect("deserialize");
+    assert!(!reloaded.sprint_review_invoke_live, "the skip field never round-trips through disk");
+
+    let fx = step(&mut reloaded, Input::Host(HostEvent::Reconcile), 5000, 4);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1, "exactly one re-armed invoke");
+    assert_eq!(reloaded.sprints[0].status, SprintStatus::InReview, "still under review");
+    assert!(
+        reloaded.trace.iter().any(|e| e.summary.contains("re-armed")),
+        "the re-arm is traced"
+    );
+}
+
+#[test]
+fn live_sprint_review_invoke_not_rearmed_on_reconcile() {
+    // (b) A genuinely in-flight invoke (this process fired it, no reload happened) must NOT be
+    // duplicated by the Reconcile self-heal.
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::InReview)];
+    p.sprint_review_invoke_live = true;
+    let fx = step(&mut p, Input::Host(HostEvent::Reconcile), 5000, 4);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 0, "no re-fire while genuinely in flight");
+}
+
+#[test]
+fn sprint_review_invoke_error_clears_hint_and_reconcile_rearms() {
+    // (c) The hint clears on the ERROR arm exactly like the success arm — both converge in
+    // `finish_sprint_review`. A later ceremony stranded in the SAME (InReview, hint=false) shape
+    // (however it got there — the hint is never persisted, so a restart always produces it) still
+    // gets re-armed by Reconcile; the self-heal is not special-cased to a fresh reload.
+    // A second (Pending) sprint keeps the project Running (not completed) after the first errors,
+    // so it stays a valid target for the Reconcile self-heal below.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["t2"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle -> InReview, one invoke fired
+    assert!(p.sprint_review_invoke_live, "fire_sprint_review marks the invoke live");
+
+    let err = Input::Command(Command::InvokeResult {
+        purpose: InvokePurpose::SprintReview,
+        outcome: Err("model call timed out".to_string()),
+    });
+    step(&mut p, err, 1100, 4);
+    assert!(!p.sprint_review_invoke_live, "the error arm clears the hint exactly like success");
+    assert_eq!(p.sprints[0].status, SprintStatus::Done, "the ceremony still completes on error");
+    assert!(matches!(p.phase, ProjectPhase::Running));
+
+    // Simulate a later ceremony stranded in the identical (InReview, hint=false) shape.
+    p.sprints[1].status = SprintStatus::InReview;
+    let fx = step(&mut p, Input::Host(HostEvent::Reconcile), 1200, 4);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1, "reconcile re-arms it");
+    assert!(p.trace.iter().any(|e| e.summary.contains("re-armed")));
+}
+
+// ---------------------------------------------------------------------------
+// PM Drop strands dependents / empty Active sprint stalls (review finding, MAJOR)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sprint_pm_drop_strips_dangling_blocker_from_dependents() {
+    // A `drop` adjustment used to leave the dropped id dangling in a dependent's `blocked_by` —
+    // never "done" (`graph::ready_set`) and never "poisoned" (`graph::line_is_stuck` treats a
+    // missing blocker as NOT poisoned) — so the dependent waited forever with no halt signal.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("proj/s2/drop-me", TaskState::Todo, 0, &[]),
+            task("proj/s2/dependent", TaskState::Todo, 0, &["proj/s2/drop-me"]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["proj/s2/drop-me", "proj/s2/dependent"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle s1 -> review
+
+    let plan = "SPRINT-REVIEW\nsummary: reprioritize\nadjustments:\n- drop drop-me\n";
+    step(&mut p, sprint_review_result(plan), 1100, 4);
+
+    assert!(!p.tasks.iter().any(|t| t.id.0 == "proj/s2/drop-me"), "dropped task removed from the board");
+    let dependent = find_task(&p, "proj/s2/dependent");
+    assert!(dependent.blocked_by.is_empty(), "the dangling blocker was stripped");
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("stripped dangling blocker")),
+        "the strip is traced"
+    );
+}
+
+#[test]
+fn sprint_pm_drop_all_next_tasks_with_zero_carryover_auto_closes_empty_sprint() {
+    // Dropping every one of the next sprint's planned tasks (with zero carry-overs from the closing
+    // sprint) used to leave that sprint `Active` with an empty task list — it can never "settle" its
+    // way to a ceremony invoke (nothing running, nothing ready), so the project silently stalled.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("proj/s2/only", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.crd_markdown = "# CRD\n- README (100)".into();
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["proj/s2/only"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle s1 -> review
+
+    let plan = "SPRINT-REVIEW\nsummary: descope\nadjustments:\n- drop only\n";
+    let fx = step(&mut p, sprint_review_result(plan), 1100, 4);
+
+    assert_eq!(p.sprints[0].status, SprintStatus::Done);
+    assert_eq!(p.sprints[1].status, SprintStatus::Done, "the now-empty sprint auto-closes");
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 0, "no ceremony invoke for an empty sprint");
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("empty sprint auto-closed")),
+        "the auto-close is traced"
+    );
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })),
+        "the project proceeds to completion (audit) instead of stalling"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ensure_active_sprint two-Active self-heal (review finding, MINOR)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ensure_active_sprint_demotes_extra_active_sprints_keeping_lowest_index() {
+    // The mirror-image of the zero-Active self-heal — TWO sprints somehow Active at once (bad data
+    // / an old race). Keep the lowest-index one, demote the rest to Pending.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Todo, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["t2"], SprintStatus::Active),
+    ];
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Active, "the lowest-index sprint stays Active");
+    assert_eq!(p.sprints[1].status, SprintStatus::Pending, "the extra Active sprint is demoted");
+    assert_eq!(count_spawns(&fx), 1, "dispatch now scopes cleanly to the single Active sprint");
+    assert!(matches!(find_task(&p, "t1").state, TaskState::OnProgress { .. }));
+    assert!(matches!(find_task(&p, "t2").state, TaskState::Todo));
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("demoted to Pending")),
+        "the demotion is traced"
+    );
 }

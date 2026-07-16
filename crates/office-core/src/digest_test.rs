@@ -69,6 +69,7 @@ mod tests {
             gate_invoke_live_hint: false,
             track: "project".to_string(),
             triage_pending: false,
+            sprint_review_invoke_live: false,
             pending_breakdown: None,
             seq,
             worktree_desks: false,
@@ -322,6 +323,7 @@ mod tests {
         // the InReview sprint carries its ceremony transcript for the UI to replay.
         assert_eq!(sprints[1]["transcript"].as_array().unwrap().len(), 1);
         assert_eq!(sprints[1]["transcript"][0]["speaker"].as_str().unwrap(), "office");
+        assert_eq!(sprints[1]["transcript"][0]["text"].as_str().unwrap(), "summary line");
         // the active pointer points at the current (InReview) sprint.
         let active = &obj["activeSprint"];
         assert_eq!(active["index"].as_u64().unwrap(), 1);

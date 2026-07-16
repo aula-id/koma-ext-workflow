@@ -49,6 +49,7 @@ mod tests {
             gate_invoke_live_hint: false,
             track: "project".to_string(),
             triage_pending: false,
+            sprint_review_invoke_live: false,
             pending_breakdown: None,
             seq: 1,
             worktree_desks: false,

@@ -567,6 +567,23 @@ pub struct Project {
     /// proceeds under the resolved (or default `"project"`) track rather than wedging.
     #[serde(skip)]
     pub triage_pending: bool,
+    /// Runtime-only hint (review finding, CRITICAL): "a `SprintReview` ceremony invoke was fired by
+    /// THIS process (`fire_sprint_review`) and may still be in flight". The in-flight invoke chain is
+    /// the ceremony's ONLY liveness signal — nothing else persists "a review invoke is outstanding" —
+    /// so a daemon restart mid-ceremony drops it silently: the sprint stays `InReview` forever, and
+    /// `dispatch_scope` returns `Scope::None` while any sprint is `InReview`, freezing the WHOLE
+    /// project with no user-visible signal. Set `true` every time [`crate::kernel`]'s
+    /// `fire_sprint_review` emits the invoke, cleared on the `SprintReview` invoke-result arm
+    /// (`finish_sprint_review`, success AND error both converge there) and on hard/soft interrupt
+    /// (same "process boundary" reasoning as `gate_invoke_live_hint`/`triage_pending`: an in-flight
+    /// result is dropped unconditionally by the `Interrupted` guard, so a hint left `true` would never
+    /// clear on its own). Deliberately `#[serde(skip)]` for the same reason as those two siblings —
+    /// it always deserializes to `false`, so a project reloaded mid-ceremony is correctly seen as
+    /// having NO invoke in flight and the periodic `Reconcile` self-heal (which re-fires
+    /// `fire_sprint_review` — idempotent, replaces the transcript — whenever a sprint is `InReview`
+    /// with this `false`) un-wedges it on the very next reconcile pass.
+    #[serde(skip)]
+    pub sprint_review_invoke_live: bool,
     pub seq: u64,
 }
 

@@ -403,6 +403,7 @@ mod tests {
             // sdlc-triage: a non-default track must round-trip through serde intact.
             track: "enhancement".to_string(),
             triage_pending: false,
+            sprint_review_invoke_live: false,
             pending_breakdown: None,
             seq: 42,
             worktree_desks: false,

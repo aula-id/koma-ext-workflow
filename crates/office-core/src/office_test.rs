@@ -41,6 +41,7 @@ fn project(phase: ProjectPhase) -> Project {
         gate_invoke_live_hint: false,
         track: "project".to_string(),
         triage_pending: false,
+        sprint_review_invoke_live: false,
         pending_breakdown: None,
         seq: 1,
         worktree_desks: false,
@@ -669,4 +670,23 @@ fn append_research_learnings_keeps_newest_within_cap() {
     let capped = office::append_research_learnings(&huge, "FRESH");
     assert!(capped.starts_with("FRESH"));
     assert!(capped.len() <= office::RESEARCH_NOTES_CAP);
+}
+
+#[test]
+fn append_research_learnings_reserves_floor_for_original_research() {
+    // Review finding (MINOR, eviction floor): repeated large sprint-learnings appends must never
+    // evict the ORIGINAL stack research entirely. The accumulated learnings prefix is capped at half
+    // the budget, so the original research (found here via a distinctive marker near its start)
+    // always survives, however many verbose sprints pile learnings on top of it.
+    let original = format!("ORIGINAL-STACK-RESEARCH-MARKER {}", "y".repeat(2000));
+    let mut notes = original.clone();
+    let big_learning = "z".repeat(office::RESEARCH_NOTES_CAP); // one huge sprint's learnings
+    for _ in 0..10 {
+        notes = office::append_research_learnings(&notes, &big_learning);
+        assert!(notes.len() <= office::RESEARCH_NOTES_CAP, "stays within the overall cap");
+    }
+    assert!(
+        notes.contains("ORIGINAL-STACK-RESEARCH-MARKER"),
+        "the original research must survive even after many large learnings appends"
+    );
 }

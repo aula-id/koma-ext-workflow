@@ -520,20 +520,57 @@ existing: yes | no   (does the brief target an EXISTING delivery? only meaningfu
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
+/// Marks the boundary between the accumulated sprint-learnings prefix (newest addition first) and
+/// the ORIGINAL stack-research tail within `research_notes` (review finding, MINOR: eviction floor).
+/// Only ever inserted by [`append_research_learnings`]; reads as a natural section header in the
+/// rendered notes, and lets that function recover the split on every subsequent call.
+const ORIGINAL_RESEARCH_HEADER: &str = "\n\n## Original Stack Research\n\n";
+
 /// Append sprint-review learnings to `existing` research notes, keeping the NEWEST content within
-/// [`RESEARCH_NOTES_CAP`] (feature: sprints item 4). The addition is PREPENDED, then the combined
-/// text is tail-truncated by [`truncate_bytes`] — so the just-learned sprint findings (most relevant
-/// to the next sprint) always survive the cap, and the oldest stack research is dropped first when
-/// the budget is exceeded. An empty addition is a no-op.
+/// [`RESEARCH_NOTES_CAP`] (feature: sprints item 4).
+///
+/// Review finding (MINOR, eviction floor): the original implementation PREPENDED the addition and
+/// tail-truncated the combined text — correct for one call, but across enough verbose sprints the
+/// accumulated learnings prefix alone grows past the cap, and tail-truncation then eats the ORIGINAL
+/// stack research (at the tail) entirely. Fixed by reserving a floor: `existing` is split at
+/// [`ORIGINAL_RESEARCH_HEADER`] into the accumulated learnings prefix and the original research tail
+/// (the very first call — before any header exists — treats the WHOLE of `existing` as that original
+/// tail). The new prefix (this addition + the old prefix) is capped at `RESEARCH_NOTES_CAP / 2`
+/// *before* recombining with the tail, so the newest learnings can never crowd the original research
+/// out of the notes; the final recombination is still capped to `RESEARCH_NOTES_CAP` overall, which
+/// only ever trims the END of the original tail, never erasing its start. An empty addition is a
+/// no-op.
 pub fn append_research_learnings(existing: &str, addition: &str) -> String {
     if addition.trim().is_empty() {
         return existing.to_string();
     }
-    let combined = if existing.trim().is_empty() {
+
+    let (learnings_prefix, original_tail) = match existing.find(ORIGINAL_RESEARCH_HEADER) {
+        Some(idx) => (
+            existing[..idx].to_string(),
+            existing[idx + ORIGINAL_RESEARCH_HEADER.len()..].to_string(),
+        ),
+        None => (String::new(), existing.to_string()),
+    };
+
+    let mut new_prefix = if learnings_prefix.trim().is_empty() {
         addition.to_string()
     } else {
-        format!("{addition}\n\n{existing}")
+        format!("{addition}\n\n{learnings_prefix}")
     };
+
+    // Floor: the learnings prefix alone may never eat more than half the cap, so the original
+    // research tail always keeps at least the other half.
+    let floor = RESEARCH_NOTES_CAP / 2;
+    if new_prefix.len() > floor {
+        new_prefix = truncate_bytes(&new_prefix, floor);
+    }
+
+    if original_tail.trim().is_empty() {
+        return new_prefix;
+    }
+
+    let combined = format!("{new_prefix}{ORIGINAL_RESEARCH_HEADER}{original_tail}");
     truncate_bytes(&combined, RESEARCH_NOTES_CAP)
 }
 
