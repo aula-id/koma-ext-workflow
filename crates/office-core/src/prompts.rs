@@ -153,9 +153,12 @@ pub fn worker(
     if project.worktree_desks {
         // Worktree desks (item 1/2): the desk IS a full git worktree of the delivery repo and THE
         // working root. The worker edits the tree in place; the office branches / commits / merges it.
-        // The hard truth the worker must know (koma can't scope a sub-agent's cwd to the desk): the
-        // shell cwd is workspace [0] = the SHARED delivery checkout, NOT this desk, and it can't be
-        // changed — so a relative path lands in the WRONG tree. Absolute desk paths only.
+        // The hard truth the worker must know depends on the koma build spawning it: a koma new
+        // enough to honor the spawn "workspace" param CONFINES this sub-agent to the desk (it IS
+        // workspace [0] there, full stop — no delivery checkout is even visible); an older koma
+        // without that confinement leaves the shell cwd at workspace [0] = the SHARED delivery
+        // checkout, NOT this desk, and it can't be changed — so a relative path lands in the WRONG
+        // tree there. Either way, absolute desk paths only.
         out.push_str(&format!(
             "- Your desk is a full git worktree of the delivery repo, and it IS your workspace: {}\n",
             desk.display()
@@ -165,10 +168,13 @@ pub fn worker(
 there is NO separate copy step and NO separate delivery path.\n",
         );
         out.push_str(&format!(
-            "- CRITICAL — where files land: your shell's working directory is NOT this desk and you \
-CANNOT change it. A relative path (or workspace root [0]) resolves to a DIFFERENT checkout — the \
-shared delivery working tree — not to your desk. Writing there is WRONG: it pollutes a tree you do \
-not own, your desk stays empty, and the task is bounced. ALWAYS address files by their ABSOLUTE path \
+            "- CRITICAL — where files land: on a koma build that scopes this spawn to the desk, this \
+worktree already IS your only workspace root (including [0]) — you have no visibility into the \
+delivery checkout at all, so there is nothing else to write to by mistake. On an older koma without \
+that scoping, your shell's working directory is NOT this desk and you CANNOT change it: a relative \
+path or workspace root [0] resolves to a DIFFERENT checkout — the shared delivery working tree — not \
+to your desk. Writing there is WRONG: it pollutes a tree you do not own, your desk stays empty, and \
+the task is bounced. Regardless of which case you're in, ALWAYS address files by their ABSOLUTE path \
 under {}. NEVER write to any other workspace root, and NEVER write to the delivery path or workspace \
 [0].\n",
             desk.display()
@@ -306,10 +312,13 @@ workspace. Read the changed files, verify each criterion, and run read-only chec
 typecheck / lint) against the whole tree. Nothing destructive; NEVER run git (the office owns VCS).\n"
         ));
         out.push_str(&format!(
-            "- Your shell's working directory is NOT this worktree and cannot be changed: a relative \
-path (or workspace root [0]) resolves to a DIFFERENT checkout (the shared delivery tree), not to \
-{tree}. Address every file by its ABSOLUTE path under {tree}, run any build/typecheck there, and \
-never write outside it — especially not to the delivery path or workspace [0].\n"
+            "- On a koma build that scopes this spawn to the desk, {tree} already IS your only \
+workspace root (including [0]) — you have no visibility into the delivery checkout at all. On an \
+older koma without that scoping, your shell's working directory is NOT this worktree and cannot be \
+changed: a relative path or workspace root [0] resolves to a DIFFERENT checkout (the shared delivery \
+tree), not to {tree}. Regardless of which case you're in, address every file by its ABSOLUTE path \
+under {tree}, run any build/typecheck there, and never write outside it — especially not to the \
+delivery path or workspace [0].\n"
         ));
         if let Some(stat) = task.diff_stat.as_deref() {
             let stat = truncate_bytes(stat.trim(), CAP_DIFF_STAT);

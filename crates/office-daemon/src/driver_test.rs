@@ -1837,3 +1837,87 @@ fn worktree_empty_desk_diff_with_clean_main_proceeds_to_review() {
     assert!(matches!(proj.tasks[0].state, TaskState::Review { .. }), "proceeds to Review as before");
     assert_eq!(call_count(&d.host, "sessions.spawn_into"), 2, "reviewer spawned (normal flow)");
 }
+
+// ---------------------------------------------------------------------------
+// koma spawn "workspace" confinement (feat/spawn-workspace d7c327f): worktree-desks
+// spawns carry the optional `workspace` param that narrows a sub-agent's world to a
+// single root; legacy copy-desk spawns never send it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worktree_worker_spawn_carries_workspace_equal_to_desk() {
+    // The WORKER dispatch's `sessions.spawn_into` params must confine the sub-agent to its
+    // fresh desk worktree — the same path `setup_worktree` just materialized.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker
+    let mut d = driver(store, host);
+
+    let (p, ws) = worktree_setup("auth", vec![task("auth/t1", TaskState::Todo)]);
+    d.insert_for_test(p, 1_000);
+    let desk = desk_of(&ws, "auth", "t1");
+
+    d.on_tick(1_000); // dispatch -> worktree add + worker spawn
+
+    let params = last_call(&d.host, "sessions.spawn_into").expect("worker spawn recorded");
+    assert_eq!(
+        params.get("workspace").and_then(Value::as_str),
+        Some(desk.display().to_string().as_str()),
+        "worker spawn params: {params}"
+    );
+}
+
+#[test]
+fn worktree_reviewer_spawn_carries_workspace_equal_to_task_worktree() {
+    // The REVIEWER dispatch's `sessions.spawn_into` params must confine the sub-agent to the SAME
+    // task worktree the worker used (still present — not reclaimed until after the merge) so it
+    // reviews the integrated tree.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker
+    host.script("agents.result", json!({ "agentId": 101, "output": "OFFICE-REPORT\nstatus: complete\nsummary: did it\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 202, "status": "spawned" })); // reviewer
+    let mut d = driver(store, host);
+
+    let (p, ws) = worktree_setup("auth", vec![task("auth/t1", TaskState::Todo)]);
+    d.insert_for_test(p, 1_000);
+    let desk = desk_of(&ws, "auth", "t1");
+
+    d.on_tick(1_000); // worker spawn
+    std::fs::write(desk.join("feature.rs"), "fn f() {}\n").unwrap();
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }), 2_000); // commit -> Review -> reviewer spawn
+
+    let params = last_call(&d.host, "sessions.spawn_into").expect("reviewer spawn recorded");
+    assert_eq!(
+        params.get("agent").and_then(Value::as_str),
+        Some("office-reviewer"),
+        "this is the reviewer spawn: {params}"
+    );
+    assert_eq!(
+        params.get("workspace").and_then(Value::as_str),
+        Some(desk.display().to_string().as_str()),
+        "reviewer spawn params: {params}"
+    );
+}
+
+#[test]
+fn legacy_desk_spawn_has_no_workspace_key() {
+    // Legacy copy-desk mode (worktree_desks: false) must NEVER send the "workspace" confinement
+    // param — the desk there is a plain scratch dir, not a git worktree, and old behavior is
+    // preserved byte-for-byte.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker
+    let mut d = driver(store, host);
+
+    let p = project("auth", ProjectPhase::Running, vec![task("auth/t1", TaskState::Todo)]);
+    d.insert_for_test(p, 1_000);
+
+    d.on_tick(1_000); // dispatch -> legacy EnsureDesk + worker spawn
+
+    let params = last_call(&d.host, "sessions.spawn_into").expect("worker spawn recorded");
+    assert!(
+        params.get("workspace").is_none(),
+        "legacy spawn must not carry a workspace key: {params}"
+    );
+}

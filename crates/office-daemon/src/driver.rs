@@ -902,6 +902,27 @@ impl<H: Host> Driver<H> {
                 params["model"] = json!(m);
             }
         }
+        // koma workspace confinement (spawn-workspace feature, broker_spawn's optional
+        // `workspace` param): in worktree-desks mode, narrow the sub-agent's world to its
+        // task's desk. A WORKER's desk is the fresh worktree `setup_worktree` just added above;
+        // a REVIEWER dispatch reuses the SAME `task.desk` (still present — it isn't reclaimed
+        // until after the review passes and the branch merges), so it reviews the integrated
+        // tree confined to that same worktree. Sent unconditionally whenever `task.desk` is
+        // known in worktree mode — an OLDER koma silently ignores an unknown param, so there is
+        // no compatibility hazard. Legacy copy-desk mode NEVER sends this key: the desk there is
+        // a scratch dir, not a git worktree of the delivery repo, and old behavior is preserved
+        // byte-for-byte.
+        if self.projects[idx].project.worktree_desks {
+            if let Some(desk) = self.projects[idx]
+                .project
+                .tasks
+                .iter()
+                .find(|t| &t.id == task)
+                .and_then(|t| t.desk.clone())
+            {
+                params["workspace"] = json!(desk.display().to_string());
+            }
+        }
         let reply = self.host.call("sessions.spawn_into", params);
 
         if reply.get("status").and_then(Value::as_str) == Some("sent") {
