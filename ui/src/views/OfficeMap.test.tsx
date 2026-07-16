@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React, { act } from 'react';
 import { createRoot, Root } from 'react-dom/client';
-import OfficeMap from './OfficeMap';
+import OfficeMap, { __resetOfficeTickForTests } from './OfficeMap';
 
 /**
  * Component smoke test: the office view renders a desk per occupied persona and opens the task
@@ -14,6 +14,13 @@ describe('OfficeMap', () => {
 
   beforeEach(() => {
     (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+    // The office's animation tick now persists across mounts by design (feature: ambient-idle-life
+    // bug 2b — a real remount, e.g. a tab switch, should resume the clock, not restart it). Reset
+    // it here so each test still starts from a known tick=0, the same guarantee a fresh page load
+    // gives production; otherwise tick state would leak across `it()` blocks in this file and any
+    // "at mount" assertion (e.g. the meeting-room ceremony's first transcript line) would depend on
+    // run order.
+    __resetOfficeTickForTests();
     // jsdom ships no matchMedia; stub reduced-motion = false so the component's guard is exercised.
     if (typeof window.matchMedia !== 'function') {
       (window as any).matchMedia = () => ({
@@ -237,6 +244,45 @@ describe('OfficeMap', () => {
       );
       expect(idlePersonas).not.toContain('nova');
       expect(idlePersonas).not.toContain('mika');
+    });
+
+    // -----------------------------------------------------------------------
+    // Population cap (live-test scope amendment): the office only employs `maxWorkers` bodies
+    // total (desks + idle wanderers combined) — the roster is 10, but a small project must not
+    // spawn the whole unused roster as ambient sprites.
+    // -----------------------------------------------------------------------
+
+    it('max_workers=2, one working -> exactly one idle sprite renders', () => {
+      const capped: any = {
+        id: 'c',
+        name: 'C',
+        phase: { kind: 'running' },
+        config: { maxWorkers: 2 },
+        tasks: [{ id: 'c/a', title: 'A', state: 'onprogress', priority: 5, persona: 'nova' }],
+      };
+      act(() => {
+        root.render(React.createElement(OfficeMap, { project: capped, onTaskClick: () => {} }));
+      });
+      const idleSprites = container.querySelectorAll('[data-testid="idle-sprite"]');
+      expect(idleSprites.length).toBe(1);
+      expect(idleSprites[0].getAttribute('data-persona')).not.toBe('nova');
+    });
+
+    it('max_workers=2, both working -> zero idle sprites (no roster spillover)', () => {
+      const bothWorking: any = {
+        id: 'w2',
+        name: 'W2',
+        phase: { kind: 'running' },
+        config: { maxWorkers: 2 },
+        tasks: [
+          { id: 'w2/a', title: 'A', state: 'onprogress', priority: 5, persona: 'nova' },
+          { id: 'w2/b', title: 'B', state: 'onprogress', priority: 4, persona: 'mika' },
+        ],
+      };
+      act(() => {
+        root.render(React.createElement(OfficeMap, { project: bothWorking, onTaskClick: () => {} }));
+      });
+      expect(container.querySelectorAll('[data-testid="idle-sprite"]').length).toBe(0);
     });
   });
 });

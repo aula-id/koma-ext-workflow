@@ -11,6 +11,7 @@ import OfficeMap from './OfficeMap';
 import TraceLog from './TraceLog';
 import ConfirmButton from '../components/ConfirmButton';
 import { docCards, DocCard } from '../lib/docCards';
+import { designStageCards, DesignStage, DesignStageCard } from '../lib/designStages';
 import { isResearchLive } from '../lib/officeLayout';
 
 /** Project shape, full mode, per docs/PANEL_PROTOCOL.md 2.1 (frozen W7 contract). */
@@ -138,6 +139,13 @@ export interface Project {
    * renders its classic desk-grid scene unchanged). */
   sprints?: Sprint[];
   activeSprint?: ActiveSprint | null;
+  /** Design-stage placeholder cards (feature: design-stage-cards), full snapshot only,
+   * present ONLY while the project is pre-Ready (Drafting, or paused mid-Drafting via
+   * Interrupted) — see office-core digest.rs's `design_stages`. Absent once a real board
+   * exists (Ready+) or on an older snapshot that doesn't carry this field (back-compat:
+   * the board falls back to the client-derived `docCards` projection, same as before this
+   * feature existed). */
+  designStages?: DesignStage[];
 }
 
 const COLUMNS: { key: ColumnKey; label: string }[] = [
@@ -288,6 +296,79 @@ const DocCardView: React.FC<{ card: DocCard; onClick: () => void }> = ({ card, o
   );
 };
 
+const DESIGN_STAGE_DOT: Partial<Record<DesignStageCard['status'], string>> = {
+  inProgress: 'var(--wf-info)',
+  done: 'var(--wf-status-done)',
+};
+
+/**
+ * Design-stage placeholder card (feature: design-stage-cards): the pre-Ready SDLC
+ * pipeline's stage-by-stage progress (triage -> PRD/change-brief -> research -> TRD+CRD
+ * -> breakdown, or the patch track's single task), server-derived and rendered where the
+ * (still-empty) real task board would otherwise show nothing. Same flat, dashed-border,
+ * non-draggable recipe as `DocCardView` above — but tagged `design` (not `doc`) since the
+ * two are mutually exclusive (designStages supersedes docCards whenever present) and
+ * never clickable, since there's no single tab a stage card jumps to.
+ */
+const DesignStageCardView: React.FC<{ card: DesignStageCard }> = ({ card }) => {
+  const dotColor = DESIGN_STAGE_DOT[card.status];
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -6 }}
+      transition={{ duration: 0.18 }}
+      style={{
+        background: 'var(--wf-panel)',
+        borderRadius: 'var(--wf-radius)',
+        border: '1px dashed var(--wf-border)',
+        padding: '0.5rem 0.6rem',
+      }}
+      data-testid="design-stage-card"
+      data-stage-id={card.key}
+    >
+      <div style={{ fontSize: '0.82rem', color: 'var(--wf-fg)', lineHeight: 1.35 }}>
+        <span
+          style={{
+            fontSize: '0.6rem',
+            fontWeight: 600,
+            letterSpacing: '0.06em',
+            textTransform: 'uppercase',
+            color: 'var(--wf-dim)',
+            marginRight: '0.45rem',
+          }}
+        >
+          design
+        </span>
+        {card.title}
+      </div>
+
+      {card.note && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.35rem',
+            marginTop: '0.35rem',
+            fontSize: '0.68rem',
+            color: dotColor ?? 'var(--wf-dim)',
+          }}
+        >
+          {dotColor && (
+            <motion.span
+              animate={card.status === 'inProgress' ? { opacity: [0.35, 1, 0.35] } : undefined}
+              transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
+              style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor, display: 'inline-block' }}
+            />
+          )}
+          {card.note}
+        </div>
+      )}
+    </motion.div>
+  );
+};
+
 export interface BoardProps {
   projectId: string;
   onBack?: () => void;
@@ -375,6 +456,10 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
 
   // Drafting-pipeline docs (PRD/research/TRD/CRD/audit) projected as synthetic cards,
   // rendered above the task cards in whichever column their live state maps to.
+  // `designStages` (feature: design-stage-cards) is a server-derived SUPERSET of this
+  // client-side projection — it also covers triage/breakdown and branches correctly by
+  // track (patch/enhancement) — so it takes over whenever present; `docCards` only backs
+  // an older snapshot that doesn't carry `designStages` yet (back-compat).
   const docCardsByColumn = useMemo(() => {
     const grouped: Record<ColumnKey, DocCard[]> = {
       backlog: [],
@@ -383,7 +468,25 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
       review: [],
       done: [],
     };
+    if (project?.designStages) return grouped;
     for (const c of docCards(project)) {
+      grouped[c.column].push(c);
+    }
+    return grouped;
+  }, [project]);
+
+  // Design-stage placeholder cards (feature: design-stage-cards): the pre-Ready SDLC
+  // pipeline's stage-by-stage progress, rendered in place of the (still-empty) task
+  // board. Absent entirely once the project has a real board (Ready+).
+  const designStageCardsByColumn = useMemo(() => {
+    const grouped: Record<ColumnKey, DesignStageCard[]> = {
+      backlog: [],
+      todo: [],
+      onprogress: [],
+      review: [],
+      done: [],
+    };
+    for (const c of designStageCards(project?.designStages)) {
       grouped[c.column].push(c);
     }
     return grouped;
@@ -681,6 +784,11 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
                   <span>{tasksByColumn[col.key].length}</span>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <AnimatePresence initial={false}>
+                    {designStageCardsByColumn[col.key].map((card) => (
+                      <DesignStageCardView key={card.key} card={card} />
+                    ))}
+                  </AnimatePresence>
                   <AnimatePresence initial={false}>
                     {docCardsByColumn[col.key].map((card) => (
                       <DocCardView key={card.key} card={card} onClick={() => setTab('prd')} />

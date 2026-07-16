@@ -391,7 +391,76 @@ export function idlePersonasFor(presence: PersonaPresence[], excluded: readonly 
   return presence.filter((p) => p.status === 'idle' && !excludeSet.has(p.persona)).map((p) => p.persona);
 }
 
+/** Personas this project has ever assigned a task to, in any state (done/onprogress/parked/...),
+ * PERSONA_ORDER-stable and deduped. This is the project's "track record" — as opposed to the full
+ * 10-person roster, most of whom may never have touched this project — used by
+ * `idleWanderPoolFor` to decide which idle personas get to wander before falling back to roster
+ * padding. */
+export function historicalPersonasFor(project: OfficeProject | null | undefined): string[] {
+  const tasks = project?.tasks ?? [];
+  const seen = new Set<string>();
+  for (const t of tasks) {
+    const name = stripPersona(t.persona);
+    if (name) seen.add(name);
+  }
+  return PERSONA_ORDER.filter((p) => seen.has(p));
+}
+
+/**
+ * The idle-life "wander pool" (feature: ambient-idle-life, population cap): which personas may
+ * show up as ambient idle sprites. The project only *employs* `maxWorkers` bodies total — desks
+ * and idle wanderers combined — so if `maxWorkers` are already occupying desks (working/
+ * review-debate/parked), nobody is left to wander (an all-hands-busy project shows zero idle
+ * sprites, not the whole unused roster milling around). Otherwise the remaining headroom
+ * (`maxWorkers - occupiedCount`) is filled first by personas with a track record on this project
+ * (`historicalPersonasFor`), then padded deterministically from the full roster (`PERSONA_ORDER`)
+ * so a fresh/empty project still shows some ambient life — never by a `Math.random` roster pick,
+ * so the cast is stable across ticks (it only changes when the snapshot itself changes).
+ * `excluded` additionally drops sprint-review meeting attendees (same contract as
+ * `idlePersonasFor`) — excluded *before* padding, so an excluded historical persona doesn't eat a
+ * wander slot that a padding-roster persona could otherwise fill.
+ */
+export function idleWanderPoolFor(
+  project: OfficeProject | null | undefined,
+  presence: PersonaPresence[],
+  excluded: readonly string[] = [],
+): string[] {
+  const maxWorkers = clampMaxWorkers(project?.config?.maxWorkers);
+  const cap = Math.min(maxWorkers, PERSONA_ORDER.length);
+  const occupiedSet = new Set(presence.filter((p) => p.status !== 'idle').map((p) => p.persona));
+  const remainder = Math.max(0, cap - occupiedSet.size);
+  if (remainder === 0) return [];
+
+  const excludeSet = new Set(excluded);
+  const eligible = (p: string) => !occupiedSet.has(p) && !excludeSet.has(p);
+
+  const pool = historicalPersonasFor(project).filter(eligible);
+  for (const p of PERSONA_ORDER) {
+    if (pool.length >= remainder) break;
+    if (eligible(p) && !pool.includes(p)) pool.push(p);
+  }
+  return pool.slice(0, remainder);
+}
+
 export type IdleActivity = 'wander' | 'gossip' | 'cooler';
+
+/** A 2D point normalized 0..1 within the ambient-idle-life wander box — the caller (OfficeMap)
+ * maps these fractions onto its own pixel geometry, same convention the old 1D `waypointA`/
+ * `waypointB` scalars used for the x-axis only. */
+export interface Point01 {
+  x: number;
+  y: number;
+}
+
+/** A forbidden zone, normalized to the same 0..1 wander-box space as `Point01` (already
+ * margin-expanded by the caller) — desks, the meeting table, the gossip table, the water cooler.
+ * A sampled waypoint never lands inside one of these. */
+export interface ForbiddenRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
 
 export interface IdleAssignment {
   persona: string;
@@ -399,19 +468,31 @@ export interface IdleAssignment {
   /** Gossip only: the paired persona (deterministically paired within the same decision
    * window). */
   partner?: string;
-  /** 0..1 progress through the current decision window (an interpolant for wander position). */
+  /** 0..1 progress through the current MOVE segment (post-dwell remap for `wander`; the raw
+   * decision-window progress for `gossip`/`cooler`) — an interpolant for wander position. Holds
+   * at `0` for the whole dwell sub-phase (see `dwelling`), so position resolves to `waypointA`
+   * while paused. */
   t: number;
-  /** Wander only: normalized 0..1 waypoint fractions along the ambient lane to interpolate
-   * between (start -> end) as `t` advances this window. */
-  waypointA?: number;
-  waypointB?: number;
+  /** Wander only: the 2D waypoints (both axes) to interpolate between (start -> end) as `t`
+   * advances past the dwell sub-phase. */
+  waypointA?: Point01;
+  waypointB?: Point01;
+  /** Wander only: true while the sprite is paused at `waypointA` before departing for
+   * `waypointB` (the "harvest-moon" dwell beat) — an idle/facing pose rather than mid-stride. */
+  dwelling?: boolean;
+  /** Wander only: mirror the sprite horizontally. Direction-of-travel based (facing the way it's
+   * headed); while dwelling it occasionally flips away from that as a small idle fidget, so a
+   * paused sprite doesn't read as frozen mid-stride. */
+  flip?: boolean;
   /** An occasional, hardcoded flavor line for a gossip/cooler bubble (no model calls) — index and
    * presence chosen deterministically per decision window, `undefined` most windows so the
    * bubble doesn't spam every tick. */
   bubble?: string;
 }
 
-/** ~8s per idle decision window at the office's 200ms tick (`useTick(200, ...)`). */
+/** ~8s per idle decision window at the office's 200ms tick (`useTick(200, ...)`), before each
+ * persona's own walk-speed multiplier scales it (see `personalWindowTicks`). Gossip pairing still
+ * rides this shared, unscaled window — see `idleAssignmentsFor`. */
 const IDLE_WINDOW_TICKS = 40;
 
 const GOSSIP_LINES = ['...', 'no way, really?', 'true story', 'huh, neat', 'five more minutes'];
@@ -441,18 +522,88 @@ function hashSeed(key: string): number {
   return (h >>> 0) / 0xffffffff;
 }
 
+/** Persona-stable phase offset in ticks (feature: ambient-idle-life bug 2a): without this, every
+ * persona's decision window boundary lines up with every other persona's (and with a fresh
+ * remount's `tick=0`), so a re-render/tab-switch reads as the whole cast snapping back to the
+ * start of their loop in lockstep. Derived from the SAME persona-name hash as everything else in
+ * this file — NOT `PERSONA_ORDER.indexOf(persona)` (an index-based offset still desyncs the
+ * moment the roster/order changes, and reads as an arbitrary counter rather than something the
+ * persona "owns"). Exported so tests can assert the offsets are actually spread out, since the
+ * visible fix (idle sprites not clustering on remount) isn't itself easy to unit-test — the
+ * distribution of this function is. */
+export function personaPhaseOffset(persona: string): number {
+  return Math.floor(hashSeed(`phase|${persona}`) * IDLE_WINDOW_TICKS);
+}
+
+/** Persona-stable walk-speed multiplier, ~0.75x-1.25x (feature: ambient-idle-life, harvest-moon
+ * feel): a small deterministic per-persona spread so idle sprites don't all glide at the exact
+ * same metronome cadence. */
+function personaSpeedMul(persona: string): number {
+  return 0.75 + hashSeed(`speed|${persona}`) * 0.5;
+}
+
+/** This persona's own decision-window length in ticks, `IDLE_WINDOW_TICKS` scaled by their walk
+ * speed. Wander/cooler timing (but NOT gossip pairing — see `idleAssignmentsFor`) rides this
+ * persona-scaled clock instead of the shared one. */
+function personalWindowTicks(persona: string): number {
+  return Math.max(8, Math.round(IDLE_WINDOW_TICKS * personaSpeedMul(persona)));
+}
+
+/** Deterministic last-resort waypoints for `sampleWaypoint`, tried in order when every hashed
+ * candidate lands inside a forbidden zone — spread across the corners/edges/center of the wander
+ * box so at least one is very likely clear even with several fixtures carved out. */
+const WAYPOINT_FALLBACKS: readonly Point01[] = [
+  { x: 0.02, y: 0.02 }, { x: 0.98, y: 0.02 }, { x: 0.02, y: 0.98 }, { x: 0.98, y: 0.98 },
+  { x: 0.5, y: 0.02 }, { x: 0.5, y: 0.98 }, { x: 0.02, y: 0.5 }, { x: 0.98, y: 0.5 },
+  { x: 0.5, y: 0.5 },
+];
+
+function insideForbidden(x: number, y: number, forbidden: readonly ForbiddenRect[]): boolean {
+  return forbidden.some((r) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1);
+}
+
+const WAYPOINT_SAMPLE_ATTEMPTS = 8;
+
+/** A 2D waypoint seeded from `key` (feature: ambient-idle-life bug 1), rejection-sampled against
+ * `forbidden` (desks/meeting table/gossip table/water cooler, each already margin-expanded by the
+ * caller) so a wander waypoint never lands on top of a fixture. The retries are themselves
+ * seeded off the attempt number (not random), so this stays a pure/deterministic function of
+ * `(key, forbidden)` — same inputs, same point, every time. */
+function sampleWaypoint(key: string, forbidden: readonly ForbiddenRect[]): Point01 {
+  for (let attempt = 0; attempt < WAYPOINT_SAMPLE_ATTEMPTS; attempt++) {
+    const salted = attempt === 0 ? key : `${key}|retry${attempt}`;
+    const x = hashSeed(`${salted}|x`);
+    const y = hashSeed(`${salted}|y`);
+    if (!insideForbidden(x, y, forbidden)) return { x, y };
+  }
+  const fallback = WAYPOINT_FALLBACKS.find((p) => !insideForbidden(p.x, p.y, forbidden));
+  return fallback ?? WAYPOINT_FALLBACKS[0];
+}
+
+const DWELL_FRAC_MIN = 0.15;
+const DWELL_FRAC_MAX = 0.5;
+
 /**
  * Ambient idle-life assignment for the tick (feature: ambient-idle-life): each idle persona (no
  * active desk, no meeting-table seat) gets a deterministic activity for the current decision
- * window — wander the floor between two seeded waypoints, gossip-pair at the empty commons table
- * with another idle persona, or visit the water cooler. Pure function of
- * `(idlePersonas, tick)` — no `Math.random` — so it is reproducible and test-friendly.
- * `windowIndex` (derived from `tick`) reshuffles activities/pairs/lines every
- * `IDLE_WINDOW_TICKS`; positions/bubbles hold steady within a window so they don't flicker.
+ * window — wander the floor between two seeded 2D waypoints (dwelling at the first for a beat
+ * before departing), gossip-pair at the empty commons table with another idle persona, or visit
+ * the water cooler. Pure function of `(idlePersonas, tick, forbidden)` — no `Math.random` — so it
+ * is reproducible and test-friendly.
+ *
+ * Gossip pairing rides a SHARED window clock (`windowIndex`, straight off `tick`) because both
+ * partners must agree on the same window to decide "are we pairing up" — but wander/cooler timing
+ * for everyone else rides their OWN phase-offset + speed-scaled clock (`personaPhaseOffset`,
+ * `personalWindowTicks`), so different personas drift into and out of activities at different
+ * moments instead of the whole room reshuffling in lockstep every `IDLE_WINDOW_TICKS`.
  */
-export function idleAssignmentsFor(idlePersonas: readonly string[], tick: number): IdleAssignment[] {
+export function idleAssignmentsFor(
+  idlePersonas: readonly string[],
+  tick: number,
+  forbidden: readonly ForbiddenRect[] = [],
+): IdleAssignment[] {
   const windowIndex = Math.floor(tick / IDLE_WINDOW_TICKS);
-  const t = (tick % IDLE_WINDOW_TICKS) / IDLE_WINDOW_TICKS;
+  const sharedT = (tick % IDLE_WINDOW_TICKS) / IDLE_WINDOW_TICKS;
   const sorted = [...idlePersonas].sort();
   const paired = new Map<string, IdleAssignment>();
 
@@ -466,26 +617,51 @@ export function idleAssignmentsFor(idlePersonas: readonly string[], tick: number
       hashSeed(`gossip-show|${a}|${b}|${windowIndex}`) < 0.4
         ? GOSSIP_LINES[Math.floor(hashSeed(`gossip-line|${a}|${b}|${windowIndex}`) * GOSSIP_LINES.length)]
         : undefined;
-    paired.set(a, { persona: a, activity: 'gossip', partner: b, t, bubble });
-    paired.set(b, { persona: b, activity: 'gossip', partner: a, t, bubble });
+    paired.set(a, { persona: a, activity: 'gossip', partner: b, t: sharedT, bubble });
+    paired.set(b, { persona: b, activity: 'gossip', partner: a, t: sharedT, bubble });
   }
 
   return idlePersonas.map((persona) => {
     const pair = paired.get(persona);
     if (pair) return pair;
-    if (hashSeed(`kind|${persona}|${windowIndex}`) < 0.3) {
+
+    // Past this point: this persona's OWN phase-offset + speed-scaled clock (harvest-moon
+    // variety — see the doc comment above).
+    const winTicks = personalWindowTicks(persona);
+    const clock = tick + personaPhaseOffset(persona);
+    const personalWindow = Math.floor(clock / winTicks);
+    const rawT = (clock % winTicks) / winTicks;
+
+    if (hashSeed(`kind|${persona}|${personalWindow}`) < 0.3) {
       const bubble =
-        hashSeed(`cooler-show|${persona}|${windowIndex}`) < 0.4
-          ? COOLER_LINES[Math.floor(hashSeed(`cooler-line|${persona}|${windowIndex}`) * COOLER_LINES.length)]
+        hashSeed(`cooler-show|${persona}|${personalWindow}`) < 0.4
+          ? COOLER_LINES[Math.floor(hashSeed(`cooler-line|${persona}|${personalWindow}`) * COOLER_LINES.length)]
           : undefined;
-      return { persona, activity: 'cooler', t, bubble };
+      return { persona, activity: 'cooler', t: rawT, bubble };
     }
+
+    // Wander: dwell at waypointA for the window's opening fraction (a persona/window-varied
+    // pause, not a fixed beat), then walk to waypointB for the remainder.
+    const waypointA = sampleWaypoint(`wp-a|${persona}|${personalWindow}`, forbidden);
+    const waypointB = sampleWaypoint(`wp-b|${persona}|${personalWindow}`, forbidden);
+    const dwellFrac =
+      DWELL_FRAC_MIN + hashSeed(`dwell|${persona}|${personalWindow}`) * (DWELL_FRAC_MAX - DWELL_FRAC_MIN);
+    const dwelling = rawT < dwellFrac;
+    const moveT = dwelling ? 0 : (rawT - dwellFrac) / (1 - dwellFrac);
+    const movingLeft = waypointB.x < waypointA.x;
+    // Idle fidget: while dwelling, occasionally flip away from the upcoming travel-facing (a
+    // slow toggle, not per-tick jitter) so a paused sprite doesn't look frozen mid-stride.
+    const fidgeting = dwelling && Math.floor(clock / 6) % 3 === 1;
+    const flip = fidgeting ? !movingLeft : movingLeft;
+
     return {
       persona,
       activity: 'wander',
-      t,
-      waypointA: hashSeed(`wp-a|${persona}|${windowIndex}`),
-      waypointB: hashSeed(`wp-b|${persona}|${windowIndex}`),
+      t: moveT,
+      waypointA,
+      waypointB,
+      dwelling,
+      flip,
     };
   });
 }

@@ -85,6 +85,7 @@ mod tests {
                 kind: AgentKind::Researcher,
                 persona: String::new(),
             }),
+            research_skip_reason: None,
             crd_markdown: "# CRD\n- README present (10 pts)\n- builds clean (20 pts)".to_string(),
             audit: Some(AgentBinding {
                 ext_agent_id: 91,

@@ -856,6 +856,7 @@ fn try_capture_track_doc(p: &mut Project, reply: &str, now_ms: u64, ctx: &mut Ct
             p.prd_markdown = cb;
             p.capture_nudge_count = 0;
             p.gate_cleared = false;
+            p.research_skip_reason = None; // fresh doc-set: last cycle's skip reason no longer applies
             trace(p, now_ms, "capture", format!("change-brief captured ({} bytes)", p.prd_markdown.len()), ctx);
             queue_notice(
                 p,
@@ -882,6 +883,7 @@ fn try_capture_track_doc(p: &mut Project, reply: &str, now_ms: u64, ctx: &mut Ct
             p.prd_markdown = prd;
             p.capture_nudge_count = 0; // a successful capture resets the nudge cap
             p.gate_cleared = false; // fresh doc-set: the PRD gate has not cleared yet
+            p.research_skip_reason = None; // fresh doc-set: last cycle's skip reason no longer applies
             trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
             queue_notice(
                 p,
@@ -1093,6 +1095,8 @@ fn start_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         // binding's PRESENCE, not a persona label, so no per-task persona applies.
         persona: String::new(),
     });
+    // A fresh research run supersedes any prior skip/degrade reason (design-stage-cards).
+    p.research_skip_reason = None;
     trace(p, now_ms, "research", "spawned — analyzing the stack", ctx);
 }
 
@@ -1131,6 +1135,9 @@ fn on_research_result(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx)
 fn research_degrade(p: &mut Project, reason: String, now_ms: u64, ctx: &mut Ctx) {
     let research_spawned_at_ms = p.research.as_ref().map(|b| b.spawned_at_ms);
     p.research = None;
+    // Durable skip reason for the design-stage digest (design-stage-cards): distinguishes a
+    // degrade from the config/well-known/user skip paths without parsing the trace ring.
+    p.research_skip_reason = Some("degraded".to_string());
     trace(p, now_ms, "research", format!("degraded: {}", trace_preview(&reason, 80)), ctx);
     queue_notice(
         p,
@@ -1164,7 +1171,11 @@ fn resume_should_respawn_research(p: &Project) -> bool {
 /// DEFER the decision to the PRD gate's enumerate result, which asks the well-known boolean.
 fn start_research_at_capture(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     match p.config.research_mode.as_str() {
-        "never" => trace(p, now_ms, "research", "research skipped (config)", ctx),
+        "never" => {
+            // Durable skip reason for the design-stage digest (design-stage-cards).
+            p.research_skip_reason = Some("config".to_string());
+            trace(p, now_ms, "research", "research skipped (config)", ctx);
+        }
         "always" => start_research(p, now_ms, ctx),
         _ => {} // "auto": decided from the PRD gate's well-known answer
     }
@@ -1179,7 +1190,11 @@ fn research_decide_from_check(p: &mut Project, text: &str, now_ms: u64, ctx: &mu
         return;
     }
     match office::parse_well_known(text) {
-        Some(true) => trace(p, now_ms, "research", "research skipped — stack well-known", ctx),
+        Some(true) => {
+            // Durable skip reason for the design-stage digest (design-stage-cards).
+            p.research_skip_reason = Some("well-known".to_string());
+            trace(p, now_ms, "research", "research skipped — stack well-known", ctx);
+        }
         _ => start_research(p, now_ms, ctx),
     }
 }
@@ -1485,6 +1500,8 @@ fn skip_research(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         if b.ext_agent_id != PROVISIONAL {
             ctx.fx.push(Effect::Kill { ext_agent_id: b.ext_agent_id });
         }
+        // Durable skip reason for the design-stage digest (design-stage-cards).
+        p.research_skip_reason = Some("user".to_string());
         trace(p, now_ms, "research", "research skipped by user", ctx);
         queue_notice(
             p,

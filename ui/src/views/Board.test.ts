@@ -227,3 +227,117 @@ describe('Board — SDLC track badge', () => {
     expect(container.querySelector('[data-testid="project-track-badge"]')).toBeFalsy();
   });
 });
+
+/**
+ * Design-stage placeholder cards (feature: design-stage-cards): while a project carries
+ * `designStages` on its snapshot (pre-Ready — Drafting or paused mid-Drafting), the board
+ * renders them in the matching column instead of leaving it empty. Once `designStages` is
+ * absent (Ready+, or an older snapshot), the classic board (real task cards, or the
+ * client-derived `docCards` fallback) renders unchanged.
+ */
+describe('Board — design-stage cards', () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  function seedProject(overrides: Record<string, unknown> = {}) {
+    act(() => {
+      useStore.getState().updateSnapshot({
+        kind: 'snapshot',
+        seq: 1,
+        projects: [
+          {
+            id: 'p1',
+            name: 'Auth Service',
+            phase: { kind: 'drafting' },
+            tasks: [],
+            ...overrides,
+          },
+        ],
+      });
+    });
+  }
+
+  function renderBoard() {
+    act(() => {
+      root.render(React.createElement(Board, { projectId: 'p1', initialTab: 'board' }));
+    });
+  }
+
+  beforeEach(() => {
+    (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+    useStore.setState({ snapshot: null, projects: [] });
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it('renders one card per stage, in the column matching its status, with the note as subtitle', () => {
+    seedProject({
+      designStages: [
+        { id: 'triage', label: 'Triage', status: 'done', note: 'project' },
+        { id: 'prd', label: 'PRD', status: 'done', note: 'verified — clean' },
+        { id: 'research', label: 'Research', status: 'done', note: 'skipped — stack well-known' },
+        { id: 'trdcrd', label: 'TRD+CRD', status: 'inProgress' },
+        { id: 'breakdown', label: 'Breakdown', status: 'todo' },
+      ],
+    });
+    renderBoard();
+
+    const cards = container.querySelectorAll('[data-testid="design-stage-card"]');
+    expect(cards.length).toBe(5);
+
+    const research = container.querySelector('[data-stage-id="research"]');
+    expect(research?.textContent).toContain('Research');
+    expect(research?.textContent).toContain('skipped — stack well-known');
+
+    const trdcrd = container.querySelector('[data-stage-id="trdcrd"]');
+    expect(trdcrd?.textContent).toContain('TRD+CRD');
+
+    const breakdown = container.querySelector('[data-stage-id="breakdown"]');
+    expect(breakdown?.textContent).toContain('Breakdown');
+  });
+
+  it('does not render the client-derived docCards while designStages is present', () => {
+    seedProject({
+      prdMarkdown: '# PRD',
+      designStages: [{ id: 'triage', label: 'Triage', status: 'inProgress' }],
+    });
+    renderBoard();
+    expect(container.querySelector('[data-testid="doc-card"]')).toBeFalsy();
+    expect(container.querySelector('[data-testid="design-stage-card"]')).toBeTruthy();
+  });
+
+  it('renders the classic board (docCards, no design-stage cards) once designStages is absent', () => {
+    seedProject({ prdMarkdown: '# PRD' });
+    renderBoard();
+    expect(container.querySelector('[data-testid="design-stage-card"]')).toBeFalsy();
+    expect(container.querySelector('[data-testid="doc-card"]')).toBeTruthy();
+  });
+
+  it('renders real task cards unchanged once designStages is absent (Ready+)', () => {
+    seedProject({
+      phase: { kind: 'ready' },
+      tasks: [
+        {
+          id: 't1',
+          title: 'Do the thing',
+          column: 'todo',
+          state: 'todo',
+          priority: 0,
+          blockedBy: [],
+          bounces: 0,
+        },
+      ],
+    });
+    renderBoard();
+    expect(container.querySelector('[data-testid="design-stage-card"]')).toBeFalsy();
+    expect(container.querySelector('[data-task-id="t1"]')).toBeTruthy();
+  });
+});

@@ -5,8 +5,10 @@ import {
   clampMaxWorkers,
   deskCountFor,
   formatElapsed,
+  historicalPersonasFor,
   idleAssignmentsFor,
   idlePersonasFor,
+  idleWanderPoolFor,
   isAuditLive,
   isDraftingFamilyActivity,
   isResearchLive,
@@ -14,6 +16,7 @@ import {
   isWaitingOnUserActivity,
   meetingSeatsFor,
   occupiedCount,
+  personaPhaseOffset,
   presenceFor,
   reviewedSprint,
   sprintAttendees,
@@ -21,6 +24,7 @@ import {
   stationsFor,
   stripPersona,
   tierFor,
+  type ForbiddenRect,
   type OfficeProject,
   type OfficeSprint,
 } from './officeLayout';
@@ -405,5 +409,170 @@ describe('idleAssignmentsFor', () => {
     for (const a of assignments) {
       expect(idle).toContain(a.persona);
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Bug 1 (live-test feedback): idle sprites only ever moved along a horizontal line — the
+  // wander waypoints varied x but never y. Fix: waypoints are 2D (`Point01 { x, y }`), sampled
+  // and interpolated on both axes.
+  // -------------------------------------------------------------------------
+
+  it('wander waypoints vary in BOTH axes across a persona’s loop (adaptation: waypointA/B are now Point01, not a bare 0..1 number)', () => {
+    const xs = new Set<number>();
+    const ys = new Set<number>();
+    // Sweep enough windows (persona-scaled window length varies, but 4000 ticks is comfortably
+    // many multiples of it) to gather several independent wander samples for one persona.
+    for (let tick = 0; tick < 4000; tick += 97) {
+      const [a] = idleAssignmentsFor(['nova'], tick);
+      if (a.activity !== 'wander') continue;
+      xs.add(a.waypointA!.x);
+      ys.add(a.waypointA!.y);
+    }
+    expect(xs.size).toBeGreaterThan(1);
+    expect(ys.size).toBeGreaterThan(1);
+  });
+
+  it('two personas at the same tick occupy different (x, y) positions', () => {
+    // Sweep ticks until we find one where both are wandering (not gossip-paired with each
+    // other) — deterministic hash, so this always finds one.
+    for (let tick = 0; tick < 2000; tick += 53) {
+      const [nova, mika] = idleAssignmentsFor(['nova', 'mika'], tick);
+      if (nova.activity !== 'wander' || mika.activity !== 'wander') continue;
+      expect(nova.waypointA).not.toEqual(mika.waypointA);
+      return;
+    }
+    throw new Error('expected at least one tick where both personas are independently wandering');
+  });
+
+  it('waypoints never fall inside a forbidden zone (desks/table/cooler + margin, already expanded by the caller)', () => {
+    const forbidden: ForbiddenRect[] = [
+      { x0: 0.3, y0: 0.3, x1: 0.7, y1: 0.7 }, // a big center block, like a desk cluster
+      { x0: 0, y0: 0, x1: 0.1, y1: 1 }, // a full-height strip, like the water cooler + margin
+    ];
+    const inForbidden = (p: { x: number; y: number }) =>
+      forbidden.some((r) => p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1);
+
+    const idlePersonas = ['nova', 'mika', 'tetsuo', 'bob', 'yuki'];
+    for (let tick = 0; tick < 3000; tick += 61) {
+      for (const a of idleAssignmentsFor(idlePersonas, tick, forbidden)) {
+        if (a.activity !== 'wander') continue;
+        expect(inForbidden(a.waypointA!)).toBe(false);
+        expect(inForbidden(a.waypointB!)).toBe(false);
+      }
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Bug 2a (live-test feedback): every refresh restarted all idle sprites from a shared
+  // decision-window boundary (in sync with a remounted `tick=0`), reading as the whole cast
+  // snapping back to one point. Fix: a persona-stable phase offset (hashed off the persona name,
+  // not its PERSONA_ORDER index) staggers each persona's own clock.
+  // -------------------------------------------------------------------------
+
+  describe('personaPhaseOffset', () => {
+    it('is deterministic per persona', () => {
+      for (const p of PERSONA_ORDER) {
+        expect(personaPhaseOffset(p)).toBe(personaPhaseOffset(p));
+      }
+    });
+
+    it('is spread across personas, not a single shared value (the bug this replaces)', () => {
+      const offsets = new Set(PERSONA_ORDER.map((p) => personaPhaseOffset(p)));
+      expect(offsets.size).toBeGreaterThan(1);
+    });
+
+    it('at tick 0 (a fresh mount), not every persona reads as "just started" — proves a remount no longer clusters everyone at a shared origin', () => {
+      const atMount = idleAssignmentsFor([...PERSONA_ORDER], 0);
+      // A shared-origin bug would put every wandering persona at t=0/dwelling=true in lockstep.
+      // With phase offsets, at least one should already be past the very start of its own window.
+      const wandering = atMount.filter((a) => a.activity === 'wander');
+      const allAtOrigin = wandering.every((a) => a.dwelling === true);
+      expect(allAtOrigin).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Population cap (live-test scope amendment): the office only *employs* `maxWorkers` bodies
+// total (desks + idle wanderers combined) — idle sprites must not spawn the full 10-persona
+// roster regardless of project size.
+// ---------------------------------------------------------------------------
+
+describe('historicalPersonasFor', () => {
+  it('returns personas with any task assignment (any state), PERSONA_ORDER-stable, deduped', () => {
+    const p = proj([
+      { id: 't1', state: 'done', persona: 'mika' },
+      { id: 't2', state: 'todo', persona: 'nova' },
+      { id: 't3', state: 'onprogress', persona: 'nova' }, // dup persona, different task
+    ]);
+    expect(historicalPersonasFor(p)).toEqual(['nova', 'mika']);
+  });
+
+  it('is empty for a project with no tasks', () => {
+    expect(historicalPersonasFor(proj([]))).toEqual([]);
+  });
+});
+
+describe('idleWanderPoolFor', () => {
+  it('max_workers=2, both working -> zero idle wanderers', () => {
+    const p = proj(
+      [
+        { id: 'a', state: 'onprogress', persona: 'nova' },
+        { id: 'b', state: 'onprogress', persona: 'mika' },
+      ],
+      2,
+    );
+    const presence = presenceFor(p);
+    expect(idleWanderPoolFor(p, presence)).toEqual([]);
+  });
+
+  it('max_workers=2, nobody working -> exactly 2 idle wanderers (padded from the roster)', () => {
+    const p = proj([], 2);
+    const presence = presenceFor(p);
+    const pool = idleWanderPoolFor(p, presence);
+    expect(pool).toHaveLength(2);
+    // Deterministic — padded straight off PERSONA_ORDER when there's no track record at all.
+    expect(pool).toEqual(['nova', 'mika']);
+  });
+
+  it('max_workers=2, one working -> exactly 1 idle wanderer, never the working persona', () => {
+    const p = proj([{ id: 'a', state: 'onprogress', persona: 'nova' }], 2);
+    const presence = presenceFor(p);
+    const pool = idleWanderPoolFor(p, presence);
+    expect(pool).toHaveLength(1);
+    expect(pool).not.toContain('nova');
+  });
+
+  it('prefers personas with a track record on this project before padding from the roster', () => {
+    // koji has history (a done task) but isn't currently occupied — should fill a wander slot
+    // ahead of roster padding (mika, tetsuo, ...).
+    const p = proj([{ id: 'a', state: 'done', persona: 'koji' }], 3);
+    const presence = presenceFor(p);
+    const pool = idleWanderPoolFor(p, presence);
+    expect(pool).toHaveLength(3);
+    expect(pool).toContain('koji');
+  });
+
+  it('excludes given personas (sprint attendees) without shrinking the pool when roster padding can fill the gap', () => {
+    // nova + mika have history but are excluded (e.g. seated at the meeting table) — the pool
+    // still fills its 2 slots from the roster instead of coming up short.
+    const p = proj(
+      [
+        { id: 'a', state: 'done', persona: 'nova' },
+        { id: 'b', state: 'done', persona: 'mika' },
+      ],
+      2,
+    );
+    const presence = presenceFor(p);
+    const pool = idleWanderPoolFor(p, presence, ['nova', 'mika']);
+    expect(pool).toHaveLength(2);
+    expect(pool).not.toContain('nova');
+    expect(pool).not.toContain('mika');
+  });
+
+  it('never exceeds the full 10-persona roster even if maxWorkers were misconfigured higher', () => {
+    const p = proj([], 4); // clampMaxWorkers caps config at 4 anyway, but exercise the cap path
+    const presence = presenceFor(p);
+    expect(idleWanderPoolFor(p, presence).length).toBeLessThanOrEqual(PERSONA_ORDER.length);
   });
 });

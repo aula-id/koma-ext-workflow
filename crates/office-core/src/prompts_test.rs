@@ -13,6 +13,7 @@ mod tests {
             trd_markdown: String::new(),
             research_notes: String::new(),
             research: None,
+            research_skip_reason: None,
             crd_markdown: String::new(),
             audit: None,
             audit_rounds: 0,
