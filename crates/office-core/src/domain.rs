@@ -402,6 +402,18 @@ pub struct Project {
     /// the driver reports the real one). `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub research: Option<AgentBinding>,
+    /// Why research was skipped/degraded for the CURRENT drafting cycle (feature: design-stage-
+    /// cards): one of `"config"` (`research_mode == "never"`), `"well-known"` (auto-mode's
+    /// well-known-stack answer), `"user"` (`workflow_skip`), or `"degraded"` (spawn failure / dead
+    /// researcher / runtime ceiling) — mirrors the trace-log distinction the kernel already makes
+    /// (`start_research_at_capture` / `research_decide_from_check` / `skip_research` /
+    /// `research_degrade`) but as a durable field, so the design-stage digest (digest.rs) can render
+    /// an accurate note without parsing the capped trace ring. `None` while research has not been
+    /// skipped this cycle (running, completed, or not yet reached). Cleared back to `None` whenever
+    /// research (re)starts (`start_research`) or a fresh doc is captured, so a revised PRD/change-
+    /// brief gets a clean slate. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub research_skip_reason: Option<String>,
     /// The Clean-build Requirement Document (CRD): a concrete gradeable checklist for THIS
     /// project (expected file-tree shape, no unwired/trash files, build+lint pass, README, ...)
     /// plus a 100-point grading rubric, authored after the TRD in Drafting (ARCHITECTURE.md

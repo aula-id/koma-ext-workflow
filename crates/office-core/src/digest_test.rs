@@ -5,6 +5,7 @@ mod tests {
         CONTEXT_BLOB_CAP,
     };
     use crate::domain::*;
+    use serde_json::json;
     use std::collections::HashMap;
 
     fn task(id: &str, state: TaskState) -> Task {
@@ -43,6 +44,7 @@ mod tests {
             trd_markdown: String::new(),
             research_notes: String::new(),
             research: None,
+            research_skip_reason: None,
             crd_markdown: String::new(),
             audit: None,
             audit_rounds: 0,
@@ -361,5 +363,159 @@ mod tests {
         }];
         let blob = context_blob(&[p]);
         assert!(blob.contains("sprint 1/1: Foundation (1/2 tasks)"), "got: {blob}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Design-stage cards (feature: design-stage-cards)
+    // -----------------------------------------------------------------------
+
+    fn design_stages(snap: &serde_json::Value) -> &serde_json::Value {
+        &snap.as_array().unwrap()[0]["designStages"]
+    }
+
+    #[test]
+    fn design_stages_project_track_fresh_brief() {
+        // Checkpoint 1: the very first message — triage is still classifying, nothing else has
+        // started. Only the safe-fallback "project" shape is shown, all as todo placeholders.
+        let mut p = project("p1", 1, ProjectPhase::Drafting, vec![]);
+        p.prd_markdown = String::new();
+        p.triage_pending = true;
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let stages = design_stages(&snap).as_array().expect("designStages array");
+        assert_eq!(
+            stages,
+            &vec![
+                json!({ "id": "triage", "label": "Triage", "status": "inProgress" }),
+                json!({ "id": "prd", "label": "PRD", "status": "todo" }),
+                json!({ "id": "research", "label": "Research", "status": "todo" }),
+                json!({ "id": "trdcrd", "label": "TRD+CRD", "status": "todo" }),
+                json!({ "id": "breakdown", "label": "Breakdown", "status": "todo" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn design_stages_project_track_gate_cleared_research_skipped() {
+        // Checkpoint 2: triage resolved to "project", the PRD gate cleared, and research was
+        // skipped (auto-mode well-known-stack answer) — the TRD+CRD invoke is now in flight.
+        let mut p = project("p1", 1, ProjectPhase::Drafting, vec![]);
+        p.gate_cleared = true;
+        p.research_skip_reason = Some("well-known".to_string());
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let stages = design_stages(&snap).as_array().expect("designStages array");
+        assert_eq!(
+            stages,
+            &vec![
+                json!({ "id": "triage", "label": "Triage", "status": "done", "note": "project" }),
+                json!({ "id": "prd", "label": "PRD", "status": "done", "note": "verified — clean" }),
+                json!({
+                    "id": "research",
+                    "label": "Research",
+                    "status": "done",
+                    "note": "skipped — stack well-known"
+                }),
+                json!({ "id": "trdcrd", "label": "TRD+CRD", "status": "inProgress" }),
+                json!({ "id": "breakdown", "label": "Breakdown", "status": "todo" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn design_stages_project_track_trdcrd_authoring() {
+        // Checkpoint 3: research completed normally (not skipped) and the PRD gate cleared, so
+        // the TRD+CRD invoke has been fired and is authoring — the docs haven't landed yet.
+        let mut p = project("p1", 1, ProjectPhase::Drafting, vec![]);
+        p.gate_cleared = true;
+        p.research_notes = "- reqwest for HTTP".to_string();
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let stages = design_stages(&snap).as_array().expect("designStages array");
+        assert_eq!(
+            stages,
+            &vec![
+                json!({ "id": "triage", "label": "Triage", "status": "done", "note": "project" }),
+                json!({ "id": "prd", "label": "PRD", "status": "done", "note": "verified — clean" }),
+                json!({ "id": "research", "label": "Research", "status": "done", "note": "researched" }),
+                json!({ "id": "trdcrd", "label": "TRD+CRD", "status": "inProgress" }),
+                json!({ "id": "breakdown", "label": "Breakdown", "status": "todo" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn design_stages_absent_once_ready() {
+        // Checkpoint 4: the breakdown landed and the board is real — designStages disappears
+        // entirely, even though every field above is still populated from the drafting run.
+        let mut p = project("p1", 1, ProjectPhase::Ready, vec![task("t1", TaskState::Todo)]);
+        p.gate_cleared = true;
+        p.research_notes = "- reqwest for HTTP".to_string();
+        p.trd_markdown = "# TRD".to_string();
+        p.crd_markdown = "# CRD".to_string();
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        assert!(
+            snap.as_array().unwrap()[0].get("designStages").is_none(),
+            "designStages must be absent once the project has a real board"
+        );
+    }
+
+    #[test]
+    fn design_stages_patch_track_shape() {
+        // Patch track: only [triage, task]. A dispatched (OnProgress) task renders inProgress.
+        let binding = AgentBinding {
+            ext_agent_id: 7,
+            session: "s1".to_string(),
+            spawned_at_ms: 1,
+            kind: AgentKind::Worker,
+            persona: "office-worker-nova".to_string(),
+        };
+        let mut p = project(
+            "p1",
+            1,
+            ProjectPhase::Drafting,
+            vec![task("t1", TaskState::OnProgress { binding, attempt: 1 })],
+        );
+        p.track = "patch".to_string();
+        p.prd_markdown = String::new(); // patch never authors a doc
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let stages = design_stages(&snap).as_array().expect("designStages array");
+        assert_eq!(
+            stages,
+            &vec![
+                json!({ "id": "triage", "label": "Triage", "status": "done", "note": "patch" }),
+                json!({ "id": "task", "label": "Task", "status": "inProgress" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn design_stages_enhancement_track_shape() {
+        // Enhancement track: triage, change-brief (labeled "Change brief"), research (skipped by
+        // user here), breakdown pending the gate. TRD+CRD is skipped entirely — no "trdcrd" stage.
+        let mut p = project("p1", 1, ProjectPhase::Drafting, vec![]);
+        p.track = "enhancement".to_string();
+        p.gate_cleared = true;
+        p.research_skip_reason = Some("user".to_string());
+        p.crd_markdown = "# Minimal hygiene CRD".to_string(); // programmatically generated
+        p.pending_breakdown = Some("```breakdown\n...\n```".to_string());
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let stages = design_stages(&snap).as_array().expect("designStages array");
+        assert_eq!(
+            stages,
+            &vec![
+                json!({ "id": "triage", "label": "Triage", "status": "done", "note": "enhancement" }),
+                json!({ "id": "prd", "label": "Change brief", "status": "done", "note": "verified — clean" }),
+                json!({
+                    "id": "research",
+                    "label": "Research",
+                    "status": "done",
+                    "note": "skipped — by user"
+                }),
+                json!({
+                    "id": "breakdown",
+                    "label": "Breakdown",
+                    "status": "inProgress",
+                    "note": "planned — awaiting gate"
+                }),
+            ]
+        );
     }
 }

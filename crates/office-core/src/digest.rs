@@ -314,6 +314,225 @@ fn phase_value(phase: &ProjectPhase) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Design-stage cards (feature: design-stage-cards) — while a project is pre-Ready (Drafting, or
+// paused mid-Drafting via Interrupted), its kanban board has no real task cards yet (those only
+// exist once a breakdown lands, Drafting -> Ready). Rather than render an empty board while all
+// the SDLC action (triage -> PRD/change-brief -> research -> TRD+CRD -> breakdown) hides in the
+// trace tab, the panel snapshot carries a parallel `designStages` array: lightweight placeholder
+// cards the UI renders in the kanban columns by status, derived entirely from existing kernel
+// state (see `Project::research_skip_reason` for the one durable field this feature added, since
+// the "why was research skipped" fact is not otherwise recoverable without parsing the capped
+// trace ring).
+// ---------------------------------------------------------------------------
+
+/// One design-stage placeholder card. `status` is one of `"todo" | "inProgress" | "done"`.
+struct DesignStage {
+    id: &'static str,
+    label: &'static str,
+    status: &'static str,
+    note: Option<String>,
+}
+
+fn design_stage_value(s: DesignStage) -> Value {
+    let mut v = json!({ "id": s.id, "label": s.label, "status": s.status });
+    if let Some(note) = s.note {
+        v["note"] = json!(note);
+    }
+    v
+}
+
+fn todo_stage(id: &'static str, label: &'static str) -> DesignStage {
+    DesignStage { id, label, status: "todo", note: None }
+}
+
+/// Whether `p` is still pre-Ready for the design-stage board's purposes: actively Drafting, or
+/// paused mid-Drafting (`Interrupted` with `interrupted_from == Some(Drafting)` — feature:
+/// interrupt-from-drafting). Every other phase (`Ready`/`Running`/`Halted`/`Done`, or an
+/// `Interrupted` that came from one of those) means a real board exists.
+fn is_pre_ready_drafting(p: &Project) -> bool {
+    matches!(p.phase, ProjectPhase::Drafting)
+        || (matches!(p.phase, ProjectPhase::Interrupted)
+            && matches!(p.interrupted_from, Some(ProjectPhase::Drafting)))
+}
+
+/// The Triage stage: `inProgress` while the classifier invoke is in flight (`triage_pending`);
+/// `done` once the track is resolved, noting which track it landed on.
+fn triage_stage(p: &Project) -> DesignStage {
+    if p.triage_pending {
+        DesignStage { id: "triage", label: "Triage", status: "inProgress", note: None }
+    } else {
+        DesignStage { id: "triage", label: "Triage", status: "done", note: Some(p.track.clone()) }
+    }
+}
+
+/// Whether the newest captured doc-set is TRD+CRD rather than PRD/change-brief (mirrors the
+/// kernel's own `newest_gated_doc` in kernel.rs — the pipeline authors PRD then TRD+CRD strictly
+/// in order, so once either is non-empty the PRD-stage gate has necessarily already cleared).
+fn newest_doc_is_trdcrd(p: &Project) -> bool {
+    !p.trd_markdown.trim().is_empty() || !p.crd_markdown.trim().is_empty()
+}
+
+/// The PRD (or, on the enhancement track, "Change brief") stage: `inProgress` while the doc is
+/// still empty, or captured but its safeguard gate has not yet cleared; `done` once the gate has
+/// cleared (verified once TRD+CRD — or, for enhancement, the breakdown — has moved on, since the
+/// shared `gate_cleared` flag has by then been reset for the NEXT join). Returns whether the
+/// stage is done, so callers gating on "PRD/change-brief settled" (the TRD+CRD stage) don't have
+/// to re-derive it.
+fn prd_stage(p: &Project) -> (DesignStage, bool) {
+    let label = if p.track == "enhancement" { "Change brief" } else { "PRD" };
+    if p.prd_markdown.trim().is_empty() {
+        return (DesignStage { id: "prd", label, status: "inProgress", note: None }, false);
+    }
+    if newest_doc_is_trdcrd(p) || p.gate_cleared {
+        (
+            DesignStage { id: "prd", label, status: "done", note: Some("verified — clean".to_string()) },
+            true,
+        )
+    } else {
+        (DesignStage { id: "prd", label, status: "inProgress", note: None }, false)
+    }
+}
+
+/// Friendly note text for a settled `research_skip_reason` (see the field's doc comment in
+/// domain.rs for the kernel sites that set each value).
+fn research_skip_note(reason: &str) -> String {
+    match reason {
+        "config" => "skipped (config)".to_string(),
+        "well-known" => "skipped — stack well-known".to_string(),
+        "user" => "skipped — by user".to_string(),
+        "degraded" => "skipped — research degraded".to_string(),
+        other => format!("skipped ({other})"),
+    }
+}
+
+/// The Research stage: `todo` before the PRD/change-brief that triggers it is even captured;
+/// `inProgress` while the `office-researcher` binding is live; `done` once notes land, or once a
+/// skip/degrade is recorded (`research_skip_reason` — see domain.rs; a durable field rather than
+/// parsed trace, since the trace ring is capped and could evict the entry).
+fn research_stage(p: &Project) -> DesignStage {
+    if p.prd_markdown.trim().is_empty() {
+        return todo_stage("research", "Research");
+    }
+    if p.research.is_some() {
+        return DesignStage { id: "research", label: "Research", status: "inProgress", note: None };
+    }
+    if !p.research_notes.trim().is_empty() {
+        return DesignStage {
+            id: "research",
+            label: "Research",
+            status: "done",
+            note: Some("researched".to_string()),
+        };
+    }
+    if let Some(reason) = &p.research_skip_reason {
+        return DesignStage {
+            id: "research",
+            label: "Research",
+            status: "done",
+            note: Some(research_skip_note(reason)),
+        };
+    }
+    // Captured but the "always spawn now" vs "auto: defer to the gate's well-known answer" vs
+    // "never" decision hasn't landed yet (a same-tick window) — treat as in flight rather than
+    // flashing back to todo.
+    DesignStage { id: "research", label: "Research", status: "inProgress", note: None }
+}
+
+/// The TRD+CRD stage (project track only — enhancement skips the trio entirely, see
+/// `enhancement_track_stages`): `todo` until the PRD gate clears AND research settles (the exact
+/// join condition `maybe_author_trdcrd` fires on, kernel.rs); `inProgress` once that join is met
+/// but the invoke hasn't returned both docs; `done` once both are captured.
+fn trdcrd_stage(p: &Project, prd_done: bool) -> DesignStage {
+    let trd_done = !p.trd_markdown.trim().is_empty();
+    let crd_done = !p.crd_markdown.trim().is_empty();
+    if trd_done && crd_done {
+        DesignStage { id: "trdcrd", label: "TRD+CRD", status: "done", note: None }
+    } else if trd_done || crd_done || (prd_done && p.research.is_none()) {
+        DesignStage { id: "trdcrd", label: "TRD+CRD", status: "inProgress", note: None }
+    } else {
+        DesignStage { id: "trdcrd", label: "TRD+CRD", status: "todo", note: None }
+    }
+}
+
+/// The Breakdown stage (every track ends here): `done` once the board is built (`p.tasks` non-
+/// empty); `inProgress` while a validated breakdown is stashed awaiting its gate
+/// (`pending_breakdown`, design-speedup item 8); `todo` otherwise.
+fn breakdown_stage(p: &Project) -> DesignStage {
+    if !p.tasks.is_empty() {
+        DesignStage { id: "breakdown", label: "Breakdown", status: "done", note: None }
+    } else if p.pending_breakdown.is_some() {
+        DesignStage {
+            id: "breakdown",
+            label: "Breakdown",
+            status: "inProgress",
+            note: Some("planned — awaiting gate".to_string()),
+        }
+    } else {
+        todo_stage("breakdown", "Breakdown")
+    }
+}
+
+/// The single Task card for the patch track (feature: sdlc-triage — patch skips every document
+/// and goes straight to one task): `todo`/`done` mirror the task's own state; `inProgress` once
+/// it's occupying a worker's desk (dispatched — `OnProgress`/`Review`/`Parked`, the same
+/// "occupied" test `task_persona` uses).
+fn patch_task_stage(p: &Project) -> DesignStage {
+    match p.tasks.first() {
+        None => todo_stage("task", "Task"),
+        Some(t) => {
+            let status = match &t.state {
+                TaskState::Done { .. } => "done",
+                TaskState::OnProgress { .. } | TaskState::Review { .. } | TaskState::Parked { .. } => {
+                    "inProgress"
+                }
+                _ => "todo",
+            };
+            DesignStage { id: "task", label: "Task", status, note: None }
+        }
+    }
+}
+
+/// Build the `designStages` array for a pre-Ready project, or `None` once it has a real board
+/// (`Ready`+). Only [`triage`] is shown while the classifier invoke is still resolving the track
+/// (`triage_pending`) — the rest render as `todo` placeholders under the safe-fallback "project"
+/// shape, since which track actually applies is not known yet.
+fn design_stages(p: &Project) -> Option<Vec<Value>> {
+    if !is_pre_ready_drafting(p) {
+        return None;
+    }
+
+    let mut stages = vec![triage_stage(p)];
+
+    if p.triage_pending {
+        stages.push(todo_stage("prd", "PRD"));
+        stages.push(todo_stage("research", "Research"));
+        stages.push(todo_stage("trdcrd", "TRD+CRD"));
+        stages.push(todo_stage("breakdown", "Breakdown"));
+        return Some(stages.into_iter().map(design_stage_value).collect());
+    }
+
+    match p.track.as_str() {
+        "patch" => stages.push(patch_task_stage(p)),
+        "enhancement" => {
+            let (prd, _prd_done) = prd_stage(p);
+            stages.push(prd);
+            stages.push(research_stage(p));
+            stages.push(breakdown_stage(p));
+        }
+        _ => {
+            // "project" — the default and safe fallback track.
+            let (prd, prd_done) = prd_stage(p);
+            stages.push(prd);
+            stages.push(research_stage(p));
+            stages.push(trdcrd_stage(p, prd_done));
+            stages.push(breakdown_stage(p));
+        }
+    }
+
+    Some(stages.into_iter().map(design_stage_value).collect())
+}
+
 fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeActivity>) -> Value {
     let tasks: Vec<Value> = p.tasks.iter().map(|t| task_to_value(t, mode)).collect();
 
@@ -354,6 +573,12 @@ fn project_to_value(p: &Project, mode: SnapshotMode, activity: Option<&OfficeAct
         // Ungrounded assumptions the safeguard flagged in the last doc gate (6.2c): the docs tab
         // renders these as an amber pending-assumptions strip while the pipeline waits.
         obj["pendingAssumptions"] = json!(p.pending_assumptions);
+        // Design-stage placeholder cards (feature: design-stage-cards): while the project is
+        // pre-Ready (Drafting, or paused mid-Drafting), the panel renders these in the kanban
+        // columns instead of an empty board. Absent once a real board exists (Ready+).
+        if let Some(stages) = design_stages(p) {
+            obj["designStages"] = json!(stages);
+        }
         // Machine-diary trace ring (feature: tracelog): the panel's trace tab renders these as an
         // `HH:MM:SS kind summary` timeline. Full mode only, like the other bodies; summary mode
         // drops it under the 900KB size guard.
