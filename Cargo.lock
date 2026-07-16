@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "office-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "office-daemon"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "koma-extension",
  "office-core",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "office-store"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "office-core",
  "serde",
@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-mcp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "office-core",
  "office-store",
