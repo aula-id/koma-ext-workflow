@@ -1737,3 +1737,103 @@ fn sprint_tag_failure_is_traced_not_wedged() {
     let tags = String::from_utf8_lossy(&out.stdout);
     assert!(!tags.contains("sprint-1"), "the tag failed, so no sprint-1 ref was created");
 }
+
+#[test]
+fn authorize_adopts_existing_repo_without_seeding_gitignore() {
+    // item 3: an ADOPTED existing repo is respected untouched — the office seeds its starter
+    // .gitignore ONLY on a fresh `init_repo`, never over a user's repo.
+    let (store, _dir) = temp_store();
+    let mut d = driver(store, FakeHost::new());
+
+    let ws = tempfile::tempdir().unwrap();
+    let delivery = ws.path().join("product");
+    std::fs::create_dir_all(&delivery).unwrap();
+    // An EXISTING repo with a HEAD commit (worktree-capable) but NO .gitignore.
+    std::process::Command::new("git").arg("-C").arg(&delivery).arg("init").output().unwrap();
+    std::process::Command::new("git")
+        .arg("-C").arg(&delivery)
+        .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+        .output().unwrap();
+    std::fs::write(delivery.join("app.js"), "console.log(1)\n").unwrap();
+    crate::git::Git::new("git").commit_all(&delivery, "user's initial commit").unwrap();
+    assert!(!delivery.join(".gitignore").exists(), "precondition: user repo has no .gitignore");
+
+    let mut p = project("auth", ProjectPhase::Ready, vec![]); // no tasks: no dispatch noise
+    p.workspace = Some(ws.path().to_path_buf());
+    p.workflow_home = Some(ws.path().join("wfh"));
+    d.insert_for_test(p, 1_000);
+
+    d.authorize_project("auth", &delivery.display().to_string(), 2_000);
+
+    let proj = d.project("auth").unwrap();
+    assert!(proj.worktree_desks, "existing repo with a HEAD => adopted, worktree desks on");
+    assert!(!delivery.join(".gitignore").exists(), "adopted repo must NOT get a workflow .gitignore");
+}
+
+#[test]
+fn worktree_misroute_bounces_when_delivery_checkout_is_dirty() {
+    // item 4: a worker whose desk diff is EMPTY while the delivery MAIN checkout is DIRTY wrote its
+    // files outside its desk. The attempt bounces with the named reason INSTEAD of reaching Review;
+    // the dirty main checkout is left untouched (never auto-cleaned) and no reviewer is spawned.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker
+    host.script("agents.result", json!({ "agentId": 101, "output": "OFFICE-REPORT\nstatus: complete\n" }));
+    let mut d = driver(store, host);
+
+    let (mut p, ws) = worktree_setup("auth", vec![task("auth/t1", TaskState::Todo)]);
+    p.config.bounce_budget = 0; // park on the first bounce => no retry-spawn noise
+    let delivery = p.delivery_path.clone().unwrap();
+    d.insert_for_test(p, 1_000);
+    let desk = desk_of(&ws, "auth", "t1");
+
+    d.on_tick(1_000); // dispatch -> worktree add + worker spawn
+    assert!(desk.exists(), "worktree materialized");
+
+    // The "worker" writes into the DELIVERY main checkout (a relative path / workspace [0]) instead
+    // of its desk — the desk stays empty.
+    std::fs::write(delivery.join("stray.rs"), "// misrouted\n").unwrap();
+
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }), 2_000);
+
+    let proj = d.project("auth").unwrap();
+    assert_eq!(proj.tasks[0].bounces, 1, "the misroute counted a bounce");
+    assert!(
+        proj.tasks[0].last_review.as_deref().unwrap_or("").contains("worker wrote outside its desk"),
+        "the named misroute reason is the review note: {:?}",
+        proj.tasks[0].last_review
+    );
+    assert!(matches!(proj.tasks[0].state, TaskState::Parked { .. }), "budget 0 -> parked, not Review");
+    assert_eq!(call_count(&d.host, "sessions.spawn_into"), 1, "no reviewer spawned for a misroute");
+    // The office NEVER touches the delivery checkout: the stray file is still there, loud + visible.
+    assert!(delivery.join("stray.rs").exists(), "delivery checkout left untouched (not auto-cleaned)");
+}
+
+#[test]
+fn worktree_empty_desk_diff_with_clean_main_proceeds_to_review() {
+    // item 4: an EMPTY desk diff with a CLEAN delivery checkout is a legitimate no-op delivery —
+    // current behavior is preserved: the worker result proceeds to Review (the reviewer then fails
+    // the empty diff). No bounce here.
+    let (store, _dir) = temp_store();
+    let mut host = FakeHost::new();
+    host.script("sessions.spawn_into", json!({ "agentId": 101, "status": "spawned" })); // worker
+    host.script("agents.result", json!({ "agentId": 101, "output": "OFFICE-REPORT\nstatus: complete\n" }));
+    host.script("sessions.spawn_into", json!({ "agentId": 202, "status": "spawned" })); // reviewer
+    let mut d = driver(store, host);
+
+    let (p, ws) = worktree_setup("auth", vec![task("auth/t1", TaskState::Todo)]);
+    d.insert_for_test(p, 1_000);
+    let desk = desk_of(&ws, "auth", "t1");
+
+    d.on_tick(1_000); // worker spawn
+    assert!(desk.exists(), "worktree materialized");
+    // The worker delivers NOTHING (desk empty) and the delivery checkout stays clean.
+
+    d.handle(handlers::Input::Event(handlers::HostEvent::AgentsDone { agent_id: 101, status: "done".to_string(), error: None }), 2_000);
+
+    let proj = d.project("auth").unwrap();
+    assert_eq!(proj.tasks[0].bounces, 0, "clean main -> no misroute bounce");
+    assert!(proj.tasks[0].last_review.is_none(), "no bounce note");
+    assert!(matches!(proj.tasks[0].state, TaskState::Review { .. }), "proceeds to Review as before");
+    assert_eq!(call_count(&d.host, "sessions.spawn_into"), 2, "reviewer spawned (normal flow)");
+}
