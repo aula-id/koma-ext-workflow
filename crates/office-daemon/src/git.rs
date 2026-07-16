@@ -58,6 +58,36 @@ pub enum MergeOutcome {
 const COMMIT_EMAIL: &str = "office@koma-workflow.local";
 const COMMIT_NAME: &str = "Workflow Office";
 
+/// Starter `.gitignore` seeded into a FRESH delivery repo BEFORE its initial commit (item 3), so
+/// build artifacts / vendored deps / runtime droppings that already sit in the delivery dir (e.g. a
+/// `node_modules/` the user left, or one a pre-init tool created) are NOT captured by the
+/// authorize-time snapshot. That first commit predates any worker- or reviewer-authored `.gitignore`
+/// and every task worktree branches off it, so without this seed the trash rides along into every
+/// desk and the clean-build auditor fails the delivery (a real run committed `node_modules/` this
+/// way). The entries mirror the clean-build hygiene contract the workers/reviewers enforce
+/// (`office-core` `prompts::HYGIENE_RULES`). Only ever written on a fresh `init_repo` — an ADOPTED
+/// repo is left exactly as the user has it.
+const STARTER_GITIGNORE: &str = "# Seeded by the Workflow office — keep the delivered tree clean (clean-build hygiene).\n\
+node_modules/\n\
+vendor/\n\
+target/\n\
+dist/\n\
+build/\n\
+.vite/\n\
+.next/\n\
+__pycache__/\n\
+*.pyc\n\
+coverage/\n\
+*.log\n\
+*.tmp\n\
+*.bak\n\
+*.orig\n\
+*.swp\n\
+.DS_Store\n\
+*.db-wal\n\
+*.db-shm\n\
+*.sqlite-journal\n";
+
 /// An injectable handle to the `git` binary. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct Git {
@@ -126,9 +156,37 @@ impl Git {
         let _ = self.run(delivery, &["config", "user.email", "office@koma-workflow.local"]);
         let _ = self.run(delivery, &["config", "user.name", "Workflow Office"]);
         let _ = self.run(delivery, &["config", "commit.gpgsign", "false"]);
+        // item 3: seed a starter `.gitignore` BEFORE `add -A` so the initial commit excludes build
+        // artifacts / vendored deps / runtime trash already present in the delivery dir. Written only
+        // when absent — a user-provided `.gitignore` is respected, never clobbered.
+        Self::seed_gitignore(delivery);
         self.run(delivery, &["add", "-A"])?;
         self.run(delivery, &["commit", "--allow-empty", "-m", "workflow: initial delivery snapshot"])?;
         Ok(())
+    }
+
+    /// Write the starter [`STARTER_GITIGNORE`] into a fresh delivery repo (item 3), UNLESS the dir
+    /// already has a `.gitignore` (respect a user-provided one). Best-effort: a write error is
+    /// swallowed — the initial commit still proceeds (worst case a later worker authors one), never
+    /// blocking authorize.
+    fn seed_gitignore(delivery: &Path) {
+        let path = delivery.join(".gitignore");
+        if path.exists() {
+            return;
+        }
+        let _ = std::fs::write(&path, STARTER_GITIGNORE);
+    }
+
+    /// Whether the working tree at `path` has uncommitted changes (`git status --porcelain`
+    /// non-empty). The misroute guard (item 4) uses this on the delivery MAIN checkout: an empty desk
+    /// diff PLUS a dirty main checkout means a worker wrote its files there (relative paths /
+    /// workspace [0]) instead of into its worktree. Best-effort — a git error (missing binary, not a
+    /// repo) yields `false` so the guard only ever ACTS on a CONFIRMED-dirty tree, never on an
+    /// inconclusive probe.
+    pub fn is_dirty(&self, path: &Path) -> bool {
+        self.run(path, &["status", "--porcelain"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
     }
 
     /// The repo's current (main) branch name — the branch the main worktree stays checked out on,

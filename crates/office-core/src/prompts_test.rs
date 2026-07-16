@@ -311,6 +311,44 @@ mod tests {
     }
 
     #[test]
+    fn worker_prompt_worktree_names_the_desk_as_the_working_root_and_bans_writing_to_zero() {
+        // item 2 (prompt truth): the worktree worker must be told the desk IS its workspace, that its
+        // shell cwd is NOT the desk (relative paths / [0] land in the shared delivery checkout), and
+        // that it must use ABSOLUTE desk paths and NEVER write to any other root / the delivery path.
+        let mut project = base_project();
+        project.worktree_desks = true;
+        let task = &project.tasks[0].clone();
+        let desk = "/home/.koma-workflow/desks/shop-crawler/t4";
+        let prompt = worker(&project, task, Path::new(desk), Path::new("/work/session/deliver"), 1, None, &[]);
+
+        assert!(prompt.contains("IS your workspace"), "desk framed as the workspace");
+        assert!(prompt.contains("ABSOLUTE path"), "absolute-path rule stated");
+        assert!(prompt.contains(desk), "the desk path is named as the working root");
+        assert!(prompt.contains("NEVER write to any other workspace root"), "cross-root write ban");
+        assert!(prompt.contains("workspace [0]"), "workspace [0] / delivery is called out as off-limits");
+        assert!(prompt.contains("the task is bounced"), "the consequence of misrouting is stated");
+        assert!(prompt.len() < PROMPT_TARGET_CAP, "prompt was {} bytes", prompt.len());
+    }
+
+    #[test]
+    fn reviewer_prompt_worktree_names_the_worktree_as_the_working_root() {
+        // item 2 (prompt truth): the worktree reviewer gets the same working-root truth — its cwd is
+        // NOT the worktree, so absolute paths under it, and never write to the delivery path / [0].
+        let mut project = base_project();
+        project.worktree_desks = true;
+        let tree = "/home/.koma-workflow/desks/shop-crawler/t4-retry-logic";
+        project.tasks[0].desk = Some(tree.into());
+        let task = &project.tasks[0].clone();
+        let prompt = reviewer(&project, task, Path::new("/work/session/deliver"), "did it", &[]);
+
+        assert!(prompt.contains("IS your workspace"), "worktree framed as the workspace");
+        assert!(prompt.contains("ABSOLUTE path"), "absolute-path rule stated");
+        assert!(prompt.contains("workspace [0]"), "delivery / [0] called out as off-limits");
+        assert!(prompt.contains(tree), "the worktree path is named as the working root");
+        assert!(prompt.len() < PROMPT_TARGET_CAP);
+    }
+
+    #[test]
     fn worker_prompt_legacy_bans_git_but_keeps_delivery_path() {
         // item 1: even the legacy copy-desk prompt now forbids git (the office owns VCS).
         let project = base_project(); // worktree_desks = false

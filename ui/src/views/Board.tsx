@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useStore } from '../store';
 import { bridge } from '../bridge';
-import { Card, ColumnKey, Task, TaskStateKey } from '../components/Card';
+import { Card, ColumnKey, Task, TaskStateKey, taskSlug } from '../components/Card';
 import Drilldown from './Drilldown';
 import DepMap from '../components/DepMap';
 import TaskDetail from './TaskDetail';
@@ -369,6 +369,134 @@ const DesignStageCardView: React.FC<{ card: DesignStageCard }> = ({ card }) => {
   );
 };
 
+const SPRINT_STATUS_LABEL: Record<Sprint['status'], string> = {
+  pending: 'pending',
+  active: 'active',
+  // The wire value is lowercase `inreview` (see Sprint's doc comment above); the label
+  // shown to the user is the two-word "in review", matching OfficeMap's meeting-room copy.
+  inreview: 'in review',
+  done: 'done',
+};
+
+const SPRINT_STATUS_COLOR: Record<Sprint['status'], string> = {
+  pending: 'var(--wf-dim)',
+  active: 'var(--wf-accent)',
+  inreview: 'var(--wf-review)',
+  done: 'var(--wf-status-done)',
+};
+
+/**
+ * Sprint plan strip (feature: sprint-list): one compact row per project-track sprint,
+ * rendered above the kanban columns whenever the snapshot carries `sprints[]`. Until now
+ * `sprints[]`/`activeSprint` only fed OfficeMap's badge + meeting-room scene (feature:
+ * sprints) — the full plan itself was never surfaced anywhere on the Board, so users had
+ * no way to see it. Absent/empty `sprints` renders nothing (back-compat: pre-sprints /
+ * no-sprint-track snapshots keep today's board byte-identical) — see the caller below.
+ *
+ * Each row is a flat, non-draggable disclosure: click toggles a one-line expansion of the
+ * sprint's task ids, resolved to titles against `project.tasks` when the task is still
+ * known (falls back to the bare slug otherwise — same `taskSlug` helper Card.tsx uses for
+ * `blockedBy` refs). No routing, no drilldown — just cheap inline context.
+ */
+const SprintStrip: React.FC<{ sprints: Sprint[]; tasks: Task[] }> = ({ sprints, tasks }) => {
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  const titleFor = (id: string) => tasks.find((t) => t.id === id)?.title ?? taskSlug(id);
+  const orderedSprints = sprints.slice().sort((a, b) => a.index - b.index);
+
+  return (
+    <div
+      data-testid="sprint-strip"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        marginBottom: '1rem',
+        border: '1px solid var(--wf-border)',
+        borderRadius: 'var(--wf-radius)',
+        overflow: 'hidden',
+      }}
+    >
+      {orderedSprints.map((sprint) => {
+        const active = sprint.status === 'active';
+        const inReview = sprint.status === 'inreview';
+        const isExpanded = expandedIndex === sprint.index;
+        return (
+          <div key={sprint.index}>
+            <div
+              data-testid="sprint-row"
+              data-sprint-index={sprint.index}
+              data-sprint-status={sprint.status}
+              onClick={() => setExpandedIndex((cur) => (cur === sprint.index ? null : sprint.index))}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.6rem',
+                padding: '0.4rem 0.6rem',
+                cursor: 'pointer',
+                borderLeft: active ? '2px solid var(--wf-accent)' : '2px solid transparent',
+                background: active
+                  ? 'var(--wf-tint-accent)'
+                  : inReview
+                    ? 'color-mix(in srgb, var(--wf-review) 10%, transparent)'
+                    : 'transparent',
+                borderBottom: '1px solid var(--wf-head)',
+              }}
+            >
+              <span style={{ fontSize: '0.68rem', fontWeight: 600, color: 'var(--wf-dim)', flex: 'none' }}>
+                S{sprint.index + 1}
+              </span>
+              <span
+                title={sprint.goal}
+                className="truncate"
+                style={{ fontSize: '0.82rem', color: 'var(--wf-fg)', flex: 1, minWidth: 0 }}
+              >
+                {sprint.goal}
+              </span>
+              <span
+                data-testid="sprint-status-chip"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  fontSize: '0.68rem',
+                  color: SPRINT_STATUS_COLOR[sprint.status],
+                  flex: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {inReview && (
+                  <motion.span
+                    animate={{ opacity: [0.35, 1, 0.35] }}
+                    transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
+                    style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--wf-review)', display: 'inline-block' }}
+                  />
+                )}
+                {SPRINT_STATUS_LABEL[sprint.status]}
+              </span>
+              <span style={{ fontSize: '0.68rem', color: 'var(--wf-dim)', flex: 'none', whiteSpace: 'nowrap' }}>
+                {sprint.done}/{sprint.total}
+              </span>
+            </div>
+
+            {isExpanded && (
+              <div
+                data-testid="sprint-row-expanded"
+                style={{
+                  padding: '0.35rem 0.6rem 0.5rem 1.9rem',
+                  fontSize: '0.72rem',
+                  color: 'var(--wf-dim)',
+                  borderBottom: '1px solid var(--wf-head)',
+                }}
+              >
+                {sprint.tasks.length > 0 ? sprint.tasks.map(titleFor).join(', ') : 'no tasks in this sprint'}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 export interface BoardProps {
   projectId: string;
   onBack?: () => void;
@@ -731,6 +859,13 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
 
         {tab === 'board' && (
           <React.Fragment>
+          {/* Sprint plan strip (feature: sprint-list): the project-track plan, rendered
+              between this tab's header/tabs and the kanban columns below. Absent/empty
+              `sprints` (pre-sprints / no-sprint-track / older snapshot) renders nothing —
+              same board as before this feature existed. */}
+          {project.sprints && project.sprints.length > 0 && (
+            <SprintStrip sprints={project.sprints} tasks={project.tasks} />
+          )}
           {/* Flat columns: no background panel per column — a small header with a
               hairline rule, cards below. The drop target affordance is a dashed
               hairline around the column area while dragging.

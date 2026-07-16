@@ -4172,3 +4172,61 @@ fn ensure_active_sprint_demotes_extra_active_sprints_keeping_lowest_index() {
         "the demotion is traced"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Worktree desks — misroute guard (item 4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_misrouted_bounces_the_in_flight_attempt_with_the_reason() {
+    // item 4: the driver's WorkerMisrouted event (empty desk diff + dirty delivery checkout) bounces
+    // the still-OnProgress worker attempt, storing the named reason as the review note for the retry.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 }, 0, &[])],
+    );
+    p.config.bounce_budget = 3;
+    p.worktree_desks = true;
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::WorkerMisrouted {
+            task: TaskId("t1".into()),
+            reason: "worker wrote outside its desk".into(),
+        }),
+        1000,
+        0, // capacity 0 so the same-step dispatch scan can't immediately re-spawn and mask the bounce
+    );
+
+    let t = find_task(&p, "t1");
+    assert_eq!(t.bounces, 1, "misroute counted a bounce");
+    assert_eq!(
+        t.last_review.as_deref(),
+        Some("worker wrote outside its desk"),
+        "the named reason is the review note the retry carries"
+    );
+    assert!(matches!(t.state, TaskState::Todo), "re-queued within budget");
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("wrote outside its desk")),
+        "the misroute is traced"
+    );
+}
+
+#[test]
+fn worker_misrouted_on_a_non_inflight_task_is_a_safe_noop() {
+    // Guard: a WorkerMisrouted for a task that already left OnProgress (a race with completion) does
+    // nothing — no bounce, no state change.
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    let before = find_task(&p, "t1").bounces;
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::WorkerMisrouted { task: TaskId("t1".into()), reason: "x".into() }),
+        1000,
+        4,
+    );
+
+    let t = find_task(&p, "t1");
+    assert_eq!(t.bounces, before, "no bounce on a non-in-flight task");
+    assert!(matches!(t.state, TaskState::Done { .. }), "state unchanged");
+}

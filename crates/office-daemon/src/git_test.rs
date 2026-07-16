@@ -43,6 +43,57 @@ fn init_repo_respects_existing_content_in_the_first_commit() {
 }
 
 #[test]
+fn init_repo_seeds_gitignore_and_first_commit_excludes_planted_node_modules() {
+    // item 3: a FRESH repo gets a starter .gitignore BEFORE the initial commit, so build/vendored
+    // trash already sitting in the delivery dir (here a node_modules/ planted PRE-init) is excluded
+    // from the authorize-time snapshot — while real source is still captured.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    fs::create_dir_all(repo.join("node_modules/left-pad")).unwrap();
+    write(&repo.join("node_modules/left-pad"), "index.js", "module.exports = 1\n");
+    write(repo, "app.js", "console.log(1)\n");
+
+    let g = git();
+    g.init_repo(repo).expect("init");
+
+    // A starter .gitignore was seeded, listing node_modules/.
+    assert!(repo.join(".gitignore").exists(), "starter .gitignore seeded");
+    assert!(read(repo, ".gitignore").contains("node_modules/"), "gitignore covers node_modules/");
+
+    // The initial commit EXCLUDED node_modules but kept the source + the .gitignore. Check the
+    // COMMITTED tree via a fresh worktree (the working dir still physically holds node_modules).
+    let dir2 = tempfile::tempdir().unwrap();
+    let desk = dir2.path().join("wt");
+    g.add_worktree(repo, &desk, "task/x").expect("worktree");
+    assert!(desk.join("app.js").exists(), "source captured by the initial commit");
+    assert!(desk.join(".gitignore").exists(), ".gitignore captured by the initial commit");
+    assert!(!desk.join("node_modules").exists(), "node_modules excluded from the initial commit");
+}
+
+#[test]
+fn init_repo_respects_a_user_provided_gitignore() {
+    // item 3: seed only when absent — a user's own .gitignore is never clobbered.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    write(repo, ".gitignore", "# mine\nsecrets/\n");
+    git().init_repo(repo).expect("init");
+    assert_eq!(read(repo, ".gitignore"), "# mine\nsecrets/\n", "user .gitignore left untouched");
+}
+
+#[test]
+fn is_dirty_reflects_uncommitted_changes_in_the_working_tree() {
+    // item 4: the misroute guard's main-checkout probe. Clean right after init; dirty once a file
+    // is added to the working tree.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let g = git();
+    g.init_repo(repo).unwrap();
+    assert!(!g.is_dirty(repo), "clean after init");
+    write(repo, "stray.rs", "// misrouted\n");
+    assert!(g.is_dirty(repo), "dirty after an untracked write");
+}
+
+#[test]
 fn add_worktree_is_a_fresh_branch_checkout() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();

@@ -282,6 +282,14 @@ pub enum HostEvent {
         summary: String,
         is_conflict: bool,
     },
+    /// Worktree desks (item 4 — misroute guard): the driver committed a finished worker's desk but
+    /// the branch diff came back EMPTY while the delivery MAIN checkout was DIRTY — the worker wrote
+    /// its files outside its desk (a relative path / workspace root [0] resolves to the shared
+    /// delivery working tree, not to the per-task worktree). The task bounces with `reason` as the
+    /// review note so the retry's prompt tells the worker to write into its desk. The dirty main
+    /// checkout is left UNTOUCHED (loud + user-visible) — the office never auto-cleans user-visible
+    /// state. Fed INSTEAD of `Result` for that attempt, so the normal Review transition is skipped.
+    WorkerMisrouted { task: TaskId, reason: String },
 }
 
 /// Side effects for the driver to execute. `InvokeModel`/`PublishContext` are part
@@ -2696,6 +2704,7 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
         HostEvent::DeskMergeConflict { task, summary, is_conflict } => {
             on_desk_merge_conflict(p, &task, summary, is_conflict, now_ms, ctx)
         }
+        HostEvent::WorkerMisrouted { task, reason } => on_worker_misrouted(p, &task, reason, now_ms, ctx),
     }
 }
 
@@ -3256,6 +3265,29 @@ fn on_desk_merge_conflict(
     let trace_word = if is_conflict { "conflict" } else { "failed" };
     trace(p, now_ms, "desk", format!("{} merge {trace_word} — bouncing", short_task(task)), ctx);
     bounce_task(p, idx, attempt, note, now_ms, ctx);
+    ctx.dirty = true;
+}
+
+/// A worker wrote OUTSIDE its desk (item 4 — misroute guard): the driver's desk commit produced an
+/// empty branch diff while the delivery MAIN checkout was dirty, so the files landed in the shared
+/// delivery working tree (relative paths / workspace [0]) instead of the worktree. Bounce the task
+/// with `reason` as the review note — the retry rebranches a FRESH worktree off main and its prompt
+/// carries the note. The worker is still `OnProgress` here (the driver fed this INSTEAD of `Result`,
+/// so the normal Review transition never ran). The delivery checkout is NEVER touched: this only
+/// re-queues the task and names the failure.
+fn on_worker_misrouted(p: &mut Project, task: &TaskId, reason: String, now_ms: u64, ctx: &mut Ctx) {
+    let idx = match find_task(p, task) {
+        Some(i) => i,
+        None => return,
+    };
+    // Must still be the in-flight worker attempt; if a race already moved it, nothing to bounce.
+    let attempt = match &p.tasks[idx].state {
+        TaskState::OnProgress { attempt, .. } => *attempt,
+        _ => return,
+    };
+    record(&mut p.tasks[idx], now_ms, "worker-misrouted");
+    trace(p, now_ms, "desk", format!("{} wrote outside its desk — bouncing", short_task(task)), ctx);
+    bounce_task(p, idx, attempt, reason, now_ms, ctx);
     ctx.dirty = true;
 }
 

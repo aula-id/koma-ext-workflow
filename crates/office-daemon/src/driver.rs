@@ -252,6 +252,24 @@ enum SpawnOutcome {
     Failed,
 }
 
+/// The bounce note for a worker that wrote outside its desk (item 4 — misroute guard). Fixed wording
+/// so the failure is loud and named in the trace, the panel, and the next worker's review-note.
+const MISROUTE_REASON: &str =
+    "worker wrote outside its desk (delivery checkout is dirty) — files must go in the desk worktree";
+
+/// Outcome of committing a finished worker's worktree (item 4 — misroute guard). Decides whether the
+/// driver feeds the normal `Result` (→ Review) or bounces the attempt as a misroute.
+enum WorktreeCommit {
+    /// Legacy desks, a non-worker binding, a worker whose desk captured its changes, OR an empty
+    /// desk diff with a CLEAN delivery checkout (a legitimate no-op delivery). Feed `Result` as
+    /// usual — the normal Review flow proceeds (an empty diff is then failed by the reviewer).
+    Proceed,
+    /// The desk diff came back EMPTY while the delivery MAIN checkout is DIRTY: the worker wrote its
+    /// files into the shared delivery working tree instead of its worktree. Bounce this task with
+    /// [`MISROUTE_REASON`] instead of moving it to Review.
+    Misrouted(TaskId),
+}
+
 pub struct Driver<H: Host> {
     store: Store,
     /// Public so `driver_test.rs` can script replies and assert the recorded call log.
@@ -884,6 +902,27 @@ impl<H: Host> Driver<H> {
                 params["model"] = json!(m);
             }
         }
+        // koma workspace confinement (spawn-workspace feature, broker_spawn's optional
+        // `workspace` param): in worktree-desks mode, narrow the sub-agent's world to its
+        // task's desk. A WORKER's desk is the fresh worktree `setup_worktree` just added above;
+        // a REVIEWER dispatch reuses the SAME `task.desk` (still present — it isn't reclaimed
+        // until after the review passes and the branch merges), so it reviews the integrated
+        // tree confined to that same worktree. Sent unconditionally whenever `task.desk` is
+        // known in worktree mode — an OLDER koma silently ignores an unknown param, so there is
+        // no compatibility hazard. Legacy copy-desk mode NEVER sends this key: the desk there is
+        // a scratch dir, not a git worktree of the delivery repo, and old behavior is preserved
+        // byte-for-byte.
+        if self.projects[idx].project.worktree_desks {
+            if let Some(desk) = self.projects[idx]
+                .project
+                .tasks
+                .iter()
+                .find(|t| &t.id == task)
+                .and_then(|t| t.desk.clone())
+            {
+                params["workspace"] = json!(desk.display().to_string());
+            }
+        }
         let reply = self.host.call("sessions.spawn_into", params);
 
         if reply.get("status").and_then(Value::as_str) == Some("sent") {
@@ -1027,13 +1066,24 @@ impl<H: Host> Driver<H> {
             .unwrap_or_default();
         // Worktree desks (item 2): commit a finished WORKER's tree onto its branch + stash the
         // diff-stat for the reviewer, BEFORE the kernel moves the task to Review. A no-op for
-        // reviewers/researchers/auditors and legacy desks.
-        self.maybe_commit_worktree(idx, agent_id);
-        self.step(
-            idx,
-            kernel::Input::Host(kernel::HostEvent::Result { agent_id, text }),
-            now_ms,
-        );
+        // reviewers/researchers/auditors and legacy desks. Item 4 (misroute guard): if the desk
+        // diff is EMPTY yet the delivery checkout is dirty, the worker wrote outside its desk — bounce
+        // the attempt (named, loud) INSTEAD of feeding `Result`, so it never reaches an empty Review.
+        match self.maybe_commit_worktree(idx, agent_id) {
+            WorktreeCommit::Misrouted(task) => self.step(
+                idx,
+                kernel::Input::Host(kernel::HostEvent::WorkerMisrouted {
+                    task,
+                    reason: MISROUTE_REASON.to_string(),
+                }),
+                now_ms,
+            ),
+            WorktreeCommit::Proceed => self.step(
+                idx,
+                kernel::Input::Host(kernel::HostEvent::Result { agent_id, text }),
+                now_ms,
+            ),
+        }
     }
 
     /// Execute an `InjectComment` (feature 4): push a mid-run board comment to a live sub-agent
@@ -1668,11 +1718,18 @@ impl<H: Host> Driver<H> {
 
     /// Commit a finished worker's tree onto its task branch and stash the branch diff-stat for the
     /// reviewer prompt (item 2), BEFORE the kernel transitions the task to Review. Only for a WORKER
-    /// binding in worktree mode; a no-op otherwise. Best-effort: a commit failure is logged but the
-    /// review still proceeds (the reviewer inspects the tree directly).
-    fn maybe_commit_worktree(&mut self, idx: usize, agent_id: u64) {
+    /// binding in worktree mode; a no-op otherwise (returns [`WorktreeCommit::Proceed`]). Best-effort:
+    /// a commit failure is logged but the review still proceeds (the reviewer inspects the tree
+    /// directly).
+    ///
+    /// Item 4 (misroute guard): when the desk diff comes back EMPTY, probe the delivery MAIN
+    /// checkout — a dirty checkout means the worker wrote its files THERE (relative paths / workspace
+    /// [0]) instead of into its worktree. That returns [`WorktreeCommit::Misrouted`] so the caller
+    /// bounces the attempt loudly. An empty diff with a CLEAN checkout is a legitimate no-op delivery
+    /// and proceeds to Review as before. The delivery checkout is NEVER auto-cleaned or auto-committed.
+    fn maybe_commit_worktree(&mut self, idx: usize, agent_id: u64) -> WorktreeCommit {
         if !self.projects[idx].project.worktree_desks {
-            return;
+            return WorktreeCommit::Proceed;
         }
         // The worker is still OnProgress here (the Result event has not been fed yet).
         let (task_idx, desk, branch) = {
@@ -1683,14 +1740,14 @@ impl<H: Host> Driver<H> {
             match ti {
                 Some(ti) => match &p.tasks[ti].desk {
                     Some(d) => (ti, d.clone(), office_core::task_branch(&p.tasks[ti].id.0)),
-                    None => return,
+                    None => return WorktreeCommit::Proceed,
                 },
-                None => return, // not a worker binding (reviewer/researcher/auditor)
+                None => return WorktreeCommit::Proceed, // not a worker binding (reviewer/researcher/auditor)
             }
         };
         let repo = match &self.projects[idx].project.delivery_path {
             Some(r) => r.clone(),
-            None => return,
+            None => return WorktreeCommit::Proceed,
         };
         let msg = format!("workflow: task {}", self.projects[idx].project.tasks[task_idx].id.0);
         let gate = self.repo_lock(&repo);
@@ -1699,8 +1756,22 @@ impl<H: Host> Driver<H> {
             log_line(&format!("worktree commit failed: {}", e.reason()));
         }
         let diff = self.git.diff_stat(&repo, &desk, &branch);
+        // item 4: an EMPTY branch diff + a DIRTY delivery checkout = the worker wrote outside its
+        // desk. Probe the main checkout only in the empty-diff case (the common path has changes and
+        // never touches git again here). Never mutate the checkout — just classify.
+        let misrouted = diff.trim().is_empty() && self.git.is_dirty(&repo);
         drop(_guard);
         self.projects[idx].project.tasks[task_idx].diff_stat = Some(cap_diff_stat(&diff));
+        if misrouted {
+            let task = self.projects[idx].project.tasks[task_idx].id.clone();
+            log_line(&format!(
+                "worker misroute: task {} produced an empty desk diff but the delivery checkout {} is dirty",
+                task.0,
+                repo.display()
+            ));
+            return WorktreeCommit::Misrouted(task);
+        }
+        WorktreeCommit::Proceed
     }
 
     /// Merge a passed task's branch into main (item 1), serialized on the repo's git mutex, then
