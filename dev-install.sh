@@ -92,9 +92,8 @@ if command -v koma &> /dev/null; then
   echo "Using 'koma ext install --dev' (auto-grants requires, tier dev, replaces $EXT_ID in place)."
   koma ext install --dev "$ZIP_FILE"
 
-  # koma's Rust unpacker only chmod+x's the manifest runtime.exec (office-daemon);
-  # bin/workflow-mcp comes out non-executable on unix and the MCP server then fails
-  # to spawn. Re-mark everything in bin/ (no-op on Windows / already-executable files).
+  # koma >= 0.3.2 preserves zip unix modes on unpack; this chmod is a harmless
+  # belt for older komas and mode-stripping zip tools.
   if [ -d "$INSTALL_DIR/bin" ]; then
     chmod +x "$INSTALL_DIR/bin/"* 2>/dev/null || true
   fi
@@ -102,7 +101,16 @@ if command -v koma &> /dev/null; then
   if [ -f "$CONFIG_FILE" ] && command -v jq &> /dev/null; then
     cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
   fi
-  register_mcp_server
+
+  # koma >= 0.3.3 auto-registers manifest-declared mcp_servers with extension
+  # provenance; a manual jq upsert would create a DUPLICATE (prefixed) server.
+  # Only register manually when the installed manifest does not declare it.
+  if command -v jq &> /dev/null && [ -f "$INSTALL_DIR/manifest.json" ] \
+    && jq -e '.mcp_servers | length > 0' "$INSTALL_DIR/manifest.json" &> /dev/null; then
+    echo "MCP server declared in manifest - koma auto-registers it (skipping manual registration)."
+  else
+    register_mcp_server
+  fi
 
   echo ""
   echo "=== Installation Complete ==="
