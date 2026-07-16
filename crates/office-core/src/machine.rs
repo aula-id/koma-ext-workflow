@@ -5,7 +5,7 @@
 //! `Err(Transition)`. The kernel (W4) never panics on user input — an illegal
 //! transition is surfaced to the panel instead.
 
-use crate::domain::{AgentBinding, ParkReason, ProjectPhase, TaskState};
+use crate::domain::{AgentBinding, ParkReason, ProjectPhase, SprintStatus, TaskState};
 
 /// An illegal transition. `from` is the current-state label, `attempted` is the
 /// transition label. Carried to the panel so the user sees why an action bounced.
@@ -152,6 +152,12 @@ pub enum ProjectTransition {
     Halt { reason: String },
     /// Running -> Done (all tasks Done).
     Complete { at_ms: u64 },
+    /// Ready -> Drafting AND Drafting -> Drafting (SDLC re-triage / escalation to a heavier track,
+    /// pre-authorize only — feature: sdlc-triage). A light track (patch/enhancement) whose board is
+    /// already built in Ready can be sent back to Drafting to re-run the fuller ceremony; the
+    /// Drafting -> Drafting self-edge lets the kernel call this uniformly without special-casing the
+    /// phase. Never legal from Running/Interrupted/Halted/Done — escalation is pre-authorize.
+    Retriage,
 }
 
 fn phase_label(phase: &ProjectPhase) -> &'static str {
@@ -173,6 +179,7 @@ fn project_transition_label(t: &ProjectTransition) -> &'static str {
         ProjectTransition::Resume { .. } => "Resume",
         ProjectTransition::Halt { .. } => "Halt",
         ProjectTransition::Complete { .. } => "Complete",
+        ProjectTransition::Retriage => "Retriage",
     }
 }
 
@@ -215,6 +222,74 @@ pub fn step_project(
         }
         (ProjectPhase::Halted { .. }, ProjectTransition::Resume { .. }) => Ok(ProjectPhase::Running),
 
+        // SDLC re-triage / escalation to a heavier track (pre-authorize only): Ready -> Drafting to
+        // rebuild the board under the fuller ceremony, or a Drafting -> Drafting self-edge so the
+        // kernel need not branch on the current phase.
+        (ProjectPhase::Ready, ProjectTransition::Retriage) => Ok(ProjectPhase::Drafting),
+        (ProjectPhase::Drafting, ProjectTransition::Retriage) => Ok(ProjectPhase::Drafting),
+
+        _ => Err(err()),
+    }
+}
+
+/// Sprint-status transitions (feature: sprints).
+///
+/// ## Design call: a sub-state of `Running`, NOT a new `ProjectPhase` variant
+/// A sprint review is a per-sprint ceremony that runs WHILE the project stays `Running`. It was
+/// tempting to add a `ProjectPhase::SprintReview` variant, but a sprint state machine driven off
+/// `SprintStatus` fits the existing machine better and is far less invasive:
+///   - A new phase variant would force every exhaustive `match ProjectPhase` (digest, prompts,
+///     `authorize`'s phase report, `is_pre_authorize`, `owned_running/dispatchable_indices`,
+///     `maybe_complete_project`'s guards, and the machine's own Interrupt/Resume/Halt/Complete
+///     edges) to grow an arm — a wide blast radius with many chances for a subtle regression.
+///   - Interrupt/resume already work `Running <-> Interrupted`; a new phase would need extra edges
+///     AND its own `interrupted_from` handling to remember "was mid-review".
+///   - The dispatch loop is already gated on `Running`; scoping dispatch to the ACTIVE sprint makes
+///     it a natural no-op during a review (the reviewed sprint's tasks are all terminal, and the
+///     next sprint is not `Active` yet), so no phase gate is needed.
+///   - Completion must become sprint-aware regardless (don't finish at the end of sprint 1); a
+///     sub-state keeps that logic local to the sprint bookkeeping instead of scattering phase checks.
+///
+/// The only thing a distinct phase would buy is a louder external signal, and the digest/snapshot
+/// surface the sprint status + ceremony transcript explicitly, so the UI still gets a clear one.
+///
+/// The legal edges: `Pending -> Active` (the office starts grinding this sprint), `Active ->
+/// InReview` (every task settled — the ceremony fires), `InReview -> Done` (the single ceremony
+/// invoke returned and its carry-overs were folded forward). Anything else is `Err(Transition)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprintTransition {
+    /// Pending -> Active: this sprint becomes the one dispatch considers.
+    Activate,
+    /// Active -> InReview: all of the sprint's tasks settled; the review ceremony fires.
+    Review,
+    /// InReview -> Done: the ceremony's one invoke returned; carry-overs folded into the next sprint.
+    Complete,
+}
+
+fn sprint_label(status: &SprintStatus) -> &'static str {
+    match status {
+        SprintStatus::Pending => "Pending",
+        SprintStatus::Active => "Active",
+        SprintStatus::InReview => "InReview",
+        SprintStatus::Done => "Done",
+    }
+}
+
+fn sprint_transition_label(t: &SprintTransition) -> &'static str {
+    match t {
+        SprintTransition::Activate => "Activate",
+        SprintTransition::Review => "Review",
+        SprintTransition::Complete => "Complete",
+    }
+}
+
+/// Advance a single sprint's status. Pure and deterministic (feature: sprints).
+pub fn step_sprint(status: &SprintStatus, t: SprintTransition) -> Result<SprintStatus, Transition> {
+    let err = || Transition::new(sprint_label(status), sprint_transition_label(&t));
+    match (status, &t) {
+        (SprintStatus::Pending, SprintTransition::Activate) => Ok(SprintStatus::Active),
+        (SprintStatus::Active, SprintTransition::Review) => Ok(SprintStatus::InReview),
+        (SprintStatus::InReview, SprintTransition::Complete) => Ok(SprintStatus::Done),
         _ => Err(err()),
     }
 }

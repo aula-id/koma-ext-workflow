@@ -28,6 +28,9 @@ fn one_task(id: &str) -> Task {
         last_report: None,
         last_review: None,
         history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     }
 }
 
@@ -57,14 +60,22 @@ fn project(slug: &str) -> Project {
         epics: Vec::new(),
         stories: Vec::new(),
         tasks: vec![one_task("t1")],
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
         trace: Vec::new(),
         interrupted_from: None,
         gate_cleared: false,
         gate_invoke_live_hint: false,
+        track: "project".to_string(),
+        triage_pending: false,
+        sprint_review_invoke_live: false,
         pending_breakdown: None,
         seq: 0,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     }
 }
 

@@ -99,6 +99,10 @@ pub enum ParkReason {
     /// failures so the halt/attention lines can explain it. The user fixes manually and
     /// unparks, or lowers the threshold in settings.
     AuditFailed(String),
+    /// The task's agent died < 5s after spawn (an "instant death") three times in a row with no
+    /// non-instant run in between (item 3) — a blind retry loop would just replay the crash forever,
+    /// so the office parks it instead. Carries the last death reason.
+    InstantDeath(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +120,25 @@ pub struct Task {
     pub last_report: Option<String>,
     pub last_review: Option<String>,
     pub history: Vec<TaskEvent>,
+    /// Worktree desks (item 1/2): the capped `git diff <main>...task/<slug> --stat` output the
+    /// driver computes when it commits the worker's tree onto the task branch, folded into the
+    /// reviewer prompt (`prompts::reviewer`) so the reviewer judges the INTEGRATED diff, not a
+    /// scratch desk. `None` in legacy copy-desk mode, or before the first commit. In worktree
+    /// mode a pending review only dispatches once this is `Some` (the commit has landed).
+    /// `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub diff_stat: Option<String>,
+    /// Worktree desks (item 1): the task passed review and its branch is being merged into main.
+    /// Gates the reviewer from re-dispatching during the (synchronous) merge window; cleared when
+    /// the merge resolves — Done on a clean merge, bounce on a conflict. `#[serde(default)]`.
+    #[serde(default)]
+    pub awaiting_merge: bool,
+    /// Instant-death retry backoff (item 4): the earliest wall-clock ms this task may be
+    /// (re-)dispatched. `0` = dispatch immediately. Set when an agent dies < 5s after spawn so the
+    /// dispatch scan skips the task until `now_ms >= dispatch_after_ms`, re-armed on the next
+    /// Tick/Reconcile with no busy-wait and no spawned thread. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub dispatch_after_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,6 +194,53 @@ pub enum ProjectPhase {
     Interrupted,
     Halted { reason: String },
     Done { at_ms: u64 },
+}
+
+/// The lifecycle status of one sprint (feature: sprints). A project-track breakdown groups its
+/// tasks into ordered sprints; the office grinds ONE sprint at a time. `Pending` = not yet started;
+/// `Active` = its tasks are the ones dispatch currently considers; `InReview` = every task settled
+/// and the (theater-over-real-data) sprint-review ceremony is in flight; `Done` = the ceremony
+/// finished and its carry-overs (if any) were folded into the next sprint. There is at most ONE
+/// `Active` (grinding) or `InReview` (ceremony) sprint at a time — the machine.rs `step_sprint`
+/// pure function owns the legal edges. `Copy` so the many read-side comparisons stay ergonomic;
+/// a distinct `#[serde(default = ..)]` is unnecessary because whole `Sprint` records are only ever
+/// written by this build (old state has an EMPTY `Project.sprints`, the legacy no-sprint flow).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SprintStatus {
+    Pending,
+    Active,
+    InReview,
+    Done,
+}
+
+/// One line of a sprint-review ceremony transcript (feature: sprints): a `(speaker, line)` pair the
+/// UI replays as a chat bubble. Speakers are worker persona short names (`nova`, ...), `reviewer`,
+/// `researcher` (a silent observer), and `office` (the PM's synthesis line, appended last when the
+/// single ceremony invoke returns). Assembled PROGRAMMATICALLY from the sprint's tasks' real
+/// OFFICE-REPORT/OFFICE-REVIEW data — the one model invoke only adds the PM's closing line.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SprintLine {
+    pub speaker: String,
+    pub line: String,
+}
+
+/// One sprint of a project-track plan (feature: sprints). `goal` is the model-authored one-line
+/// increment goal; `tasks` are the task ids grinding under this sprint (plus any carry-overs folded
+/// in from a prior sprint's review); `status` drives the sprint sub-state machine; `transcript` is
+/// the sprint-review ceremony chat (empty until the sprint enters `InReview`). A patch board and
+/// pre-feature (or otherwise sprint-less) state carry an EMPTY `Project.sprints` and run the legacy
+/// no-sprint flow unchanged; sprints engage only when the breakdown (or the enhancement wrap)
+/// populates this.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Sprint {
+    pub goal: String,
+    pub tasks: Vec<TaskId>,
+    pub status: SprintStatus,
+    /// The sprint-review ceremony transcript (feature: sprints). `#[serde(default)]` so a sprint
+    /// record persisted before the transcript existed (there are none in practice, but the field is
+    /// the one most likely to be added-to later) still loads clean.
+    #[serde(default)]
+    pub transcript: Vec<SprintLine>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,6 +354,13 @@ fn default_research_mode() -> String {
     "auto".to_string()
 }
 
+/// The SDLC intake track a pre-feature state file loads as (feature: sdlc-triage): `"project"`, the
+/// full-ceremony track. A named-fn default (not `#[serde(default)]`, which would force an empty
+/// string) so old state = the safe full process.
+fn default_track() -> String {
+    "project".to_string()
+}
+
 impl ProjectConfig {
     pub fn default_config() -> Self {
         Self {
@@ -394,6 +471,14 @@ pub struct Project {
     pub epics: Vec<Epic>,
     pub stories: Vec<Story>,
     pub tasks: Vec<Task>,
+    /// Ordered sprints of a project-track plan (feature: sprints). The breakdown groups tasks into
+    /// sprints (each with a one-line goal); the office grinds ONE sprint at a time, runs a review
+    /// ceremony between sprints, and completes only when the LAST sprint's review clears with zero
+    /// carry-overs. EMPTY for the patch track and for pre-feature / sprint-less state — that empty
+    /// case is the legacy no-sprint flow (global dispatch, all-Done completion), so old state loads
+    /// and behaves EXACTLY as before. `#[serde(default)]` for that back-compat.
+    #[serde(default)]
+    pub sprints: Vec<Sprint>,
     pub config: ProjectConfig,
     pub outbox: Vec<OutboundNotice>,
     /// Machine-diary trace ring (feature: tracelog): a capped, newest-last log of what the office
@@ -429,6 +514,29 @@ pub struct Project {
     /// `#[serde(default)]` (None) for back-compat.
     #[serde(default)]
     pub pending_breakdown: Option<String>,
+    /// Worktree desks active for this project (item 1). Set at authorize time: `true` when the
+    /// delivery path is (or was successfully `git init`-ed into) a git repo AND `git` is on PATH,
+    /// `false` on any failure (graceful fallback to legacy copy-desks). When `true`, each task desk
+    /// is a `git worktree` on branch `task/<slug>` under `workflow_home` and the office owns every
+    /// commit / merge / worktree-remove; when `false` the legacy scratch-desk flow runs.
+    /// `#[serde(default)]` (false) for back-compat.
+    #[serde(default)]
+    pub worktree_desks: bool,
+    /// The extension's OWN workspace root (`~/.koma-workflow`, the durable state root) — where task
+    /// desks live (item 1), NOT the user's session workspace / delivery parent (the old desk root,
+    /// which leaked scratch next to the product). Seeded by the driver from the store root at create
+    /// and on load. `None` falls back to `workspace` for the desk path (legacy). `#[serde(default)]`.
+    #[serde(default)]
+    pub workflow_home: Option<PathBuf>,
+    /// Rolling per-merge clean-build score (item 3): the running SUM and COUNT of the optional
+    /// `hygiene: <0-100>` grades reviewers emit on a PASS. The rolling score is the AVERAGE
+    /// (`hygiene_sum / hygiene_count`); a pass with no `hygiene:` line counts as 100 (compat). The
+    /// kernel traces "rolling score sagging: NN" whenever the average drops below `crd_pass_grade`.
+    /// `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub hygiene_sum: u64,
+    #[serde(default)]
+    pub hygiene_count: u32,
     /// Runtime-only hint (review finding, migration self-heal): "a PRD gate (`AssumeCheckPrd` /
     /// resolve / verify) invoke was fired by THIS process and may still be in flight". Set `true`
     /// at every PRD-stage invoke emission (`gate_doc`, `emit_resolve`, `emit_verify`, each gated on
@@ -442,6 +550,40 @@ pub struct Project {
     /// settling research binding heals the gate on first settle instead of wedging forever.
     #[serde(skip)]
     pub gate_invoke_live_hint: bool,
+    /// SDLC intake track (feature: sdlc-triage). At the FIRST message of a fresh brief a lightweight
+    /// classifier routes the work to exactly one of three tracks: `"project"` (the full ceremony —
+    /// PRD/TRD/CRD, the default and safe fallback), `"enhancement"` (one change-brief doc + a small
+    /// breakdown, the trio skipped), or `"patch"` (no documents — the brief becomes one task straight
+    /// to Ready). A named-fn serde default of `"project"` (NOT `#[serde(default)]`, which would force
+    /// an empty string) so every pre-feature state file loads as the full-ceremony track.
+    #[serde(default = "default_track")]
+    pub track: String,
+    /// Whether the intake Triage classification is still in flight (feature: sdlc-triage). Set the
+    /// instant the first-message Triage invoke is emitted; cleared when its result lands, on error,
+    /// or on interrupt. While `true` a Drafting persona reply does NOT capture a doc into the
+    /// pipeline — the track (which decides WHICH fence/contract applies) is not yet known — it only
+    /// flows to chat. `#[serde(skip)]` for the same reason as `gate_invoke_live_hint`: an in-flight
+    /// invoke can never survive a daemon restart, so it deserializes to `false` and the persona
+    /// proceeds under the resolved (or default `"project"`) track rather than wedging.
+    #[serde(skip)]
+    pub triage_pending: bool,
+    /// Runtime-only hint (review finding, CRITICAL): "a `SprintReview` ceremony invoke was fired by
+    /// THIS process (`fire_sprint_review`) and may still be in flight". The in-flight invoke chain is
+    /// the ceremony's ONLY liveness signal — nothing else persists "a review invoke is outstanding" —
+    /// so a daemon restart mid-ceremony drops it silently: the sprint stays `InReview` forever, and
+    /// `dispatch_scope` returns `Scope::None` while any sprint is `InReview`, freezing the WHOLE
+    /// project with no user-visible signal. Set `true` every time [`crate::kernel`]'s
+    /// `fire_sprint_review` emits the invoke, cleared on the `SprintReview` invoke-result arm
+    /// (`finish_sprint_review`, success AND error both converge there) and on hard/soft interrupt
+    /// (same "process boundary" reasoning as `gate_invoke_live_hint`/`triage_pending`: an in-flight
+    /// result is dropped unconditionally by the `Interrupted` guard, so a hint left `true` would never
+    /// clear on its own). Deliberately `#[serde(skip)]` for the same reason as those two siblings —
+    /// it always deserializes to `false`, so a project reloaded mid-ceremony is correctly seen as
+    /// having NO invoke in flight and the periodic `Reconcile` self-heal (which re-fires
+    /// `fire_sprint_review` — idempotent, replaces the transcript — whenever a sprint is `InReview`
+    /// with this `false`) un-wedges it on the very next reconcile pass.
+    #[serde(skip)]
+    pub sprint_review_invoke_live: bool,
     pub seq: u64,
 }
 

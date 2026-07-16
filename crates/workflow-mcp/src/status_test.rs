@@ -24,6 +24,9 @@ fn task(id: &str, state: TaskState, bounces: u32) -> Task {
         last_report: None,
         last_review: None,
         history: vec![],
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     }
 }
 
@@ -63,14 +66,22 @@ fn project(slug: &str, name: &str, phase: ProjectPhase, tasks: Vec<Task>, seq: u
         epics: vec![],
         stories: vec![],
         tasks,
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: vec![],
         trace: vec![],
         interrupted_from: None,
         gate_cleared: false,
         gate_invoke_live_hint: false,
+        track: "project".to_string(),
+        triage_pending: false,
+        sprint_review_invoke_live: false,
         pending_breakdown: None,
         seq,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     }
 }
 
@@ -132,6 +143,8 @@ fn all_projects_digest_reports_counts_parked_bounces_and_outbox() {
 
     assert!(out.contains("Workflow: 2 project(s)"), "{out}");
     assert!(out.contains("shop (Online Shop) - running"), "{out}");
+    // sdlc-triage: the status digest surfaces the intake track.
+    assert!(out.contains("track: project"), "the SDLC track is shown: {out}");
     assert!(
         out.contains("columns: backlog 0 todo 1 onprogress 1 review 1 done 1"),
         "{out}"

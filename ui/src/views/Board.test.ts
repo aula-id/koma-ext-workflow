@@ -164,3 +164,66 @@ describe('Board — skip research button', () => {
     expect(container.querySelector('[data-testid="skip-research-btn"]')).toBeFalsy();
   });
 });
+
+/**
+ * SDLC track badge (feature: sdlc-triage, review finding MINOR): `track` rides the wire
+ * (office-core digest.rs `"track"`) but was not rendered anywhere in the panel — the header
+ * now shows a small flat badge next to the phase indicator when a track is present.
+ */
+describe('Board — SDLC track badge', () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  function seedProject(overrides: Record<string, unknown> = {}) {
+    act(() => {
+      useStore.getState().updateSnapshot({
+        kind: 'snapshot',
+        seq: 1,
+        projects: [
+          {
+            id: 'p1',
+            name: 'Auth Service',
+            phase: { kind: 'drafting' },
+            tasks: [],
+            ...overrides,
+          },
+        ],
+      });
+    });
+  }
+
+  function renderBoard() {
+    act(() => {
+      root.render(React.createElement(Board, { projectId: 'p1' }));
+    });
+  }
+
+  beforeEach(() => {
+    (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+    useStore.setState({ snapshot: null, projects: [] });
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it('renders the badge with the track label when track is "patch"', () => {
+    seedProject({ track: 'patch' });
+    renderBoard();
+    const badge = container.querySelector('[data-testid="project-track-badge"]');
+    expect(badge).toBeTruthy();
+    expect(badge?.textContent).toBe('patch');
+  });
+
+  it('renders nothing when track is absent (back-compat, older snapshot)', () => {
+    seedProject({});
+    renderBoard();
+    expect(container.querySelector('[data-testid="project-track-badge"]')).toBeFalsy();
+  });
+});

@@ -27,6 +27,9 @@ fn task(id: &str, state: TaskState, priority: i32, blocked_by: &[&str]) -> Task 
         last_report: None,
         last_review: None,
         history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     }
 }
 
@@ -56,14 +59,22 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         epics: Vec::new(),
         stories: Vec::new(),
         tasks,
+        sprints: Vec::new(),
         config: ProjectConfig::default_config(),
         outbox: Vec::new(),
         trace: Vec::new(),
         interrupted_from: None,
         gate_cleared: false,
         gate_invoke_live_hint: false,
+        track: "project".to_string(),
+        triage_pending: false,
+        sprint_review_invoke_live: false,
         pending_breakdown: None,
         seq: 0,
+        worktree_desks: false,
+        workflow_home: None,
+        hygiene_sum: 0,
+        hygiene_count: 0,
     }
 }
 
@@ -617,10 +628,12 @@ fn injected_comment_folds_at_next_spawn_when_delivery_never_confirmed() {
 
 #[test]
 fn dispatch_desk_dir_is_flat_project_slug_over_task_slug() {
-    // Real dispatch mints hierarchical TaskIds `<project>/<epic-slug>/<story-slug>/<task-slug>`
-    // (office::apply_breakdown). The desk dir must collapse that to the single flat,
-    // obviously-marked `desks/<project-slug>/<task-slug>--koma-workflow-desk` layout locked by
-    // ARCHITECTURE.md 7.1 -- never a nested epic/story nested directory tree.
+    // The LEGACY-FALLBACK desk path (item 1): when `workflow_home` is unset (a pre-feature state
+    // file, or a bare unit-test project), the desk falls back to the historical
+    // `<workspace>/koma-workflow/desks/<project-slug>/<task-slug>--koma-workflow-desk` layout so the
+    // old behavior is preserved. The hierarchical TaskId still collapses to the flat task slug
+    // (never a nested epic/story tree). The seeded-home path is covered by
+    // `dispatch_desk_dir_uses_workflow_home_when_seeded`.
     let mut p = project(
         ProjectPhase::Running,
         vec![task(
@@ -816,6 +829,9 @@ fn worker_blocked_report_parks_task() {
 
 #[test]
 fn worker_error_requeues_with_attempt_increment() {
+    // Adapted for item 4: a worker that ran a WHILE (spawned at 0, dies at 10_000 => ~10s alive,
+    // well past the 5s instant-death window) re-queues IMMEDIATELY with no backoff — the original
+    // behavior. (Instant deaths, which DO back off, are covered by the death-diagnosis tests below.)
     let mut p = project(
         ProjectPhase::Running,
         vec![task(
@@ -835,12 +851,13 @@ fn worker_error_requeues_with_attempt_increment() {
             status: "error".into(),
             error: None,
         }),
-        1000,
+        10_000,
         0, // cap 0: observe Todo before re-dispatch
     );
     let t = find_task(&p, "t1");
     assert!(matches!(t.state, TaskState::Todo));
     assert_eq!(next_attempt(t), 2);
+    assert_eq!(t.dispatch_after_ms, 0, "a non-instant death carries no backoff");
 }
 
 #[test]
@@ -2803,4 +2820,1354 @@ fn config_set_research_mode_and_drafter_model_roundtrip() {
     step(&mut p, Input::Command(cfg(Some("banana"), Some(""))), 1000, 4);
     assert_eq!(p.config.research_mode, "always", "unknown research_mode ignored");
     assert_eq!(p.config.drafter_model, None, "empty string clears the drafter override");
+}
+
+// ---------------------------------------------------------------------------
+// Worktree desks (item 1/2) + rolling score (item 3) + retry backoff (item 4)
+// ---------------------------------------------------------------------------
+
+const REVIEW_PASS_HYG50: &str = "OFFICE-REVIEW\nverdict: pass\nreasons: ok\nhygiene: 50\n";
+const REVIEW_PASS_HYG100: &str = "OFFICE-REVIEW\nverdict: pass\nreasons: ok\nhygiene: 100\n";
+
+/// A Running project in worktree-desks mode with `workflow_home` seeded and the given tasks.
+fn worktree_project(tasks: Vec<Task>) -> Project {
+    let mut p = project(ProjectPhase::Running, tasks);
+    p.worktree_desks = true;
+    p.workflow_home = Some(PathBuf::from("/wfh"));
+    p
+}
+
+#[test]
+fn dispatch_desk_dir_uses_workflow_home_when_seeded() {
+    // item 1: with `workflow_home` seeded the desk lives under the extension's OWN root as a clean
+    // `<home>/desks/<project>/<task-slug>` (no koma-workflow marker dir, no --desk suffix), NOT next
+    // to the delivery product.
+    let mut p = project(ProjectPhase::Running, vec![task("shop/e1/s1/t4", TaskState::Todo, 0, &[])]);
+    p.id = ProjectId("shop".to_string());
+    p.workflow_home = Some(PathBuf::from("/home/.koma-workflow"));
+    // Legacy mode (worktree_desks stays false) still emits EnsureDesk, so we can read the dir.
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    let dir = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::EnsureDesk { dir, .. } => Some(dir.clone()),
+            _ => None,
+        })
+        .expect("EnsureDesk effect");
+    assert_eq!(dir, PathBuf::from("/home/.koma-workflow/desks/shop/t4"));
+}
+
+#[test]
+fn worktree_dispatch_omits_ensure_desk_and_records_desk() {
+    // item 1: in worktree mode the driver's `git worktree add` materializes the desk, so the kernel
+    // emits NO EnsureDesk; it still records the desk path + spawns the worker.
+    let mut p = worktree_project(vec![task("t1", TaskState::Todo, 0, &[])]);
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::EnsureDesk { .. })),
+        "no EnsureDesk in worktree mode"
+    );
+    assert_eq!(count_spawns(&fx), 1, "worker still spawns");
+    let t = find_task(&p, "t1");
+    assert_eq!(t.desk, Some(PathBuf::from("/wfh/desks/proj/t1")));
+    assert!(matches!(t.state, TaskState::OnProgress { .. }));
+}
+
+#[test]
+fn worktree_review_waits_for_the_commit_diff_before_dispatching() {
+    // item 2: a fresh Review{None} in worktree mode is NOT dispatched until the driver stashes the
+    // commit diff-stat (`diff_stat` set). Legacy mode has no such gate.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.diff_stat = None;
+    let mut p = worktree_project(vec![t]);
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(count_spawns(&fx), 0, "no reviewer until the diff-stat is stashed");
+
+    // Once the diff-stat is present the reviewer dispatches.
+    find_task_mut(&mut p, "t1").diff_stat = Some("stat".to_string());
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1100, 4);
+    assert_eq!(spawn_agents(&fx), vec!["office-reviewer"]);
+}
+
+#[test]
+fn worktree_review_pass_merges_and_accumulates_rolling_score() {
+    // item 1/3: a worktree review PASS does NOT complete directly — it emits MergeDesk and folds the
+    // hygiene grade into the rolling score, tracing a sag when it drops below crd_pass_grade.
+    let mut t = task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.diff_stat = Some("stat".to_string());
+    let mut p = worktree_project(vec![t]);
+
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS_HYG50.into() }), 1000, 4);
+
+    // MergeDesk emitted; the task is parked awaiting the merge (NOT Done yet).
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::MergeDesk { branch, .. } if branch == "task/t1")),
+        "MergeDesk emitted"
+    );
+    let after = find_task(&p, "t1");
+    assert!(after.awaiting_merge, "task awaits the merge");
+    assert!(matches!(after.state, TaskState::Review { binding: None, .. }));
+    // Rolling score accumulated; default crd_pass_grade is 98, so 50 sags.
+    assert_eq!(p.hygiene_sum, 50);
+    assert_eq!(p.hygiene_count, 1);
+    assert!(p.trace.iter().any(|e| e.summary.contains("rolling score sagging: 50")), "sag traced");
+}
+
+#[test]
+fn worktree_desk_merged_completes_the_task_and_removes_the_worktree() {
+    // item 1: a clean merge (DeskMerged) completes the task; with keep_desks off it also reclaims
+    // the worktree, and (last task) completes the project.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.awaiting_merge = true;
+    let mut p = worktree_project(vec![t]);
+
+    let fx = step(&mut p, Input::Host(HostEvent::DeskMerged { task: TaskId("t1".into()) }), 2000, 4);
+    let after = find_task(&p, "t1");
+    assert!(matches!(after.state, TaskState::Done { .. }));
+    assert!(!after.awaiting_merge);
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::RemoveDesk { branch, .. } if branch == "task/t1")),
+        "worktree reclaimed"
+    );
+    assert!(matches!(p.phase, ProjectPhase::Done { .. }), "sole task done => project done");
+}
+
+#[test]
+fn worktree_merge_conflict_bounces_with_the_conflict_summary() {
+    // item 1: a merge conflict (DeskMergeConflict) bounces the task with the conflict summary as the
+    // review note, so the retry re-delivers off the advanced main.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.awaiting_merge = true;
+    let mut p = worktree_project(vec![t]);
+    p.config.bounce_budget = 3;
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::DeskMergeConflict {
+            task: TaskId("t1".into()),
+            summary: "conflict in shared.rs".into(),
+            is_conflict: true,
+        }),
+        2000,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert!(matches!(after.state, TaskState::Todo));
+    assert_eq!(after.bounces, 1);
+    assert!(!after.awaiting_merge);
+    assert!(after.last_review.as_deref().unwrap().contains("merge conflict"));
+    assert!(after.last_review.as_deref().unwrap().contains("shared.rs"));
+    assert_eq!(next_attempt(after), 2);
+}
+
+#[test]
+fn worktree_merge_failure_non_conflict_bounces_with_failed_wording() {
+    // item 4 (adversarial review finding 4): a non-conflict merge failure (`is_conflict: false`)
+    // must NOT say "merge conflict" — that misleads the user into thinking there's something to
+    // resolve when there isn't; it should say the task was just re-queued.
+    let mut t = task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.awaiting_merge = true;
+    let mut p = worktree_project(vec![t]);
+    p.config.bounce_budget = 3;
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::DeskMergeConflict {
+            task: TaskId("t1".into()),
+            summary: "repository is locked".into(),
+            is_conflict: false,
+        }),
+        2000,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert!(matches!(after.state, TaskState::Todo));
+    let note = after.last_review.as_deref().unwrap();
+    assert!(note.contains("merge failed"), "note: {note}");
+    assert!(note.contains("repository is locked"), "note: {note}");
+    assert!(!note.contains("conflict"), "must not call a non-conflict failure a conflict: {note}");
+}
+
+#[test]
+fn legacy_review_pass_still_accumulates_hygiene_and_completes() {
+    // item 3: even legacy (non-worktree) passes fold the hygiene grade into the rolling score, and
+    // complete the task directly (no merge round-trip).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS_HYG100.into() }), 1000, 4);
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Done { .. }));
+    assert_eq!(p.hygiene_sum, 100);
+    assert_eq!(p.hygiene_count, 1);
+    // 100 >= crd_pass_grade => no sag trace.
+    assert!(!p.trace.iter().any(|e| e.summary.contains("sagging")));
+}
+
+#[test]
+fn instant_death_records_reason_and_backs_off_10s_then_60s() {
+    // item 4: a worker that dies < 5s after spawn is an instant death — record the reason, trace
+    // "died at step 0", and defer the retry (first 10s, then 60s).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 }, 0, &[])],
+    );
+    // Alive 500ms (spawned at 0, dies at 500) => instant.
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 7, status: "error".into(), error: Some("segfault".into()) }),
+        500,
+        0,
+    );
+    let t = find_task(&p, "t1");
+    assert!(matches!(t.state, TaskState::Todo));
+    assert_eq!(t.dispatch_after_ms, 500 + 10_000, "first instant death backs off 10s");
+    assert!(t.history.iter().any(|e| e.event.starts_with("died-at-step-0")));
+    assert!(p.trace.iter().any(|e| e.summary.contains("died at step 0") && e.summary.contains("segfault")));
+
+    // Re-dispatch (attempt 2) then die instantly AGAIN -> 60s backoff.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(8, 20_000), attempt: 2 };
+    find_task_mut(&mut p, "t1").dispatch_after_ms = 0;
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 8, status: "killed".into(), error: None }),
+        20_500,
+        0,
+    );
+    let t = find_task(&p, "t1");
+    assert_eq!(t.dispatch_after_ms, 20_500 + 60_000, "second instant death backs off 60s");
+}
+
+#[test]
+fn backoff_defers_dispatch_until_the_cooldown_passes() {
+    // item 4: the dispatch scan skips a task inside its cooldown and picks it up once now_ms passes
+    // dispatch_after_ms — no busy-wait, just the next Tick.
+    let mut t = task("t1", TaskState::Todo, 0, &[]);
+    t.dispatch_after_ms = 5_000;
+    let mut p = project(ProjectPhase::Running, vec![t]);
+
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1_000, 4);
+    assert_eq!(count_spawns(&fx), 0, "still in cooldown -> not dispatched");
+
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 6_000, 4);
+    assert_eq!(count_spawns(&fx), 1, "cooldown elapsed -> dispatched");
+}
+
+#[test]
+fn daemon_restart_death_pauses_without_burning_the_attempt() {
+    // item 4: a "daemon restart" death is host lifecycle noise — re-queue at the SAME attempt with
+    // no backoff, letting the reconcile/resume flow re-dispatch.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(9, 0), attempt: 2 }, 0, &[])],
+    );
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone {
+            agent_id: 9,
+            status: "killed".into(),
+            error: Some("agent lost: daemon restart in progress".into()),
+        }),
+        500, // even though it's < 5s, daemon-restart takes precedence over instant-death backoff
+        0,
+    );
+    let t = find_task(&p, "t1");
+    assert!(matches!(t.state, TaskState::Todo));
+    assert_eq!(next_attempt(t), 2, "attempt preserved (not burned)");
+    assert_eq!(t.dispatch_after_ms, 0, "no backoff on a daemon-restart pause");
+    assert!(t.history.iter().any(|e| e.event == "paused:daemon-restart"));
+}
+
+#[test]
+fn reviewer_instant_death_preserves_diff_stat_and_redispatches() {
+    // adversarial review finding 1: a REVIEWER death must NOT clear diff_stat — the reviewer never
+    // touches the worktree, and worktree-mode review dispatch (`pending_reviews_sorted`) gates on
+    // `diff_stat.is_some()`. Clearing it here would permanently wedge the task, since the worker's
+    // commit step is the only other writer and a reviewer-only retry never re-runs it.
+    let mut t = task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[]);
+    t.desk = Some(PathBuf::from("/wfh/desks/proj/t1"));
+    t.diff_stat = Some("1 file changed".to_string());
+    let mut p = worktree_project(vec![t]);
+
+    // Reviewer dies instantly (< 5s after spawn).
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 3, status: "error".into(), error: Some("oom".into()) }),
+        500,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert_eq!(after.diff_stat.as_deref(), Some("1 file changed"), "diff_stat survives a reviewer death");
+    assert!(matches!(after.state, TaskState::Review { binding: None, .. }));
+
+    // Once the instant-death backoff elapses, the reviewer re-dispatches — proving the task isn't
+    // wedged (pending_reviews_sorted would filter it out forever if diff_stat had been cleared).
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 500 + 10_000, 4);
+    assert_eq!(spawn_agents(&fx), vec!["office-reviewer"], "reviewer re-dispatches");
+}
+
+#[test]
+fn reviewer_daemon_restart_preserves_diff_stat() {
+    // adversarial review finding 1, daemon-restart variant: `pause_for_daemon_restart`'s Review arm
+    // must also not clear diff_stat.
+    let mut t = task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[]);
+    t.diff_stat = Some("1 file changed".to_string());
+    let mut p = worktree_project(vec![t]);
+
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone {
+            agent_id: 3,
+            status: "killed".into(),
+            error: Some("agent lost: daemon restart in progress".into()),
+        }),
+        500,
+        0,
+    );
+    let after = find_task(&p, "t1");
+    assert_eq!(after.diff_stat.as_deref(), Some("1 file changed"), "diff_stat survives a reviewer daemon-restart pause");
+    assert!(matches!(after.state, TaskState::Review { binding: None, .. }));
+}
+
+#[test]
+fn worker_instant_death_still_clears_diff_stat() {
+    // Sanity counterpart to the two tests above: a WORKER death (the one binding kind that actually
+    // touches the worktree) must still clear diff_stat so a fresh worktree recomputes it.
+    let mut t = task("t1", TaskState::OnProgress { binding: worker_binding(7, 0), attempt: 1 }, 0, &[]);
+    t.diff_stat = Some("stale".to_string());
+    let mut p = worktree_project(vec![t]);
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 7, status: "error".into(), error: None }),
+        500,
+        0,
+    );
+    assert_eq!(find_task(&p, "t1").diff_stat, None, "worker death still clears diff_stat");
+}
+
+#[test]
+fn three_consecutive_instant_deaths_park_with_chronic_reason() {
+    // adversarial review finding 3: an instant-death retry loop had no ceiling before this fix —
+    // mirroring the SpawnFailed pattern, three in a row now parks the task with the last death
+    // reason instead of retrying forever.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(1, 0), attempt: 1 }, 0, &[])],
+    );
+
+    // Death 1 (instant): re-queued, not parked yet.
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 1, status: "error".into(), error: Some("crash A".into()) }),
+        500,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo));
+
+    // Death 2 (instant): still re-queued.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(2, 1_000), attempt: 2 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 2, status: "error".into(), error: Some("crash B".into()) }),
+        1_400,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo), "2 instant deaths still retries");
+
+    // Death 3 (instant): parks with the chronic-death reason.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(3, 2_000), attempt: 3 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 3, status: "error".into(), error: Some("crash C".into()) }),
+        2_400,
+        0,
+    );
+    match &find_task(&p, "t1").state {
+        TaskState::Parked { reason: ParkReason::InstantDeath(r), .. } => {
+            assert!(r.contains("crash C"), "carries the last death reason: {r}")
+        }
+        other => panic!("expected Parked(InstantDeath), got {other:?}"),
+    }
+    assert_eq!(
+        find_task(&p, "t1").history.iter().filter(|e| e.event.starts_with("died-at-step-0")).count(),
+        3,
+        "three instant-death markers recorded"
+    );
+}
+
+#[test]
+fn instant_death_streak_resets_after_a_long_lived_attempt() {
+    // adversarial review finding 3: 2 instant deaths, then an attempt that runs a while before
+    // dying (non-instant), resets the consecutive streak — a further 2 instant deaths afterward
+    // must NOT park yet (it would take 3 more).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::OnProgress { binding: worker_binding(1, 0), attempt: 1 }, 0, &[])],
+    );
+
+    // 2 instant deaths.
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 1, status: "error".into(), error: Some("crash A".into()) }),
+        500,
+        0,
+    );
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(2, 1_000), attempt: 2 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 2, status: "error".into(), error: Some("crash B".into()) }),
+        1_400,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo));
+
+    // Attempt 3 runs a WHILE (spawned at 2_000, dies at 20_000 => 18s alive, past the 5s window)
+    // then dies -> non-instant, resets the streak.
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(3, 2_000), attempt: 3 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 3, status: "error".into(), error: Some("timeout".into()) }),
+        20_000,
+        0,
+    );
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Todo));
+    assert!(
+        find_task(&p, "t1").history.iter().any(|e| e.event.starts_with("died-after-run")),
+        "non-instant death recorded distinctly from an instant one"
+    );
+
+    // 2 MORE instant deaths after the reset must still NOT park (streak restarted at 0).
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(4, 20_500), attempt: 4 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 4, status: "error".into(), error: Some("crash C".into()) }),
+        20_900,
+        0,
+    );
+    find_task_mut(&mut p, "t1").state = TaskState::OnProgress { binding: worker_binding(5, 21_000), attempt: 5 };
+    step(
+        &mut p,
+        Input::Host(HostEvent::AgentsDone { agent_id: 5, status: "error".into(), error: Some("crash D".into()) }),
+        21_400,
+        0,
+    );
+    assert!(
+        matches!(find_task(&p, "t1").state, TaskState::Todo),
+        "streak reset by the long-lived attempt: 2 instant deaths after it still doesn't park"
+    );
+}
+
+/// Mutable task lookup for the worktree/backoff tests.
+fn find_task_mut<'a>(p: &'a mut Project, id: &str) -> &'a mut Task {
+    p.tasks.iter_mut().find(|t| t.id.0 == id).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// SDLC intake triage (feature: sdlc-triage)
+// ---------------------------------------------------------------------------
+
+/// A genuinely fresh intake project: Drafting, NO PRD and NO transcript yet, so the first office
+/// message fires the intake triage. (The shared `project()` builder seeds a non-empty PRD, which
+/// deliberately keeps the pre-triage golden-path tests undisturbed.)
+fn drafting_intake() -> Project {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = String::new();
+    p.office_transcript.clear();
+    p
+}
+
+/// A 2-task enhancement-sized breakdown (<= 3, so it lands without escalating).
+const TWO_TASK_JSON: &str = r#"{"epics":[{"slug":"e1","title":"E","intent":"i","stories":[{"slug":"s1","title":"S","intent":"i","tasks":[{"slug":"t1","title":"T1","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t2","title":"T2","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]}]}]}]}"#;
+
+/// A 4-task breakdown (> 3, so an enhancement escalates to project on it).
+const FOUR_TASK_JSON: &str = r#"{"epics":[{"slug":"e1","title":"E","intent":"i","stories":[{"slug":"s1","title":"S","intent":"i","tasks":[{"slug":"t1","title":"T1","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t2","title":"T2","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t3","title":"T3","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]},{"slug":"t4","title":"T4","description":"d","acceptance":["ok"],"priority":0,"blocked_by":[]}]}]}]}"#;
+
+#[test]
+fn first_brief_fires_triage_alongside_persona() {
+    // The FIRST message of a fresh brief fires BOTH the persona reply and ONE additional lightweight
+    // triage classifier — on the safeguard role, never the drafter model.
+    let mut p = drafting_intake();
+    p.config.drafter_model = Some("strong-drafter".to_string());
+    let fx = step(
+        &mut p,
+        Input::Command(Command::OfficeMessage { text: "add a dark-mode toggle to settings".into() }),
+        1000,
+        4,
+    );
+    let invokes = invoke_effects(&fx);
+    assert_eq!(invokes.len(), 2, "first brief fires the persona reply + the triage classifier");
+    assert!(p.triage_pending, "triage is marked in flight");
+
+    let persona = invokes
+        .iter()
+        .find(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Persona, .. }))
+        .expect("a persona invoke");
+    match persona {
+        Effect::InvokeModel { model, .. } => assert_eq!(model.as_deref(), Some("strong-drafter"), "persona takes the drafter model"),
+        _ => unreachable!(),
+    }
+    let triage = invokes
+        .iter()
+        .find(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. }))
+        .expect("a triage invoke");
+    match triage {
+        Effect::InvokeModel { role, model, .. } => {
+            assert_eq!(role, "safeguard", "triage runs on the safeguard role (a gate-family job)");
+            assert!(model.is_none(), "triage NEVER takes the drafter model");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn triage_does_not_re_fire_on_later_messages() {
+    let mut p = drafting_intake();
+    step(&mut p, Input::Command(Command::OfficeMessage { text: "first brief".into() }), 1000, 4);
+    step(&mut p, invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: project\nrationale: new build\n".into())), 1100, 4);
+    let fx = step(&mut p, Input::Command(Command::OfficeMessage { text: "a follow-up".into() }), 1200, 4);
+    assert!(
+        !invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })),
+        "triage fires only on the first message of a fresh project"
+    );
+}
+
+#[test]
+fn triage_garbage_result_defaults_track_to_project() {
+    let mut p = drafting_intake();
+    p.triage_pending = true;
+    let fx = step(&mut p, invoke_result(InvokePurpose::Triage, Ok("no triage block here".into())), 1000, 4);
+    assert_eq!(p.track, "project", "an unparseable verdict defaults to the full ceremony");
+    assert!(!p.triage_pending, "triage_pending cleared");
+    assert!(invoke_effects(&fx).is_empty(), "no board built, no doc invoke on a project default");
+    assert!(p.tasks.is_empty());
+}
+
+#[test]
+fn triage_error_result_defaults_track_to_project() {
+    let mut p = drafting_intake();
+    p.triage_pending = true;
+    step(&mut p, invoke_result(InvokePurpose::Triage, Err("model call timed out".into())), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert!(!p.triage_pending);
+}
+
+#[test]
+fn persona_capture_suppressed_while_triage_pending() {
+    // A ```prd fence that arrives while triage is still in flight is NOT captured (the track — which
+    // decides the contract — is not yet known); it only flows to chat.
+    let mut p = drafting_intake();
+    p.triage_pending = true;
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# App\n```".into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty(), "no PRD captured while triage pending");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "no pipeline kicked off");
+    assert!(!invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeCheckPrd, .. })));
+}
+
+// ---- PATCH track ----------------------------------------------------------
+
+#[test]
+fn triage_patch_builds_one_task_board_with_zero_doc_invokes() {
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "fix the typo in the footer copyright year".into() });
+    p.triage_pending = true;
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: patch\nrationale: tiny fix\n".into())),
+        1000,
+        4,
+    );
+    assert_eq!(p.track, "patch");
+    assert_eq!(p.phase, ProjectPhase::Ready, "patch goes straight to Ready");
+    assert_eq!(p.tasks.len(), 1, "one task built programmatically");
+    assert!(matches!(p.tasks[0].state, TaskState::Todo));
+    assert!(p.tasks[0].description.contains("footer copyright"), "the brief text IS the task description");
+    assert_eq!(p.epics.len(), 1);
+    assert_eq!(p.stories.len(), 1);
+    // The whole point: ZERO model invokes for a patch — no persona/PRD/TRD/CRD/breakdown round.
+    assert!(invoke_effects(&fx).is_empty(), "patch builds the board with NO model invokes");
+    assert!(p.outbox.iter().any(|n| n.text.contains("board is ready")));
+}
+
+#[test]
+fn patch_completion_skips_the_final_audit() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("proj/patch/change/apply", TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 1 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    p.crd_markdown = String::new();
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: pass\n".into() }), 1000, 4);
+    assert!(matches!(p.phase, ProjectPhase::Done { .. }), "a patch completes directly on the review pass");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "no clean-build audit for a patch — merge review is the gate");
+    assert!(p.trace.iter().any(|e| e.summary == "audit skipped (patch track)"));
+}
+
+#[test]
+fn patch_second_bounce_escalates_to_enhancement_and_redispatches() {
+    // capacity 0 so the dispatch scan does not immediately re-dispatch the escalated task.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("proj/patch/change/apply", TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 2 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    p.tasks[0].bounces = 1; // already bounced once
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: fail\nreasons: still broken\n".into() }), 1000, 0);
+    assert_eq!(p.tasks[0].bounces, 2, "the second bounce");
+    assert_eq!(p.track, "enhancement", "a patch that bounces twice escalates to enhancement");
+    assert!(p.trace.iter().any(|e| e.summary == "escalating patch → enhancement"));
+    assert!(matches!(p.tasks[0].state, TaskState::Todo), "re-dispatched, not parked");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Spawn { .. })), "capacity 0 -> not re-spawned this tick");
+}
+
+// ---- ENHANCEMENT track ----------------------------------------------------
+
+#[test]
+fn enhancement_change_brief_gate_then_small_breakdown() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    // The persona emits a ```change change-brief -> captured into the PRD slot, ONE gate, no TRD/CRD.
+    let reply = "Sure.\n```change\nCurrent behavior: none.\nDesired behavior: dark mode.\nAcceptance criteria: it persists.\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.prd_markdown.contains("Desired behavior"), "the change-brief takes the PRD doc-slot");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "exactly ONE gate over the change-brief");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::TrdCrd, .. })), "the TRD/CRD trio is SKIPPED");
+
+    // Gate clean + well-known -> skip research -> small breakdown starts + minimal CRD generated.
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\nwell-known: yes\n".into())), 1100, 4);
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::Breakdown, "enhancement goes straight to a small breakdown");
+    assert!(!p.crd_markdown.trim().is_empty(), "a minimal hygiene CRD was generated (no separate invoke)");
+    match invoke_effects(&fx2)[0] {
+        Effect::InvokeModel { prompt, .. } => assert!(prompt.contains("SMALL SCOPE"), "the breakdown prompt caps at 1-3 tasks"),
+        _ => unreachable!(),
+    }
+
+    // A small breakdown lands the board -> Ready.
+    let fx3 = step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(TWO_TASK_JSON.into())), 1200, 4);
+    assert_eq!(p.phase, ProjectPhase::Ready);
+    assert_eq!(p.tasks.len(), 2);
+    assert!(invoke_effects(&fx3).is_empty());
+}
+
+#[test]
+fn enhancement_escalates_to_project_on_too_many_assumptions() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# Change\nadd stuff".into();
+    // Enumerate surfaces 5 material assumptions (> N=4) -> escalate to project; the gate continues.
+    let enumerate = "ASSUME-CHECK\nverdict: assumptions\nwell-known: yes\n- [auto] a\n- [auto] b\n- [auto] c\n- [auto] d\n- [auto] e\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(enumerate.into())), 1000, 4);
+    assert_eq!(p.track, "project", "> 4 assumptions is wider than a change -> full project");
+    assert!(p.trace.iter().any(|e| e.summary == "escalating enhancement → project"));
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeVerify, "the gate finishes normally");
+
+    // Verify clean -> the escalated project authors the full TRD+CRD (which enhancement would skip).
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::AssumeVerify, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1100, 4);
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::TrdCrd, "escalated project authors TRD+CRD");
+}
+
+#[test]
+fn enhancement_escalates_to_project_on_oversized_breakdown() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# Change".into();
+    p.gate_cleared = true;
+    p.crd_markdown = crate::office::minimal_hygiene_crd(); // the placeholder enhancement CRD
+    let fx = step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(FOUR_TASK_JSON.into())), 1000, 4);
+    assert_eq!(p.track, "project", "a > 3-task breakdown is wider than a change");
+    assert!(p.trace.iter().any(|e| e.summary == "escalating enhancement → project"));
+    assert!(p.crd_markdown.is_empty(), "the placeholder CRD is cleared for the real ceremony");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "authors the full TRD+CRD");
+    assert!(p.tasks.is_empty(), "the oversized plan was discarded, board not built");
+    assert_eq!(p.phase, ProjectPhase::Drafting, "stays Drafting for the full ceremony");
+}
+
+// ---- override + door guards ----------------------------------------------
+
+#[test]
+fn override_retriages_enhancement_to_project_in_drafting() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::Office, text: "```change\nCurrent: none\nDesired: stuff\n```".into() });
+    p.prd_markdown = "# change-brief\nstuff".into();
+    p.crd_markdown = crate::office::minimal_hygiene_crd();
+    p.gate_cleared = true;
+    let fx = step(&mut p, Input::Command(Command::OfficeMessage { text: "actually, make it a full project".into() }), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert!(p.crd_markdown.is_empty(), "the light-track CRD placeholder is cleared");
+    assert!(!p.gate_cleared, "the gate is reset for the full ceremony");
+    // Review finding (MINOR, soft-stall fix): the `prd_markdown` SLOT is cleared (not kept) so the
+    // capture-miss nudge machinery re-arms for a fresh full PRD; the change-brief TEXT itself is
+    // still readable by the persona from `office_transcript`, untouched by retriage.
+    assert!(p.prd_markdown.trim().is_empty(), "the change-brief slot is cleared, awaiting a full PRD");
+    assert!(
+        p.office_transcript.iter().any(|m| m.text.contains("Desired: stuff")),
+        "the change-brief text itself stays in the transcript as carried context"
+    );
+    assert!(p.trace.iter().any(|e| e.summary == "retriage: change-brief cleared, awaiting full PRD"));
+    assert!(p.trace.iter().any(|e| e.summary == "re-triaged to project (user override)"));
+    assert!(fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Persona, .. })), "the message still drives a persona reply");
+    assert!(!fx.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })), "no re-triage (triage only ever fires on a truly fresh, empty transcript)");
+}
+
+#[test]
+fn override_from_ready_clears_prd_slot_and_rearms_capture_nudge() {
+    // Review finding (MINOR): override-from-Ready soft-stall — retriage used to KEEP the change-brief
+    // in `prd_markdown`, so the capture-miss nudge (guarded on the slot being EMPTY) never re-armed;
+    // if the project-track persona just chatted instead of emitting a fresh ```prd fence, the gate
+    // never re-ran. Fixed: the slot is cleared on retriage, so a fenceless reply nudges again.
+    let mut p = project(ProjectPhase::Ready, vec![task("proj/e/change/apply", TaskState::Todo, 0, &[])]);
+    p.track = "enhancement".to_string();
+    // A project that already reached Ready has a real prior conversation — seed one turn so this
+    // message is not mistaken for a fresh intake (the `project()` builder otherwise starts with an
+    // empty transcript, which would spuriously re-fire the ONE-SHOT intake triage).
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::Office, text: "```change\nCurrent: none\nDesired: old scope\n```".into() });
+    p.prd_markdown = "# change-brief\nold enhancement scope".into();
+    p.crd_markdown = crate::office::minimal_hygiene_crd();
+    p.gate_cleared = true;
+    p.capture_nudge_count = 0;
+    let fx0 = step(&mut p, Input::Command(Command::OfficeMessage { text: "make it a full project".into() }), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert_eq!(p.phase, ProjectPhase::Drafting, "a Ready light track regresses to Drafting");
+    assert!(p.prd_markdown.trim().is_empty(), "prd_markdown slot cleared on retriage");
+    assert!(p.trace.iter().any(|e| e.summary == "retriage: change-brief cleared, awaiting full PRD"));
+    assert!(!p.triage_pending, "no fresh intake triage — this project already had a conversation");
+    assert!(
+        !fx0.iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Triage, .. })),
+        "no re-triage on an override"
+    );
+
+    // A long fenceless persona reply now nudges (the slot is empty again), instead of the gate
+    // staying wedged with a stale non-empty prd_markdown.
+    let long_reply = format!("Here is my detailed product thinking. {}", "detail. ".repeat(80));
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(long_reply)), 1100, 4);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Persona, "the capture-miss nudge re-fires a persona invoke");
+    assert!(p.trace.iter().any(|e| e.kind == "nudge"), "capture-miss nudge fired");
+}
+
+#[test]
+fn override_from_ready_regresses_a_patch_to_drafting() {
+    let mut p = project(ProjectPhase::Ready, vec![task("proj/patch/change/apply", TaskState::Todo, 0, &[])]);
+    p.track = "patch".to_string();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "fix a thing".into() });
+    step(&mut p, Input::Command(Command::OfficeMessage { text: "make it a project".into() }), 1000, 4);
+    assert_eq!(p.track, "project");
+    assert_eq!(p.phase, ProjectPhase::Drafting, "a Ready light track regresses to Drafting");
+    assert!(p.tasks.is_empty(), "the patch board is cleared for re-drafting");
+}
+
+#[test]
+fn override_never_touches_a_running_project() {
+    // Pre-authorize only: a Running project ignores the override intent (track locked in).
+    let mut p = project(ProjectPhase::Running, vec![task("proj/e/s/t", TaskState::Todo, 0, &[])]);
+    p.track = "enhancement".to_string();
+    step(&mut p, Input::Command(Command::OfficeMessage { text: "make it a project".into() }), 1000, 0);
+    assert_eq!(p.track, "enhancement", "the track is locked once Running");
+    assert!(matches!(p.phase, ProjectPhase::Running));
+}
+
+#[test]
+fn workflow_approve_advances_the_enhancement_gate() {
+    // The change-brief is the only doc the user approves; approval advances the PostPrd join to the
+    // enhancement small breakdown (NOT the TRD/CRD trio).
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# change-brief".into();
+    p.pending_assumptions = vec!["assumed a datastore".into()];
+    let fx = step(&mut p, Input::Command(Command::ApproveAssumptions), 1000, 4);
+    assert!(p.pending_assumptions.is_empty(), "approval clears the change-brief assumptions");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "enhancement approval -> small breakdown");
+    assert!(!p.crd_markdown.trim().is_empty(), "the minimal CRD is generated on advance");
+}
+
+#[test]
+fn workflow_breakdown_works_on_enhancement_and_stays_small() {
+    let mut p = drafting_intake();
+    p.track = "enhancement".to_string();
+    p.prd_markdown = "# change".into();
+    p.gate_cleared = true;
+    let fx = step(&mut p, Input::Command(Command::RequestBreakdown), 1000, 4);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown);
+    match invoke_effects(&fx)[0] {
+        Effect::InvokeModel { prompt, .. } => assert!(prompt.contains("SMALL SCOPE"), "workflow_breakdown honors the enhancement cap"),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn project_golden_path_unchanged_by_triage() {
+    // The project track (default) is byte-for-byte the pre-feature flow: a ```prd fence captures,
+    // spawns research (always mode), and runs the PRD gate — NO extra invokes from the triage plumbing.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "always".to_string();
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# App\nBuild it.\n```".into())), 1000, 4);
+    assert_eq!(p.prd_markdown, "# App\nBuild it.");
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research spawns");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "the PRD gate fires — unchanged");
+    assert_eq!(p.track, "project", "the default track is project");
+}
+
+// ---- persona-first race (review finding, MAJOR) ---------------------------
+//
+// The first message fires the triage classifier AND the persona invoke CONCURRENTLY. These tests
+// simulate the persona reply landing FIRST (while `triage_pending` is still true, so the Persona
+// capture path suppresses capture) and assert the doc is RECOVERED — not dropped — once the triage
+// verdict resolves the track.
+
+#[test]
+fn triage_race_recovers_prd_captured_by_a_persona_reply_that_beat_the_verdict() {
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "build a thing".into() });
+    p.triage_pending = true;
+
+    // The persona reply lands FIRST, carrying the fenced PRD, while triage is still in flight.
+    let reply = "Sure, here's the plan.\n```prd\n# App\nBuild it.\n```";
+    let fx1 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty(), "capture suppressed while triage is still pending");
+    assert!(invoke_effects(&fx1).is_empty(), "nothing captured yet -> no gate/research invoke");
+    assert!(
+        p.office_transcript.iter().any(|m| matches!(m.who, ChatAuthor::Office) && m.text.contains("```prd")),
+        "the reply still lands in the transcript regardless of triage state"
+    );
+
+    // The triage verdict arrives afterward, resolving the track to "project".
+    let fx2 = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: project\nrationale: new build\n".into())),
+        1100,
+        4,
+    );
+    assert_eq!(p.track, "project");
+    assert_eq!(p.prd_markdown, "# App\nBuild it.", "the raced PRD is recovered, not dropped");
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::AssumeCheckPrd, "the PRD gate fired on the recovered doc");
+    assert!(p.trace.iter().any(|e| e.summary.contains("triage race")), "the recovery is traced");
+}
+
+#[test]
+fn triage_race_recovers_change_brief_captured_by_a_persona_reply_that_beat_the_verdict() {
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "add a small toggle".into() });
+    p.triage_pending = true;
+
+    let reply = "Sure.\n```change\nCurrent behavior: none.\nDesired behavior: a toggle.\nAcceptance criteria: it persists.\n```";
+    let fx1 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty(), "capture suppressed while triage is still pending");
+    assert!(invoke_effects(&fx1).is_empty());
+
+    let fx2 = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: enhancement\nrationale: small change\n".into())),
+        1100,
+        4,
+    );
+    assert_eq!(p.track, "enhancement");
+    assert!(p.prd_markdown.contains("Desired behavior"), "the raced change-brief is recovered");
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::AssumeCheckPrd, "the change-brief gate fired on the recovered doc");
+    assert!(p.trace.iter().any(|e| e.summary.contains("triage race")));
+}
+
+#[test]
+fn triage_race_patch_verdict_ignores_any_raced_persona_reply() {
+    // Patch never captures a doc, so a persona reply that raced ahead — even one carrying a fence —
+    // must not be scanned or captured once the verdict resolves to "patch"; the board still builds
+    // programmatically with zero doc invokes, unchanged.
+    let mut p = drafting_intake();
+    p.office_transcript.push(ChatMsg { who: ChatAuthor::User, text: "fix the footer typo".into() });
+    p.triage_pending = true;
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# not actually a project\n```".into())), 1000, 4);
+    assert!(p.prd_markdown.trim().is_empty());
+
+    let fx = step(
+        &mut p,
+        invoke_result(InvokePurpose::Triage, Ok("SDLC-TRIAGE\ntrack: patch\nrationale: tiny fix\n".into())),
+        1100,
+        4,
+    );
+    assert_eq!(p.track, "patch");
+    assert_eq!(p.phase, ProjectPhase::Ready, "patch board still builds straight to Ready");
+    assert_eq!(p.tasks.len(), 1);
+    assert!(p.prd_markdown.trim().is_empty(), "patch never captures a doc, race or not");
+    assert!(invoke_effects(&fx).is_empty(), "no gate invoke for patch");
+}
+
+// ---- escalated patch gains completion ceremony (review finding, MINOR) ----
+
+#[test]
+fn escalated_patch_generates_hygiene_crd_and_audits_on_completion() {
+    // An escalated patch (track flipped "patch" -> "enhancement" on its 2nd bounce) used to complete
+    // with ZERO ceremony: `maybe_complete_project` fell through the `track == "patch"` skip (track is
+    // no longer "patch") AND the CRD-gated audit (crd_markdown stayed empty). Fixed: the escalation
+    // site now generates the same minimal hygiene CRD the enhancement track would have, so completion
+    // audits for real.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("proj/patch/change/apply", TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 2 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    p.crd_markdown = String::new();
+    p.tasks[0].bounces = 1; // already bounced once
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: fail\nreasons: still broken\n".into() }), 1000, 0);
+    assert_eq!(p.track, "enhancement", "the second bounce escalates");
+    assert!(!p.crd_markdown.trim().is_empty(), "a minimal hygiene CRD was generated at escalation");
+    assert!(p.trace.iter().any(|e| e.summary == "escalation: minimal hygiene CRD generated for completion audit"));
+
+    // The re-dispatched task eventually passes review; completion must audit against the hygiene CRD
+    // instead of silently skipping it.
+    p.tasks[0].state = TaskState::Review { binding: Some(reviewer_binding(9, 1)), attempt: 3 };
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-REVIEW\nverdict: pass\nreasons: fixed\n".into() }), 1200, 4);
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "completion audits against the hygiene CRD instead of skipping");
+    assert!(matches!(p.phase, ProjectPhase::Running), "still Running — the audit gates Done, not an immediate completion");
+}
+
+// ---------------------------------------------------------------------------
+// Sprints (feature: sprints)
+// ---------------------------------------------------------------------------
+
+fn sprint(goal: &str, tasks: &[&str], status: SprintStatus) -> Sprint {
+    Sprint {
+        goal: goal.to_string(),
+        tasks: tasks.iter().map(|t| TaskId(t.to_string())).collect(),
+        status,
+        transcript: Vec::new(),
+    }
+}
+
+fn count_invokes(fx: &[Effect], want: InvokePurpose) -> usize {
+    fx.iter()
+        .filter(|e| matches!(e, Effect::InvokeModel { purpose, .. } if *purpose == want))
+        .count()
+}
+
+fn sprint_review_result(text: &str) -> Input {
+    Input::Command(Command::InvokeResult {
+        purpose: InvokePurpose::SprintReview,
+        outcome: Ok(text.to_string()),
+    })
+}
+
+#[test]
+fn sprint_dispatch_scoped_to_active_sprint() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Todo, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["t2"], SprintStatus::Pending),
+    ];
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(count_spawns(&fx), 1, "only the active sprint's task dispatches");
+    assert!(matches!(find_task(&p, "t1").state, TaskState::OnProgress { .. }));
+    assert!(matches!(find_task(&p, "t2").state, TaskState::Todo), "the pending sprint's task waits");
+}
+
+#[test]
+fn empty_sprints_dispatch_all_tasks_globally() {
+    // No sprints (patch / old state) -> the legacy global dispatch, unchanged.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Todo, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(count_spawns(&fx), 2, "empty sprints -> both tasks dispatch as before");
+}
+
+#[test]
+fn sprint_settles_and_opens_review_with_one_invoke() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS.into() }), 1000, 4);
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Done { .. }));
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview, "the settled sprint enters review");
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1, "EXACTLY one ceremony invoke");
+    assert!(matches!(p.phase, ProjectPhase::Running), "SprintReview is a sub-state of Running");
+}
+
+#[test]
+fn sprint_review_transcript_from_real_task_reports() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    p.tasks[0].last_report =
+        Some("OFFICE-REPORT\nstatus: complete\nsummary: wired the ingest pipeline\n".to_string());
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS.into() }), 1000, 4);
+    let tr = &p.sprints[0].transcript;
+    assert!(tr.iter().any(|l| l.line.contains("wired the ingest pipeline")), "worker line from the REAL report");
+    assert!(tr.iter().any(|l| l.speaker == "reviewer"), "a reviewer stats line is present");
+    assert!(tr.iter().any(|l| l.speaker == "researcher"), "the researcher observes silently");
+}
+
+#[test]
+fn sprint_review_carries_parked_task_into_next_sprint() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("t2", TaskState::Parked { reason: ParkReason::ReviewBounceBudget, attempt: 3 }, 0, &[]),
+            task("t3", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1", "t2"], SprintStatus::Active),
+        sprint("s2", &["t3"], SprintStatus::Pending),
+    ];
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1);
+
+    step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: done\n"), 1100, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Done);
+    assert_eq!(p.sprints[1].status, SprintStatus::Active, "the next sprint activates");
+    assert!(p.sprints[1].tasks.contains(&TaskId("t2".to_string())), "the parked task carried over");
+    assert!(!p.sprints[0].tasks.contains(&TaskId("t2".to_string())), "and left the closed sprint");
+}
+
+#[test]
+fn last_sprint_zero_carryover_finish_fires_audit() {
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.crd_markdown = "# CRD\n- README (100)".into();
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+
+    let fx1 = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+    assert!(!fx1.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "the audit waits for the review");
+
+    let fx2 = step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: shipped\n"), 1100, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Done);
+    assert!(fx2.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })), "the final audit fires after the LAST sprint");
+    assert!(matches!(p.phase, ProjectPhase::Running), "the audit gates Done");
+}
+
+#[test]
+fn sprint_review_pm_adjustments_add_and_drop_next_sprint_tasks() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("proj/s2/keep", TaskState::Todo, 0, &[]),
+            task("proj/s2/drop-me", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["proj/s2/keep", "proj/s2/drop-me"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle s1 -> review
+
+    let plan = "SPRINT-REVIEW\nsummary: reprioritize\nadjustments:\n- drop drop-me\n- add fresh work | build the new thing\n";
+    step(&mut p, sprint_review_result(plan), 1100, 4);
+
+    assert!(!p.tasks.iter().any(|t| t.id.0 == "proj/s2/drop-me"), "dropped task removed from the board");
+    assert!(!p.sprints[1].tasks.iter().any(|t| t.0 == "proj/s2/drop-me"), "and from the sprint");
+    assert!(p.tasks.iter().any(|t| t.id.0.contains("/added/") && t.title.contains("fresh work")), "added task on the board");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0.contains("/added/")), "and in the sprint");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "proj/s2/keep"), "the kept task remains");
+}
+
+#[test]
+fn sprint_review_garbage_result_carries_over_only() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("t2", TaskState::Parked { reason: ParkReason::WorkerBlocked("x".into()), attempt: 1 }, 0, &[]),
+            task("keep", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1", "t2"], SprintStatus::Active),
+        sprint("s2", &["keep"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    // A result with no SPRINT-REVIEW block -> no adjustments; carry-overs still move.
+    step(&mut p, sprint_review_result("the office said nothing parseable"), 1100, 4);
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "t2"), "parked task carried over despite garbage");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "keep"), "no task dropped");
+    assert_eq!(p.sprints[1].tasks.len(), 2);
+}
+
+#[test]
+fn sprint_review_errored_invoke_carries_over_only() {
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("keep", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["keep"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    let err = Input::Command(Command::InvokeResult {
+        purpose: InvokePurpose::SprintReview,
+        outcome: Err("model call timed out".to_string()),
+    });
+    step(&mut p, err, 1100, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Done, "the ceremony still finishes on an error");
+    assert_eq!(p.sprints[1].status, SprintStatus::Active);
+}
+
+#[test]
+fn sprint_review_emits_git_tag_in_worktree_mode() {
+    let mut p = worktree_project(vec![task("t1", TaskState::Review { binding: None, attempt: 1 }, 0, &[])]);
+    p.tasks[0].awaiting_merge = true; // the reviewer passed; the merge is landing
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    let fx = step(&mut p, Input::Host(HostEvent::DeskMerged { task: TaskId("t1".to_string()) }), 1000, 4);
+    assert!(matches!(find_task(&p, "t1").state, TaskState::Done { .. }));
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::TagSprint { tag, .. } if tag == "sprint-1")),
+        "the delivery repo is tagged sprint-1 after the sprint's last merge"
+    );
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1);
+}
+
+#[test]
+fn interrupt_during_sprint_review_kills_nothing_and_resume_re_enters() {
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::Active)];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // -> InReview + one invoke fired
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+
+    let fx_int = step(&mut p, Input::Command(Command::Interrupt { hard: true }), 1100, 4);
+    assert!(!fx_int.iter().any(|e| matches!(e, Effect::Kill { .. })), "no live agent to kill during a review");
+    assert!(matches!(p.phase, ProjectPhase::Interrupted));
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview, "the review is remembered across the interrupt");
+
+    let fx_res = step(&mut p, Input::Command(Command::Resume), 1200, 4);
+    assert!(matches!(p.phase, ProjectPhase::Running));
+    assert_eq!(count_invokes(&fx_res, InvokePurpose::SprintReview), 1, "the ceremony re-enters cleanly on resume");
+}
+
+#[test]
+fn empty_sprints_completes_via_legacy_flow_with_no_ceremony() {
+    // Patch track / old state: no sprints -> the legacy all-Done completion, no ceremony invoke.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Review { binding: Some(reviewer_binding(3, 0)), attempt: 1 }, 0, &[])],
+    );
+    p.track = "patch".to_string();
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 3, text: REVIEW_PASS.into() }), 1000, 4);
+    assert!(matches!(p.phase, ProjectPhase::Done { .. }), "no CRD + no sprints -> completes immediately");
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 0, "no ceremony for the legacy flow");
+}
+
+#[test]
+fn last_sprint_parked_carryover_halts_via_trailing_sprint() {
+    // The single sprint settles with a parked task; its review opens a trailing sprint that is
+    // immediately stuck -> the project HALTS (breaking any infinite-ceremony loop).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("t2", TaskState::Parked { reason: ParkReason::ReviewBounceBudget, attempt: 3 }, 0, &[]),
+        ],
+    );
+    p.sprints = vec![sprint("s1", &["t1", "t2"], SprintStatus::Active)];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::InReview);
+
+    step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: x\n"), 1100, 4);
+    assert_eq!(p.sprints.len(), 2, "a trailing sprint opened for the lone carry-over");
+    assert!(p.sprints[1].tasks.iter().any(|t| t.0 == "t2"));
+    assert!(matches!(p.phase, ProjectPhase::Halted { .. }), "the stuck trailing sprint halts — no loop");
+}
+
+#[test]
+fn sprint_review_feeds_transcript_into_research_notes() {
+    // item 4: the sprint-review transcript + PM summary are folded into research_notes (capped).
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[]), task("keep", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["keep"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle -> review
+    step(&mut p, sprint_review_result("SPRINT-REVIEW\nsummary: pipeline shipped\n"), 1100, 4);
+    assert!(p.research_notes.contains("Sprint 1 review"), "the transcript header is fed into research_notes");
+    assert!(p.research_notes.contains("pipeline shipped"), "including the PM summary line");
+}
+
+// ---------------------------------------------------------------------------
+// Sprint review self-heal (review finding, CRITICAL): a daemon restart mid-ceremony strands the
+// project with `dispatch_scope` returning `Scope::None`. `sprint_review_invoke_live` is the
+// process-boundary hint (mirrors `gate_invoke_live_hint`); `Reconcile` re-arms it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stranded_sprint_review_rearms_on_reconcile_after_reload() {
+    // (a) A serde round-trip resets the `#[serde(skip)]` hint to `false` regardless of what it was
+    // before — exactly the "process boundary" a daemon restart mid-ceremony produces. The next
+    // Reconcile must re-arm the ceremony with EXACTLY one fresh invoke.
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::InReview)];
+    p.sprint_review_invoke_live = true; // as if a review invoke WAS in flight when this was saved
+
+    let json = serde_json::to_string(&p).expect("serialize");
+    let mut reloaded: Project = serde_json::from_str(&json).expect("deserialize");
+    assert!(!reloaded.sprint_review_invoke_live, "the skip field never round-trips through disk");
+
+    let fx = step(&mut reloaded, Input::Host(HostEvent::Reconcile), 5000, 4);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1, "exactly one re-armed invoke");
+    assert_eq!(reloaded.sprints[0].status, SprintStatus::InReview, "still under review");
+    assert!(
+        reloaded.trace.iter().any(|e| e.summary.contains("re-armed")),
+        "the re-arm is traced"
+    );
+}
+
+#[test]
+fn live_sprint_review_invoke_not_rearmed_on_reconcile() {
+    // (b) A genuinely in-flight invoke (this process fired it, no reload happened) must NOT be
+    // duplicated by the Reconcile self-heal.
+    let mut p = project(ProjectPhase::Running, vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[])]);
+    p.sprints = vec![sprint("s1", &["t1"], SprintStatus::InReview)];
+    p.sprint_review_invoke_live = true;
+    let fx = step(&mut p, Input::Host(HostEvent::Reconcile), 5000, 4);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 0, "no re-fire while genuinely in flight");
+}
+
+#[test]
+fn sprint_review_invoke_error_clears_hint_and_reconcile_rearms() {
+    // (c) The hint clears on the ERROR arm exactly like the success arm — both converge in
+    // `finish_sprint_review`. A later ceremony stranded in the SAME (InReview, hint=false) shape
+    // (however it got there — the hint is never persisted, so a restart always produces it) still
+    // gets re-armed by Reconcile; the self-heal is not special-cased to a fresh reload.
+    // A second (Pending) sprint keeps the project Running (not completed) after the first errors,
+    // so it stays a valid target for the Reconcile self-heal below.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Done { at_ms: 1 }, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["t2"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle -> InReview, one invoke fired
+    assert!(p.sprint_review_invoke_live, "fire_sprint_review marks the invoke live");
+
+    let err = Input::Command(Command::InvokeResult {
+        purpose: InvokePurpose::SprintReview,
+        outcome: Err("model call timed out".to_string()),
+    });
+    step(&mut p, err, 1100, 4);
+    assert!(!p.sprint_review_invoke_live, "the error arm clears the hint exactly like success");
+    assert_eq!(p.sprints[0].status, SprintStatus::Done, "the ceremony still completes on error");
+    assert!(matches!(p.phase, ProjectPhase::Running));
+
+    // Simulate a later ceremony stranded in the identical (InReview, hint=false) shape.
+    p.sprints[1].status = SprintStatus::InReview;
+    let fx = step(&mut p, Input::Host(HostEvent::Reconcile), 1200, 4);
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 1, "reconcile re-arms it");
+    assert!(p.trace.iter().any(|e| e.summary.contains("re-armed")));
+}
+
+// ---------------------------------------------------------------------------
+// PM Drop strands dependents / empty Active sprint stalls (review finding, MAJOR)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sprint_pm_drop_strips_dangling_blocker_from_dependents() {
+    // A `drop` adjustment used to leave the dropped id dangling in a dependent's `blocked_by` —
+    // never "done" (`graph::ready_set`) and never "poisoned" (`graph::line_is_stuck` treats a
+    // missing blocker as NOT poisoned) — so the dependent waited forever with no halt signal.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("proj/s2/drop-me", TaskState::Todo, 0, &[]),
+            task("proj/s2/dependent", TaskState::Todo, 0, &["proj/s2/drop-me"]),
+        ],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["proj/s2/drop-me", "proj/s2/dependent"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle s1 -> review
+
+    let plan = "SPRINT-REVIEW\nsummary: reprioritize\nadjustments:\n- drop drop-me\n";
+    step(&mut p, sprint_review_result(plan), 1100, 4);
+
+    assert!(!p.tasks.iter().any(|t| t.id.0 == "proj/s2/drop-me"), "dropped task removed from the board");
+    let dependent = find_task(&p, "proj/s2/dependent");
+    assert!(dependent.blocked_by.is_empty(), "the dangling blocker was stripped");
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("stripped dangling blocker")),
+        "the strip is traced"
+    );
+}
+
+#[test]
+fn sprint_pm_drop_all_next_tasks_with_zero_carryover_auto_closes_empty_sprint() {
+    // Dropping every one of the next sprint's planned tasks (with zero carry-overs from the closing
+    // sprint) used to leave that sprint `Active` with an empty task list — it can never "settle" its
+    // way to a ceremony invoke (nothing running, nothing ready), so the project silently stalled.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![
+            task("t1", TaskState::Done { at_ms: 1 }, 0, &[]),
+            task("proj/s2/only", TaskState::Todo, 0, &[]),
+        ],
+    );
+    p.crd_markdown = "# CRD\n- README (100)".into();
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["proj/s2/only"], SprintStatus::Pending),
+    ];
+    step(&mut p, Input::Host(HostEvent::Tick), 1000, 4); // settle s1 -> review
+
+    let plan = "SPRINT-REVIEW\nsummary: descope\nadjustments:\n- drop only\n";
+    let fx = step(&mut p, sprint_review_result(plan), 1100, 4);
+
+    assert_eq!(p.sprints[0].status, SprintStatus::Done);
+    assert_eq!(p.sprints[1].status, SprintStatus::Done, "the now-empty sprint auto-closes");
+    assert_eq!(count_invokes(&fx, InvokePurpose::SprintReview), 0, "no ceremony invoke for an empty sprint");
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("empty sprint auto-closed")),
+        "the auto-close is traced"
+    );
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::SpawnAudit { .. })),
+        "the project proceeds to completion (audit) instead of stalling"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ensure_active_sprint two-Active self-heal (review finding, MINOR)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ensure_active_sprint_demotes_extra_active_sprints_keeping_lowest_index() {
+    // The mirror-image of the zero-Active self-heal — TWO sprints somehow Active at once (bad data
+    // / an old race). Keep the lowest-index one, demote the rest to Pending.
+    let mut p = project(
+        ProjectPhase::Running,
+        vec![task("t1", TaskState::Todo, 0, &[]), task("t2", TaskState::Todo, 0, &[])],
+    );
+    p.sprints = vec![
+        sprint("s1", &["t1"], SprintStatus::Active),
+        sprint("s2", &["t2"], SprintStatus::Active),
+    ];
+    let fx = step(&mut p, Input::Host(HostEvent::Tick), 1000, 4);
+    assert_eq!(p.sprints[0].status, SprintStatus::Active, "the lowest-index sprint stays Active");
+    assert_eq!(p.sprints[1].status, SprintStatus::Pending, "the extra Active sprint is demoted");
+    assert_eq!(count_spawns(&fx), 1, "dispatch now scopes cleanly to the single Active sprint");
+    assert!(matches!(find_task(&p, "t1").state, TaskState::OnProgress { .. }));
+    assert!(matches!(find_task(&p, "t2").state, TaskState::Todo));
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("demoted to Pending")),
+        "the demotion is traced"
+    );
 }

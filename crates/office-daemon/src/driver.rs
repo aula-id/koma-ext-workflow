@@ -22,9 +22,9 @@
 //! W7, so the effect arm here is a documented no-op).
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use koma_extension::Koma;
 use office_core::digest::{context_blob, panel_snapshot_with_activity, OfficeActivity};
@@ -281,6 +281,13 @@ pub struct Driver<H: Host> {
     invoke_in_flight: usize,
     /// Monotonic invoke request id source.
     next_req_id: u64,
+    /// The `git` binary wrapper for worktree desks (item 1), injectable via `set_git_bin` for tests.
+    git: crate::git::Git,
+    /// One mutex PER delivery repo (item 1): every worktree git op-sequence locks its repo's mutex,
+    /// so `git` never runs concurrently on the same repo. The tick loop is single-threaded so this
+    /// is belt-and-suspenders today, but it keeps the "serialized per repo" invariant explicit and
+    /// future-proof.
+    git_gate: HashMap<PathBuf, Arc<Mutex<()>>>,
 }
 
 impl<H: Host> Driver<H> {
@@ -315,7 +322,15 @@ impl<H: Host> Driver<H> {
             invoke_queue: VecDeque::new(),
             invoke_in_flight: 0,
             next_req_id: 0,
+            git: crate::git::Git::new("git"),
+            git_gate: HashMap::new(),
         })
+    }
+
+    /// Override the `git` binary used for worktree desks (item 1). Tests point it at a nonexistent
+    /// path to exercise the legacy fallback, or at a stub; production keeps the default `"git"`.
+    pub fn set_git_bin(&mut self, bin: impl Into<String>) {
+        self.git = crate::git::Git::new(bin);
     }
 
     /// Install the off-loop invoke pool (production `ThreadInvoker`, or a test fake). The
@@ -349,6 +364,17 @@ impl<H: Host> Driver<H> {
                 .ok()
                 .flatten();
             self.projects[i].lease = lease;
+        }
+
+        // Seed the extension workspace root onto every loaded project (item 1): task desks live
+        // under ~/.koma-workflow (the store root), never the user's session workspace. Pre-feature
+        // state files persisted it `None`; refresh it in-memory so dispatch resolves the right desk
+        // root (it persists on the next state write).
+        let root = self.store.root_dir().to_path_buf();
+        for o in &mut self.projects {
+            if o.project.workflow_home.is_none() {
+                o.project.workflow_home = Some(root.clone());
+            }
         }
 
         // Seed the PRD cache so inline `prd_get` replies work immediately.
@@ -753,6 +779,16 @@ impl<H: Host> Driver<H> {
         for fx in effects {
             match fx {
                 Effect::EnsureDesk { dir, .. } => self.ensure_desk(&dir),
+                Effect::MergeDesk {
+                    task,
+                    repo,
+                    desk,
+                    branch,
+                } => self.exec_merge_desk(idx, task, repo, desk, branch, now_ms),
+                Effect::RemoveDesk { repo, desk, branch } => {
+                    self.exec_remove_desk(&repo, &desk, &branch)
+                }
+                Effect::TagSprint { repo, tag } => self.exec_tag_sprint(&repo, &tag),
                 Effect::Spawn {
                     task,
                     prompt,
@@ -819,6 +855,23 @@ impl<H: Host> Driver<H> {
         model: Option<String>,
         now_ms: u64,
     ) -> SpawnOutcome {
+        // Worktree desks (item 1): a WORKER spawn first materializes a FRESH git worktree on
+        // task/<slug> (removing any stale one). A failure feeds SpawnFailed — no host agent is
+        // spawned — so the task re-queues / eventually parks rather than running against a bad tree.
+        if self.projects[idx].project.worktree_desks && agent.starts_with("office-worker") {
+            if let Err(reason) = self.setup_worktree(idx, task) {
+                self.step(
+                    idx,
+                    kernel::Input::Host(kernel::HostEvent::SpawnFailed {
+                        task: task.clone(),
+                        reason: format!("worktree desk: {reason}"),
+                    }),
+                    now_ms,
+                );
+                return SpawnOutcome::Failed;
+            }
+        }
+
         let bound = self.projects[idx].project.bound_session.clone().unwrap_or_default();
         let mut params = json!({
             "session": bound,
@@ -972,6 +1025,10 @@ impl<H: Host> Driver<H> {
             .map(str::to_string)
             .or_else(|| error_str(&reply).map(str::to_string))
             .unwrap_or_default();
+        // Worktree desks (item 2): commit a finished WORKER's tree onto its branch + stash the
+        // diff-stat for the reviewer, BEFORE the kernel moves the task to Review. A no-op for
+        // reviewers/researchers/auditors and legacy desks.
+        self.maybe_commit_worktree(idx, agent_id);
         self.step(
             idx,
             kernel::Input::Host(kernel::HostEvent::Result { agent_id, text }),
@@ -1037,17 +1094,50 @@ impl<H: Host> Driver<H> {
         let path = PathBuf::from(delivery_path);
         let allow_outside = false;
         let workspace = self.projects[idx].project.workspace.clone();
+        // The worktree-desks verdict (item 1): only meaningful when the path validates + the kernel
+        // authorizes; the placeholder Err is ignored on a refusal.
+        let mut worktree: Result<(), String> = Err("delivery path not validated".to_string());
         if office::validate_delivery_path(&path, workspace.as_deref(), allow_outside).is_ok() {
             let _ = std::fs::create_dir_all(&path);
+            // item 1: make the delivery a git repo (or respect an existing one) so task desks can be
+            // git worktrees. Any failure => legacy copy-desks, with the reason traced by the kernel.
+            worktree = self.setup_delivery_repo(&path);
         }
         self.step(
             idx,
             kernel::Input::Command(kernel::Command::Authorize {
                 delivery_path: path,
                 allow_outside_workspace: allow_outside,
+                worktree,
             }),
             now_ms,
         );
+    }
+
+    /// Make the delivery path a git repo for worktree desks (item 1), serialized on the repo's git
+    /// mutex. An existing repo is respected untouched (only confirming `git` is usable, which also
+    /// probes for a missing binary); a fresh path is `git init`-ed with an initial commit. `Ok(())`
+    /// = worktree desks on; `Err(reason)` = graceful fallback to legacy copy-desks.
+    fn setup_delivery_repo(&mut self, delivery: &Path) -> Result<(), String> {
+        let gate = self.repo_lock(delivery);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.git.is_repo(delivery) {
+            // Respect an existing repo untouched — but it needs a HEAD commit for worktrees to
+            // branch off. An empty repo (or a missing `git` binary) falls back to legacy desks.
+            if self.git.has_head_commit(delivery) {
+                Ok(())
+            } else {
+                Err("existing repo has no commits to branch worktrees from".to_string())
+            }
+        } else {
+            self.git.init_repo(delivery).map_err(|e| e.reason())
+        }
+    }
+
+    /// The per-repo git serialization mutex (item 1), created on first use. Held across each
+    /// worktree git op-sequence so `git` never runs concurrently on the same repo.
+    fn repo_lock(&mut self, repo: &Path) -> Arc<Mutex<()>> {
+        self.git_gate.entry(repo.to_path_buf()).or_default().clone()
     }
 
     // -- project lifecycle (6.1 / 10.2) ------------------------------------
@@ -1087,13 +1177,23 @@ impl<H: Host> Driver<H> {
             epics: Vec::new(),
             stories: Vec::new(),
             tasks: Vec::new(),
+            sprints: Vec::new(),
             config: office_core::ProjectConfig::default_config(),
             outbox: Vec::new(),
             trace: Vec::new(),
             interrupted_from: None,
             gate_cleared: false,
             pending_breakdown: None,
+            worktree_desks: false,
+            // Task desks live under the extension's OWN state root (~/.koma-workflow), never next
+            // to the delivery product (item 1). Seeded from the store root the daemon resolves.
+            workflow_home: Some(self.store.root_dir().to_path_buf()),
+            hygiene_sum: 0,
+            hygiene_count: 0,
             gate_invoke_live_hint: false,
+            track: "project".to_string(),
+            triage_pending: false,
+            sprint_review_invoke_live: false,
             seq: 0,
         };
         if self.store.create_project(&project).is_err() {
@@ -1542,6 +1642,113 @@ impl<H: Host> Driver<H> {
         }
     }
 
+    // -- worktree desks (item 1/2) -----------------------------------------
+
+    /// Materialize a FRESH git worktree for a worker's task (item 1), serialized on the repo's git
+    /// mutex. The desk path was set on the task by the kernel's `spawn_worker`. `Err(reason)` on any
+    /// failure (missing git surfaced here, disk error, ...) => the caller feeds SpawnFailed.
+    fn setup_worktree(&mut self, idx: usize, task: &TaskId) -> Result<(), String> {
+        let p = &self.projects[idx].project;
+        let repo = p
+            .delivery_path
+            .clone()
+            .ok_or_else(|| "no delivery path".to_string())?;
+        let desk = p
+            .tasks
+            .iter()
+            .find(|t| &t.id == task)
+            .and_then(|t| t.desk.clone())
+            .ok_or_else(|| "no desk path".to_string())?;
+        let branch = office_core::task_branch(&task.0);
+        let gate = self.repo_lock(&repo);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.git.add_worktree(&repo, &desk, &branch).map_err(|e| e.reason())
+    }
+
+    /// Commit a finished worker's tree onto its task branch and stash the branch diff-stat for the
+    /// reviewer prompt (item 2), BEFORE the kernel transitions the task to Review. Only for a WORKER
+    /// binding in worktree mode; a no-op otherwise. Best-effort: a commit failure is logged but the
+    /// review still proceeds (the reviewer inspects the tree directly).
+    fn maybe_commit_worktree(&mut self, idx: usize, agent_id: u64) {
+        if !self.projects[idx].project.worktree_desks {
+            return;
+        }
+        // The worker is still OnProgress here (the Result event has not been fed yet).
+        let (task_idx, desk, branch) = {
+            let p = &self.projects[idx].project;
+            let ti = p.tasks.iter().position(|t| {
+                matches!(&t.state, TaskState::OnProgress { binding, .. } if binding.ext_agent_id == agent_id)
+            });
+            match ti {
+                Some(ti) => match &p.tasks[ti].desk {
+                    Some(d) => (ti, d.clone(), office_core::task_branch(&p.tasks[ti].id.0)),
+                    None => return,
+                },
+                None => return, // not a worker binding (reviewer/researcher/auditor)
+            }
+        };
+        let repo = match &self.projects[idx].project.delivery_path {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let msg = format!("workflow: task {}", self.projects[idx].project.tasks[task_idx].id.0);
+        let gate = self.repo_lock(&repo);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = self.git.commit_all(&desk, &msg) {
+            log_line(&format!("worktree commit failed: {}", e.reason()));
+        }
+        let diff = self.git.diff_stat(&repo, &desk, &branch);
+        drop(_guard);
+        self.projects[idx].project.tasks[task_idx].diff_stat = Some(cap_diff_stat(&diff));
+    }
+
+    /// Merge a passed task's branch into main (item 1), serialized on the repo's git mutex, then
+    /// feed the outcome back so the kernel completes the task (clean) or bounces it (conflict).
+    fn exec_merge_desk(
+        &mut self,
+        idx: usize,
+        task: TaskId,
+        repo: PathBuf,
+        _desk: PathBuf,
+        branch: String,
+        now_ms: u64,
+    ) {
+        let gate = self.repo_lock(&repo);
+        let guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = self.git.merge(&repo, &branch);
+        drop(guard);
+        let event = match outcome {
+            crate::git::MergeOutcome::Merged => kernel::HostEvent::DeskMerged { task },
+            crate::git::MergeOutcome::Conflict(summary) => {
+                kernel::HostEvent::DeskMergeConflict { task, summary, is_conflict: true }
+            }
+            // item 4: a non-conflict merge failure — same bounce path, distinct wording.
+            crate::git::MergeOutcome::Failed(summary) => {
+                kernel::HostEvent::DeskMergeConflict { task, summary, is_conflict: false }
+            }
+        };
+        self.step(idx, kernel::Input::Host(event), now_ms);
+    }
+
+    /// Remove a task's worktree + branch (item 1), serialized on the repo's git mutex. Fire-and-
+    /// forget best-effort; emitted on Done / terminal park when `keep_desks` is off.
+    fn exec_remove_desk(&mut self, repo: &Path, desk: &Path, branch: &str) {
+        let gate = self.repo_lock(repo);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.git.remove_worktree(repo, desk, branch);
+    }
+
+    /// Tag the delivery repo at a sprint boundary (feature: sprints), serialized on the repo's git
+    /// mutex. Fire-and-forget best-effort exactly like `RemoveDesk`: a failure is TRACED (logged),
+    /// never wedges — the sprint-review ceremony fired independently and does not depend on the tag.
+    fn exec_tag_sprint(&mut self, repo: &Path, tag: &str) {
+        let gate = self.repo_lock(repo);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = self.git.tag(repo, tag) {
+            log_line(&format!("sprint tag '{tag}' failed: {}", e.reason()));
+        }
+    }
+
     // -- capacity + lookups -------------------------------------------------
 
     /// Session-global remaining office slots (5.2.3): the cap minus every in-flight worker
@@ -1738,6 +1945,9 @@ fn project_in_flight(p: &Project) -> u32 {
 fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Option<OfficeActivity> {
     if let Some(job) = pending.values().find(|j| j.proj_slug == project.id.0) {
         let label = match job.purpose {
+            // Intake triage (feature: sdlc-triage): the lightweight classifier that routes a fresh
+            // brief to a track, fired alongside the first persona reply.
+            InvokePurpose::Triage => "classifying the request",
             InvokePurpose::Persona => "office is replying",
             InvokePurpose::Fold => "summarizing the conversation",
             InvokePurpose::AssumeCheckPrd => "fact-checking the PRD",
@@ -1751,6 +1961,8 @@ fn office_activity(pending: &HashMap<u64, InvokeJob>, project: &Project) -> Opti
             InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {
                 "breaking down the plan"
             }
+            // Sprints (feature: sprints): the per-sprint review ceremony's single synthesis invoke.
+            InvokePurpose::SprintReview => "running the sprint review",
         };
         return Some(OfficeActivity { label: label.to_string(), since_ms: job.submitted_at_ms });
     }
@@ -1885,6 +2097,20 @@ fn first_session_workdir(sessions: &Value) -> Option<String> {
 
 fn serialized_len(v: &Value) -> usize {
     serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0)
+}
+
+/// Cap the `git diff --stat` output stashed on a task for the reviewer prompt (item 2). The prompt
+/// builder caps it again; this just bounds what lands in `state.json`.
+fn cap_diff_stat(diff: &str) -> String {
+    const CAP: usize = 4000;
+    if diff.len() <= CAP {
+        return diff.to_string();
+    }
+    let mut end = CAP;
+    while end > 0 && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... [diff-stat truncated]", &diff[..end])
 }
 
 /// Runtime logging goes to `~/.koma-workflow` stderr sink; a daemon must never smear the

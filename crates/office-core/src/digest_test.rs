@@ -28,6 +28,9 @@ mod tests {
             last_report: Some("worker report body".to_string()),
             last_review: Some("reviewer verdict body".to_string()),
             history: vec![TaskEvent { at_ms: 1, event: "created".to_string() }],
+            diff_stat: None,
+            awaiting_merge: false,
+            dispatch_after_ms: 0,
         }
     }
 
@@ -57,14 +60,22 @@ mod tests {
             epics: Vec::new(),
             stories: Vec::new(),
             tasks,
+            sprints: Vec::new(),
             config: ProjectConfig::default_config(),
             outbox: Vec::new(),
             trace: Vec::new(),
             interrupted_from: None,
             gate_cleared: false,
             gate_invoke_live_hint: false,
+            track: "project".to_string(),
+            triage_pending: false,
+            sprint_review_invoke_live: false,
             pending_breakdown: None,
             seq,
+            worktree_desks: false,
+            workflow_home: None,
+            hygiene_sum: 0,
+            hygiene_count: 0,
         }
     }
 
@@ -129,6 +140,8 @@ mod tests {
         let idx_old = blob.find("- old:").expect("old present");
         let idx_new = blob.find("- new:").expect("new present");
         assert!(idx_new < idx_old, "higher-seq project should render first");
+        // sdlc-triage: the board digest carries each project's intake track.
+        assert!(blob.contains("track=project"), "the SDLC track is in the board digest: {blob}");
     }
 
     #[test]
@@ -155,6 +168,8 @@ mod tests {
         assert_eq!(t["history"].as_array().unwrap().len(), 1);
         assert_eq!(t["comments"].as_array().unwrap().len(), 1);
         assert_eq!(arr[0]["prdMarkdown"], "# PRD\nbody");
+        // sdlc-triage: the intake track rides the panel snapshot too.
+        assert_eq!(arr[0]["track"], "project");
     }
 
     #[test]
@@ -270,5 +285,81 @@ mod tests {
             arr[0].get("officeActivity").is_none(),
             "summary mode omits officeActivity even when live"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sprints wire (feature: sprints)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn panel_snapshot_full_mode_carries_sprints_and_active_pointer() {
+        let mut p = project(
+            "proj",
+            1,
+            ProjectPhase::Running,
+            vec![task("t1", TaskState::Done { at_ms: 1 }), task("t2", TaskState::Todo)],
+        );
+        p.sprints = vec![
+            Sprint {
+                goal: "First".to_string(),
+                tasks: vec![TaskId("t1".to_string())],
+                status: SprintStatus::Done,
+                transcript: vec![],
+            },
+            Sprint {
+                goal: "Second".to_string(),
+                tasks: vec![TaskId("t2".to_string())],
+                status: SprintStatus::InReview,
+                transcript: vec![SprintLine { speaker: "office".to_string(), line: "summary line".to_string() }],
+            },
+        ];
+        let snap = panel_snapshot(&[p], SnapshotMode::Full);
+        let obj = &snap.as_array().unwrap()[0];
+        let sprints = obj["sprints"].as_array().expect("sprints array");
+        assert_eq!(sprints.len(), 2);
+        assert_eq!(sprints[0]["status"].as_str().unwrap(), "done");
+        assert_eq!(sprints[0]["done"].as_u64().unwrap(), 1);
+        assert_eq!(sprints[1]["status"].as_str().unwrap(), "inreview");
+        // the InReview sprint carries its ceremony transcript for the UI to replay.
+        assert_eq!(sprints[1]["transcript"].as_array().unwrap().len(), 1);
+        assert_eq!(sprints[1]["transcript"][0]["speaker"].as_str().unwrap(), "office");
+        assert_eq!(sprints[1]["transcript"][0]["text"].as_str().unwrap(), "summary line");
+        // the active pointer points at the current (InReview) sprint.
+        let active = &obj["activeSprint"];
+        assert_eq!(active["index"].as_u64().unwrap(), 1);
+        assert_eq!(active["count"].as_u64().unwrap(), 2);
+        assert!(active["inReview"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn panel_snapshot_summary_mode_omits_sprints() {
+        let mut p = project("proj", 1, ProjectPhase::Running, vec![task("t1", TaskState::Todo)]);
+        p.sprints = vec![Sprint {
+            goal: "g".to_string(),
+            tasks: vec![TaskId("t1".to_string())],
+            status: SprintStatus::Active,
+            transcript: vec![],
+        }];
+        let snap = panel_snapshot(&[p], SnapshotMode::Summary);
+        let obj = &snap.as_array().unwrap()[0];
+        assert!(obj.get("sprints").is_none(), "summary mode drops sprints under the size guard");
+    }
+
+    #[test]
+    fn context_blob_shows_the_active_sprint_line() {
+        let mut p = project(
+            "proj",
+            1,
+            ProjectPhase::Running,
+            vec![task("t1", TaskState::Done { at_ms: 1 }), task("t2", TaskState::Todo)],
+        );
+        p.sprints = vec![Sprint {
+            goal: "Foundation".to_string(),
+            tasks: vec![TaskId("t1".to_string()), TaskId("t2".to_string())],
+            status: SprintStatus::Active,
+            transcript: vec![],
+        }];
+        let blob = context_blob(&[p]);
+        assert!(blob.contains("sprint 1/1: Foundation (1/2 tasks)"), "got: {blob}");
     }
 }

@@ -59,6 +59,11 @@ impl Default for Verdict {
 pub struct ReviewTrailer {
     pub verdict: Verdict,
     pub reasons: Option<String>,
+    /// Optional per-task clean-build hygiene grade (0-100) the reviewer may emit on a PASS
+    /// (item 3, rolling score). `None` when the reviewer omitted the `hygiene:` line — the
+    /// kernel treats an absent grade as 100 so older reviewers stay fully compatible. Clamped
+    /// to `..=100` (the first digit run on the line, so `hygiene: 92/100` also reads 92).
+    pub hygiene: Option<u32>,
 }
 
 /// Strip a run of backtick characters (markdown fence) from `line`, trimmed. A
@@ -142,10 +147,12 @@ fn parse_ack_comments(map: &HashMap<String, Vec<String>>) -> Vec<CommentId> {
 }
 
 const REPORT_KEYS: &[&str] = &["status", "summary", "delivered", "ack-comments", "blocked-reason"];
-const REVIEW_KEYS: &[&str] = &["verdict", "reasons"];
+const REVIEW_KEYS: &[&str] = &["verdict", "reasons", "hygiene"];
 const RESEARCH_KEYS: &[&str] = &["findings"];
 const AUDIT_KEYS: &[&str] = &["grade", "failures"];
 const ASSUME_KEYS: &[&str] = &["verdict"];
+const TRIAGE_KEYS: &[&str] = &["track", "rationale", "existing"];
+const SPRINT_REVIEW_KEYS: &[&str] = &["summary", "adjustments"];
 
 /// A parsed `OFFICE-AUDIT` block (ARCHITECTURE.md 6.2c). `grade` is `None` when no numeric
 /// grade could be read (an inconclusive audit); the kernel fails OPEN on that (completes with a
@@ -296,6 +303,197 @@ fn strip_leading_tag(s: &str, tag: &str) -> Option<String> {
     }
 }
 
+/// The SDLC intake track a brief is classified into (feature: sdlc-triage). `Project` = the full
+/// PRD/TRD/CRD ceremony (the safe default); `Enhancement` = one change-brief + a small breakdown;
+/// `Patch` = no documents, one task straight to Ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriageTrack {
+    Project,
+    Enhancement,
+    Patch,
+}
+
+impl TriageTrack {
+    /// The persisted string form stored on `Project.track` and rendered on the wire digests.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriageTrack::Project => "project",
+            TriageTrack::Enhancement => "enhancement",
+            TriageTrack::Patch => "patch",
+        }
+    }
+}
+
+/// A parsed `SDLC-TRIAGE` block (feature: sdlc-triage). `track` is the classified track;
+/// `rationale` a one-line justification; `existing` whether the brief targets an EXISTING delivery
+/// (only meaningful for enhancement/patch). Parsing NEVER fails — a missing/garbled block yields the
+/// [`TriageVerdict::project_default`] (full ceremony is the safe fallback).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriageVerdict {
+    pub track: TriageTrack,
+    pub rationale: String,
+    pub existing: bool,
+}
+
+impl TriageVerdict {
+    /// The defensive default: the full-ceremony `project` track, used when the classifier block is
+    /// absent or unparseable, or the invoke errored.
+    pub fn project_default() -> Self {
+        TriageVerdict {
+            track: TriageTrack::Project,
+            rationale: String::new(),
+            existing: false,
+        }
+    }
+}
+
+/// Classify a raw `track:` value word into a [`TriageTrack`] (feature: sdlc-triage). Tolerant and
+/// conservative: a leading `enhance`/`patch` (case-insensitive) picks that track; ANYTHING ELSE —
+/// including `project`, an empty value, or garbage — is the safe `Project` default.
+fn classify_track(word: &str) -> TriageTrack {
+    let w = word.trim().to_ascii_lowercase();
+    if w.starts_with("enhance") {
+        TriageTrack::Enhancement
+    } else if w.starts_with("patch") {
+        TriageTrack::Patch
+    } else {
+        TriageTrack::Project
+    }
+}
+
+/// Parse the LAST `SDLC-TRIAGE` block out of `text` (feature: sdlc-triage), tolerant exactly like
+/// the other trailer scanners: fence-tolerant marker match, case drift ignored, continuation lines
+/// folded. `track:` is classified by [`classify_track`] (unknown -> `Project`); `existing:` reads a
+/// leading yes/true. A MISSING block (or any unrecognized track) yields
+/// [`TriageVerdict::project_default`] — the full ceremony is the safe fallback, never a hard error.
+pub fn parse_triage(text: &str) -> TriageVerdict {
+    let map = match scan_block(text, "SDLC-TRIAGE", TRIAGE_KEYS) {
+        Some(m) => m,
+        None => return TriageVerdict::project_default(),
+    };
+    let track = map
+        .get("track")
+        .and_then(|v| v.first())
+        .map(|s| classify_track(s))
+        .unwrap_or(TriageTrack::Project);
+    let rationale = joined(&map, "rationale").unwrap_or_default();
+    let existing = map
+        .get("existing")
+        .and_then(|v| v.first())
+        .map(|s| {
+            let v = s.trim().to_ascii_lowercase();
+            v.starts_with("yes") || v.starts_with("true")
+        })
+        .unwrap_or(false);
+    TriageVerdict {
+        track,
+        rationale,
+        existing,
+    }
+}
+
+/// What a sprint-review PM adjustment does to the NEXT sprint's task list (feature: sprints).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprintAdjustmentKind {
+    /// Remove a not-yet-started task from the next sprint (and the board).
+    Drop,
+    /// Add a fresh task to the next sprint.
+    Add,
+    /// Replace a not-yet-started task's description.
+    Modify,
+}
+
+/// One parsed adjustment from a `SPRINT-REVIEW` block (feature: sprints). `target` is the exact task
+/// id/slug for `Drop`/`Modify`, or the new task title for `Add`; `text` is the description for
+/// `Add`/`Modify` (empty for `Drop`). The kernel applies these DEFENSIVELY — a target it can't match
+/// (or a task already started/done) is simply ignored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SprintAdjustment {
+    pub kind: SprintAdjustmentKind,
+    pub target: String,
+    pub text: String,
+}
+
+/// The parsed `SPRINT-REVIEW` synthesis (feature: sprints). `summary` is the PM's closing line(s);
+/// `adjustments` are the (possibly empty) changes to the next sprint. Parsing NEVER fails — a
+/// missing/garbled block yields the default (empty summary, no adjustments), so the ceremony always
+/// falls back to "carry-overs only".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SprintReviewPlan {
+    pub summary: String,
+    pub adjustments: Vec<SprintAdjustment>,
+}
+
+/// Parse the LAST `SPRINT-REVIEW` block out of `text` (feature: sprints), tolerant exactly like the
+/// other trailer scanners: fence-tolerant marker, case drift ignored, continuation lines folded. The
+/// `summary:` value (+ folded lines) is the PM synthesis; each `- drop|add|modify ...` line under
+/// `adjustments:` becomes a [`SprintAdjustment`]. A missing block or an unrecognized verb yields no
+/// changes — the kernel then carries over the non-done tasks and makes no edits.
+pub fn parse_sprint_review(text: &str) -> SprintReviewPlan {
+    let map = match scan_block(text, "SPRINT-REVIEW", SPRINT_REVIEW_KEYS) {
+        Some(m) => m,
+        None => return SprintReviewPlan::default(),
+    };
+    let summary = joined(&map, "summary").unwrap_or_default();
+    let adjustments = map
+        .get("adjustments")
+        .map(|lines| parse_adjustments(lines))
+        .unwrap_or_default();
+    SprintReviewPlan { summary, adjustments }
+}
+
+/// Parse the folded `adjustments:` lines into [`SprintAdjustment`]s (feature: sprints). Each line is
+/// bullet-stripped, then classified by its leading verb (`drop`/`add`/`modify`, case-insensitive);
+/// `add`/`modify` split their remainder on the first `|` into `(target, text)`. An empty target, or
+/// any line whose first token is not a known verb, is dropped.
+fn parse_adjustments(lines: &[String]) -> Vec<SprintAdjustment> {
+    let mut out = Vec::new();
+    for raw in lines {
+        let line = strip_bullet(raw);
+        if let Some(rest) = strip_verb(&line, "drop") {
+            let target = rest.trim().to_string();
+            if !target.is_empty() {
+                out.push(SprintAdjustment { kind: SprintAdjustmentKind::Drop, target, text: String::new() });
+            }
+        } else if let Some(rest) = strip_verb(&line, "add") {
+            let (target, text) = split_pipe(&rest);
+            if !target.is_empty() {
+                out.push(SprintAdjustment { kind: SprintAdjustmentKind::Add, target, text });
+            }
+        } else if let Some(rest) = strip_verb(&line, "modify") {
+            let (target, text) = split_pipe(&rest);
+            if !target.is_empty() {
+                out.push(SprintAdjustment { kind: SprintAdjustmentKind::Modify, target, text });
+            }
+        }
+        // any other leading word is ignored (defensive)
+    }
+    out
+}
+
+/// Strip a leading verb keyword (case-insensitive) plus its trailing `:`/whitespace, returning the
+/// remainder. `None` when the FIRST whitespace/':'-delimited token is not exactly `verb`.
+fn strip_verb(line: &str, verb: &str) -> Option<String> {
+    let t = line.trim_start();
+    let first_len = t
+        .find(|c: char| c.is_whitespace() || c == ':')
+        .unwrap_or(t.len());
+    if t[..first_len].eq_ignore_ascii_case(verb) {
+        Some(t[first_len..].trim_start_matches(|c: char| c == ':' || c.is_whitespace()).to_string())
+    } else {
+        None
+    }
+}
+
+/// Split an `add`/`modify` remainder on the FIRST `|` into `(target, text)`, both trimmed. With no
+/// `|` the whole remainder is the target and the text is empty.
+fn split_pipe(s: &str) -> (String, String) {
+    match s.split_once('|') {
+        Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
+        None => (s.trim().to_string(), String::new()),
+    }
+}
+
 /// Parse the LAST `OFFICE-REPORT` trailer out of `text`.
 pub fn parse_report(text: &str) -> ReportTrailer {
     let map = match scan_block(text, "OFFICE-REPORT", REPORT_KEYS) {
@@ -336,8 +534,17 @@ pub fn parse_review(text: &str) -> ReviewTrailer {
         _ => Verdict::Unparseable,
     };
 
+    // Optional per-task hygiene grade (item 3): first digit run on the `hygiene:` line, clamped
+    // 0..=100. Absent => None (the kernel treats that as 100 for the rolling average).
+    let hygiene = map
+        .get("hygiene")
+        .and_then(|v| v.first())
+        .and_then(|s| parse_first_u32(s))
+        .map(|n| n.min(100));
+
     ReviewTrailer {
         verdict,
         reasons: joined(&map, "reasons"),
+        hygiene,
     }
 }

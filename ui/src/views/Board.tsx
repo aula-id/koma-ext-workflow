@@ -26,6 +26,39 @@ export interface Epic {
   stories: string[];
 }
 
+/** One line of a sprint-review ceremony transcript (feature: sprints), per office-core
+ * digest.rs's wire shape (the domain `SprintLine { speaker, line }` renamed on the wire —
+ * `text`, not `line`). */
+export interface SprintTranscriptLine {
+  speaker: string;
+  text: string;
+}
+
+/** One sprint of a project-track plan (feature: sprints), per office-core digest.rs's
+ * `sprints[]` wire entry. `status` is the wire string exactly as emitted — note `'inreview'`
+ * (lowercase, no camelCase), unlike `ActiveSprint.inReview` below. `transcript` is present only
+ * while `status === 'inreview'`. */
+export interface Sprint {
+  index: number;
+  goal: string;
+  status: 'pending' | 'active' | 'inreview' | 'done';
+  total: number;
+  done: number;
+  tasks: string[];
+  transcript?: SprintTranscriptLine[];
+}
+
+/** Pointer to the project's CURRENT sprint (feature: sprints), per office-core digest.rs's
+ * `activeSprint` wire object. Present only when a sprint is Active or InReview. */
+export interface ActiveSprint {
+  index: number;
+  count: number;
+  goal: string;
+  total: number;
+  done: number;
+  inReview: boolean;
+}
+
 export interface Story {
   id: string;
   title: string;
@@ -97,6 +130,14 @@ export interface Project {
   /** Live office activity (full snapshot only, 6.2d), present only while an activity is in
    * flight; omitted entirely (not null) when idle. At most one is live at a time. */
   officeActivity?: { label: string; sinceMs: number } | null;
+  /** SDLC intake track (feature: sdlc-triage): `'project'` | `'enhancement'` | `'patch'`.
+   * Optional — absent on older snapshots renders no badge (back-compat). */
+  track?: string;
+  /** Full sprint list + the current-sprint pointer (feature: sprints), full snapshot only.
+   * Both absent on a pre-sprints / no-sprint-track snapshot (back-compat: the office view
+   * renders its classic desk-grid scene unchanged). */
+  sprints?: Sprint[];
+  activeSprint?: ActiveSprint | null;
 }
 
 const COLUMNS: { key: ColumnKey; label: string }[] = [
@@ -452,6 +493,28 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
               <span className="wf-status-dot" style={{ background: PHASE_COLOR[phaseKind] }} />
               {phaseKind}
             </span>
+            {/* SDLC track badge (feature: sdlc-triage): same flat uppercase tag recipe as the
+                doc-card "doc" label above — no filled chip. Absent track (older snapshot) renders
+                nothing (back-compat). */}
+            {project.track && (
+              <span
+                data-testid="project-track-badge"
+                style={{
+                  fontSize: '0.6rem',
+                  fontWeight: 600,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase',
+                  color: 'var(--wf-dim)',
+                  border: '1px solid var(--wf-border)',
+                  borderRadius: 'var(--wf-radius)',
+                  padding: '0.1rem 0.4rem',
+                  flex: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {project.track}
+              </span>
+            )}
           </div>
           {/* Phase-dependent actions: one set at a time, never three alarm
               buttons side by side for every state. flex:none so a long project

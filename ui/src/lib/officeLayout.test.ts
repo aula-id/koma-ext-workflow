@@ -1,19 +1,28 @@
 import { describe, it, expect } from 'vitest';
 import {
   PERSONA_ORDER,
+  TABLE,
   clampMaxWorkers,
   deskCountFor,
   formatElapsed,
+  idleAssignmentsFor,
+  idlePersonasFor,
   isAuditLive,
   isDraftingFamilyActivity,
   isResearchLive,
+  isSprintReview,
   isWaitingOnUserActivity,
+  meetingSeatsFor,
   occupiedCount,
   presenceFor,
+  reviewedSprint,
+  sprintAttendees,
+  sprintBadgeText,
   stationsFor,
   stripPersona,
   tierFor,
   type OfficeProject,
+  type OfficeSprint,
 } from './officeLayout';
 
 describe('tierFor', () => {
@@ -242,5 +251,159 @@ describe('isWaitingOnUserActivity', () => {
     expect(isWaitingOnUserActivity('researching the stack')).toBe(false);
     expect(isWaitingOnUserActivity(undefined)).toBe(false);
     expect(isWaitingOnUserActivity(null)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sprint-review meeting room (feature: sprints)
+// ---------------------------------------------------------------------------
+
+function sprint(over: Partial<OfficeSprint>): OfficeSprint {
+  return { index: 0, goal: 'Foundation', status: 'active', total: 1, done: 0, tasks: [], ...over };
+}
+
+describe('isSprintReview / reviewedSprint / sprintBadgeText', () => {
+  it('is false/null on a pre-sprints (no activeSprint) snapshot — back-compat', () => {
+    expect(isSprintReview({})).toBe(false);
+    expect(reviewedSprint({})).toBeNull();
+    expect(sprintBadgeText({})).toBeNull();
+  });
+
+  it('is false while the current sprint is merely active (not in review)', () => {
+    const p: OfficeProject = {
+      sprints: [sprint({ status: 'active' })],
+      activeSprint: { index: 0, count: 2, goal: 'Foundation', total: 3, done: 1, inReview: false },
+    };
+    expect(isSprintReview(p)).toBe(false);
+    expect(reviewedSprint(p)).toBeNull();
+    expect(sprintBadgeText(p)).toBe('sprint 1/2 — Foundation');
+  });
+
+  it('is true and resolves the reviewed sprint (with transcript) while inReview', () => {
+    const reviewed = sprint({
+      index: 1,
+      goal: 'Second',
+      status: 'inreview',
+      transcript: [{ speaker: 'nova', text: 'shipped the client' }],
+    });
+    const p: OfficeProject = {
+      sprints: [sprint({ status: 'done' }), reviewed],
+      activeSprint: { index: 1, count: 2, goal: 'Second', total: 2, done: 2, inReview: true },
+    };
+    expect(isSprintReview(p)).toBe(true);
+    expect(reviewedSprint(p)).toBe(reviewed);
+    expect(sprintBadgeText(p)).toBe('sprint 2/2 — Second');
+  });
+});
+
+describe('sprintAttendees', () => {
+  it('returns null-safe empty for no sprint', () => {
+    expect(sprintAttendees({ tasks: [] }, null)).toEqual([]);
+  });
+
+  it('resolves the sprint tasks’ personas, PERSONA_ORDER-stable, via the live task binding', () => {
+    const p: OfficeProject = {
+      tasks: [
+        { id: 't1', state: 'done', persona: 'office-worker-mika' },
+        { id: 't2', state: 'done', persona: 'nova' },
+        { id: 't3', state: 'done', persona: 'nova' }, // same persona as t2 — de-duped
+        { id: 'other', state: 'onprogress', persona: 'bob' }, // not in this sprint — excluded
+      ],
+    };
+    const s = sprint({ tasks: ['t1', 't2', 't3'] });
+    // PERSONA_ORDER is ['nova', 'mika', ...] — nova sorts before mika regardless of task order.
+    expect(sprintAttendees(p, s)).toEqual(['nova', 'mika']);
+  });
+});
+
+describe('meetingSeatsFor', () => {
+  it('anchors the PM and reviewer at the table head, deterministically', () => {
+    const seats = meetingSeatsFor([]);
+    expect(seats).toEqual([
+      { role: 'pm', x: TABLE.padX + TABLE.seatW, y: TABLE.padY },
+      { role: 'reviewer', x: TABLE.padX + TABLE.seatW * 2, y: TABLE.padY },
+    ]);
+  });
+
+  it('rings one seat per attendee, wrapping rows at TABLE.cols', () => {
+    const seats = meetingSeatsFor(['nova', 'mika', 'tetsuo', 'bob']);
+    const workers = seats.filter((s) => s.role === 'worker');
+    expect(workers).toHaveLength(4);
+    expect(workers[0]).toEqual({ role: 'worker', persona: 'nova', x: TABLE.padX, y: TABLE.padY + TABLE.seatH });
+    // 4th attendee (index 3) wraps to the second row (cols = 3).
+    expect(workers[3]).toEqual({ role: 'worker', persona: 'bob', x: TABLE.padX, y: TABLE.padY + TABLE.seatH * 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ambient idle life (feature: ambient-idle-life)
+// ---------------------------------------------------------------------------
+
+describe('idlePersonasFor', () => {
+  it('returns only idle personas, excluding any given (e.g. meeting attendees)', () => {
+    const presence = presenceFor(
+      proj([
+        { id: 'p/a', state: 'onprogress', priority: 5, persona: 'nova' }, // occupied, not idle
+      ]),
+    );
+    const idle = idlePersonasFor(presence);
+    expect(idle).not.toContain('nova');
+    expect(idle).toContain('mika');
+    expect(idle).toHaveLength(PERSONA_ORDER.length - 1);
+  });
+
+  it('excludes meeting attendees even though presenceFor reads them as idle (their sprint tasks are Done)', () => {
+    const presence = presenceFor(proj([{ id: 'p/a', state: 'done', priority: 5, persona: 'nova' }]));
+    // nova reads idle here (done isn't an occupied-desk state) — but during a review nova is
+    // seated at the meeting table, so must be excluded from the idle-life pool.
+    expect(forPersona(presence, 'nova').status).toBe('idle');
+    const idle = idlePersonasFor(presence, ['nova']);
+    expect(idle).not.toContain('nova');
+  });
+});
+
+describe('idleAssignmentsFor', () => {
+  const idle = ['bob', 'dax', 'ines', 'koji'];
+
+  it('is a pure/deterministic function of (idlePersonas, tick) — same input, same output', () => {
+    expect(idleAssignmentsFor(idle, 5)).toEqual(idleAssignmentsFor(idle, 5));
+    expect(idleAssignmentsFor(idle, 5)).not.toEqual(idleAssignmentsFor(idle, 200)); // different window
+  });
+
+  it('returns exactly one assignment per idle persona, each a recognized activity', () => {
+    const assignments = idleAssignmentsFor(idle, 0);
+    expect(assignments).toHaveLength(idle.length);
+    expect(assignments.map((a) => a.persona).sort()).toEqual([...idle].sort());
+    for (const a of assignments) {
+      expect(['wander', 'gossip', 'cooler']).toContain(a.activity);
+      expect(a.t).toBeGreaterThanOrEqual(0);
+      expect(a.t).toBeLessThan(1);
+    }
+  });
+
+  it('gossip pairs point back at each other', () => {
+    // Sweep a range of ticks/persona sets until a gossip pair turns up (deterministic hash, so
+    // this always finds one — no flakiness).
+    for (let tick = 0; tick < 400; tick += 40) {
+      const assignments = idleAssignmentsFor(idle, tick);
+      const gossiping = assignments.filter((a) => a.activity === 'gossip');
+      if (gossiping.length > 0) {
+        for (const a of gossiping) {
+          const partner = assignments.find((x) => x.persona === a.partner);
+          expect(partner).toBeDefined();
+          expect(partner!.activity).toBe('gossip');
+          expect(partner!.partner).toBe(a.persona);
+        }
+        return;
+      }
+    }
+    throw new Error('expected at least one gossip pair across the swept ticks');
+  });
+
+  it('never assigns an idle persona that was not passed in (structural: meeting/desk exclusion is the caller’s job)', () => {
+    const assignments = idleAssignmentsFor(idle, 12);
+    for (const a of assignments) {
+      expect(idle).toContain(a.persona);
+    }
   });
 });

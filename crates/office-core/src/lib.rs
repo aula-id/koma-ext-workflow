@@ -14,7 +14,8 @@ pub mod prompts;
 
 pub mod report;
 pub use report::{
-    AssumeCheck, AssumeVerdict, AuditReport, ReportStatus, ReportTrailer, ReviewTrailer, Verdict,
+    AssumeCheck, AssumeVerdict, AuditReport, ReportStatus, ReportTrailer, ReviewTrailer,
+    TriageTrack, TriageVerdict, Verdict,
 };
 
 pub mod digest;
@@ -24,7 +25,7 @@ pub mod office;
 pub use office::{AuthError, BreakdownError, InvokePurpose};
 
 pub mod kernel;
-pub use kernel::{step, Command, Effect, HostEvent, Input};
+pub use kernel::{step, task_branch, Command, Effect, HostEvent, Input};
 
 pub mod inboxmsg;
 

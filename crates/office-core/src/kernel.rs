@@ -62,10 +62,11 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::{
     AgentBinding, AgentKind, ChatAuthor, ChatMsg, Comment, CommentAuthor, CommentId, ParkReason,
-    Project, ProjectPhase, Receipt, Task, TaskEvent, TaskId, TaskState, TraceEvent,
+    Project, ProjectPhase, Receipt, Sprint, SprintLine, SprintStatus, Task, TaskEvent, TaskId,
+    TaskState, TraceEvent,
 };
 use crate::graph::{self, ready_set};
-use crate::machine::{step_project, ProjectTransition};
+use crate::machine::{step_project, step_sprint, ProjectTransition, SprintTransition};
 use crate::office::{self, InvokePurpose};
 use crate::prompts;
 use crate::report::{self, ReportStatus, Verdict};
@@ -108,6 +109,27 @@ const TRDCRD_NUDGE_INSTRUCTION: &str = "\nYour previous reply was missing the re
 const PRD_TAGS: &[&str] = &["prd"];
 const TRDCRD_TAGS: &[&str] = &["trd", "crd"];
 
+/// The system-appended instruction on an ENHANCEMENT change-brief capture-miss nudge (feature:
+/// sdlc-triage): the reply dropped the ```change fence, so re-ask for ONLY the fenced change-brief.
+const CHANGE_NUDGE_INSTRUCTION: &str = "\nYour previous reply did not include the required ```change \
+fence. Emit ONLY the complete change-brief in the fence now (Current behavior / Desired behavior / \
+Acceptance criteria) — no prose.\n";
+
+/// SDLC escalation threshold (feature: sdlc-triage): an ENHANCEMENT whose change-brief gate surfaces
+/// MORE than this many material assumptions is wider than a change and escalates to the full project
+/// track. N = 4 (documented in requirement 3).
+const ENHANCEMENT_ASSUMPTION_ESCALATION_MAX: usize = 4;
+
+/// SDLC escalation threshold (feature: sdlc-triage): an ENHANCEMENT whose breakdown returns MORE
+/// than this many tasks is wider than a change and escalates to the full project track. The small
+/// breakdown prompt already caps at 3; this catches a model that overshoots anyway.
+const ENHANCEMENT_BREAKDOWN_TASK_MAX: usize = 3;
+
+/// SDLC escalation trigger (feature: sdlc-triage): a PATCH whose single task reaches this many
+/// bounces is wider than a patch and escalates (converts) to the enhancement track before its next
+/// re-dispatch. "The single task bounces twice" -> escalate on the 2nd bounce.
+const PATCH_BOUNCE_ESCALATION: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // Public protocol
 // ---------------------------------------------------------------------------
@@ -149,10 +171,14 @@ pub enum Command {
     RequestBreakdown,
     /// Authorize `Ready -> Running` with a delivery path the driver has already
     /// validated + `mkdir -p`'d (6.3.3). `delivery_valid` is the driver's containment
-    /// verdict; a false verdict never transitions (the hard gate).
+    /// verdict; a false verdict never transitions (the hard gate). `worktree` is the driver's
+    /// git-repo setup verdict (item 1): `Ok(())` = the delivery is a git repo and worktree desks
+    /// are on; `Err(reason)` = `git` was missing or `init` failed, so the project falls back to
+    /// legacy copy-desks (the kernel records the flag + traces the reason).
     Authorize {
         delivery_path: PathBuf,
         allow_outside_workspace: bool,
+        worktree: Result<(), String>,
     },
     /// An off-loop `models.invoke` returned (5.1). `purpose` says which flow it belongs
     /// to; `outcome` is the model text or the error string after the driver's one retry.
@@ -242,6 +268,20 @@ pub enum HostEvent {
     /// `Pending -> Delivered`. Only emitted on success; an `agents.send` error produces no
     /// event, leaving the comment `Pending` for the spawn-boundary fold to deliver later.
     CommentDelivered { task: TaskId, comment_id: CommentId },
+    /// Worktree desks (item 1): the driver merged a task's branch cleanly into main (in response
+    /// to `Effect::MergeDesk`). The task completes (Done) and its worktree is reclaimed.
+    DeskMerged { task: TaskId },
+    /// Worktree desks (item 1): the driver's merge of a task's branch hit a conflict, or failed for
+    /// some other reason. `summary` is the conflict/error description; `is_conflict` (item 4)
+    /// distinguishes a REAL content conflict (wording tells the user to resolve it) from any other
+    /// merge failure (wording just says the task was re-queued). Either way the task bounces with the
+    /// summary as the review note and a retry gets a fresh worktree branched off the now-advanced
+    /// main.
+    DeskMergeConflict {
+        task: TaskId,
+        summary: String,
+        is_conflict: bool,
+    },
 }
 
 /// Side effects for the driver to execute. `InvokeModel`/`PublishContext` are part
@@ -325,6 +365,37 @@ pub enum Effect {
         task: TaskId,
         dir: PathBuf,
     },
+    /// Worktree desks (item 1/2): merge a task's `task/<slug>` branch into the delivery repo's
+    /// main branch after review PASS. The driver runs the git merge (serialized per repo,
+    /// fast-forward preferred) and feeds back `HostEvent::DeskMerged` (clean) or
+    /// `HostEvent::DeskMergeConflict` (conflict or other failure -> the task bounces with the
+    /// summary, worded per `is_conflict`, item 4).
+    MergeDesk {
+        task: TaskId,
+        /// The delivery path — the git repo whose main branch receives the merge.
+        repo: PathBuf,
+        /// The task's worktree path (removed after a clean merge).
+        desk: PathBuf,
+        /// The task branch `task/<slug>`.
+        branch: String,
+    },
+    /// Worktree desks (item 1): remove a task's worktree + delete its branch. Fire-and-forget
+    /// best-effort (no feedback event) — emitted on Done and on a terminal park when `keep_desks`
+    /// is off. A retry re-materializes a FRESH worktree regardless (the add tears down any stale
+    /// one first), so a bounce-within-budget relies on that rather than this.
+    RemoveDesk {
+        repo: PathBuf,
+        desk: PathBuf,
+        branch: String,
+    },
+    /// Sprints (feature: sprints): tag the delivery repo `sprint-<n>` after a sprint's last merge,
+    /// emitted when the sprint enters its review. Fire-and-forget best-effort like `RemoveDesk` (no
+    /// feedback event); the driver runs `git tag` serialized on the repo mutex and TRACES a failure
+    /// rather than wedging the ceremony. Only emitted in worktree-desks mode (a git repo exists).
+    TagSprint {
+        repo: PathBuf,
+        tag: String,
+    },
     Persist,
 }
 
@@ -352,7 +423,12 @@ pub fn step(p: &mut Project, input: Input, now_ms: u64, session_capacity: u32) -
     // Running (Interrupted/Halted/Done stop the line; in-flight results still get
     // processed above so a soft drain completes naturally).
     if matches!(p.phase, ProjectPhase::Running) {
+        // Sprints (feature: sprints): keep exactly one sprint Active whenever the machinery is live,
+        // scope the dispatch scan to it, then — if that sprint has fully settled — fire its review
+        // ceremony. A no-op for the legacy (empty-sprints) flow.
+        ensure_active_sprint(p, now_ms, &mut ctx);
         dispatch(p, now_ms, session_capacity, &mut ctx);
+        maybe_review_active_sprint(p, now_ms, &mut ctx);
     }
 
     if ctx.dirty {
@@ -401,6 +477,17 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
                 if resume_should_respawn_research(p) {
                     trace(p, now_ms, "research", "respawned on resume", ctx);
                     start_research(p, now_ms, ctx);
+                }
+                // Sprints (feature: sprints): a hard/soft interrupt during a sprint review dropped
+                // that ceremony's fire-and-forget invoke (its `InvokeResult` no-ops against the
+                // `Interrupted` guard). If we resumed to Running with a sprint still `InReview`, the
+                // ceremony owes a re-fire so it can finish — `fire_sprint_review` re-assembles the
+                // transcript and re-issues the ONE invoke (no re-tag, no double-count).
+                if matches!(p.phase, ProjectPhase::Running) {
+                    if let Some(si) = sprint_under_review_idx(p) {
+                        trace(p, now_ms, "sprint", format!("sprint {} review re-entered on resume", si + 1), ctx);
+                        fire_sprint_review(p, si, now_ms, ctx);
+                    }
                 }
             }
         }
@@ -462,7 +549,8 @@ fn handle_command(p: &mut Project, c: Command, now_ms: u64, ctx: &mut Ctx) {
         Command::Authorize {
             delivery_path,
             allow_outside_workspace,
-        } => authorize(p, delivery_path, allow_outside_workspace, now_ms, ctx),
+            worktree,
+        } => authorize(p, delivery_path, allow_outside_workspace, worktree, now_ms, ctx),
         Command::InvokeResult { purpose, outcome } => {
             invoke_result(p, purpose, outcome, now_ms, ctx)
         }
@@ -612,6 +700,303 @@ pub(crate) fn is_approval_intent(msg: &str) -> bool {
     APPROVAL_PHRASES.iter().any(|p| h.contains(&format!(" {p} ")))
 }
 
+/// Deterministic SDLC override-intent phrases (feature: sdlc-triage) — the SAME mechanism as
+/// [`APPROVAL_PHRASES`], a new phrase set. When a project is on a LIGHT track (patch/enhancement)
+/// and pre-authorize, one of these in a user message re-triages it to the full `project` ceremony.
+const OVERRIDE_PHRASES: &[&str] = &[
+    "full process", "make it a project", "make it a full project", "full project",
+    "full ceremony", "treat it as a project", "do the full process", "full sdlc",
+];
+
+/// Whether `msg` is a deterministic SDLC override to the full project track (feature: sdlc-triage):
+/// at least one [`OVERRIDE_PHRASES`] entry as a whole word/phrase AND no [`APPROVAL_NEGATIONS`]
+/// token (so "don't make it a project" does NOT trigger) — mirroring [`is_approval_intent`].
+pub(crate) fn is_override_intent(msg: &str) -> bool {
+    let h = normalize_for_match(msg);
+    if APPROVAL_NEGATIONS.iter().any(|n| h.contains(&format!(" {n} "))) {
+        return false;
+    }
+    OVERRIDE_PHRASES.iter().any(|p| h.contains(&format!(" {p} ")))
+}
+
+/// Whether a project is still PRE-AUTHORIZE (feature: sdlc-triage): Drafting or Ready, i.e. the
+/// board has not started grinding. SDLC override + enhancement->project escalation are only legal
+/// here; once Running, the track is locked in.
+fn is_pre_authorize(p: &Project) -> bool {
+    matches!(p.phase, ProjectPhase::Drafting | ProjectPhase::Ready)
+}
+
+/// Re-triage a light-track project to the full `project` ceremony (feature: sdlc-triage) — the
+/// user's explicit override, or an enhancement escalation via the same path. Sets the track, drops
+/// the light-track drafting artifacts (board if one was built in Ready, the placeholder/partial
+/// TRD+CRD, the gate + breakdown state, any pending assumptions, and the change-brief itself), and —
+/// from Ready — regresses the phase back to Drafting so the fuller ceremony re-runs. The change-brief
+/// TEXT stays available to the persona as carried context in `office_transcript` (never touched
+/// here); only the `prd_markdown` SLOT is cleared. NEVER touches a Running/authorized project
+/// (guarded by the caller).
+fn retriage_to_project(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let was_ready = matches!(p.phase, ProjectPhase::Ready);
+    if let Ok(ph) = step_project(&p.phase, ProjectTransition::Retriage) {
+        p.phase = ph;
+    }
+    p.track = "project".to_string();
+    // A light track that reached Ready built a board; drop it so the project ceremony rebuilds it.
+    if was_ready {
+        p.epics.clear();
+        p.stories.clear();
+        p.tasks.clear();
+    }
+    // Drop light-track doc/gate placeholders; the project ceremony authors a real PRD + TRD + CRD and
+    // re-gates.
+    p.trd_markdown.clear();
+    p.crd_markdown.clear();
+    p.gate_cleared = false;
+    p.gate_invoke_live_hint = false;
+    p.pending_breakdown = None;
+    p.pending_assumptions.clear();
+    // Review finding (MINOR): keeping the change-brief in `prd_markdown` left the slot non-empty, so
+    // the capture-miss nudge (guarded on the slot being EMPTY) never re-armed — if the project-track
+    // persona just chatted instead of emitting a fresh ```prd fence, nothing nudged it and the gate
+    // never re-ran (soft-stall). Clear the slot so a fenceless reply is treated as a forgotten fence
+    // again; the change-brief text itself is still in `office_transcript` for the persona's context.
+    p.prd_markdown.clear();
+    trace(p, now_ms, "sdlc", "retriage: change-brief cleared, awaiting full PRD", ctx);
+    trace(p, now_ms, "sdlc", "re-triaged to project (user override)", ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: reclassified as a full project — re-drafting under the full process.", p.id.0),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
+/// Fire the intake TRIAGE classifier invoke (feature: sdlc-triage) on the `safeguard_role` — a
+/// lightweight gate-family classification, NOT a doc-drafting invoke (never `drafter_model`). Sets
+/// `triage_pending` so the persona reply's doc-capture is suppressed until the track is known.
+fn start_triage(p: &mut Project, brief: &str, now_ms: u64, ctx: &mut Ctx) {
+    let (system, prompt) = office::build_triage_prompt(p, brief);
+    p.triage_pending = true;
+    trace(p, now_ms, "sdlc", "triage — classifying the brief", ctx);
+    emit_invoke(ctx, InvokePurpose::Triage, &p.config.safeguard_role, system, prompt);
+}
+
+/// The intake TRIAGE classifier returned (feature: sdlc-triage). Parse defensively (unparseable /
+/// error -> `project`), store the track, trace + notice the verdict, and route: `patch` builds the
+/// one-task board straight to Ready; `enhancement`/`project` just record the track (the persona now
+/// drafts under the track-aware contract). Always clears `triage_pending` so capture can proceed.
+fn handle_triage_result(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    p.triage_pending = false;
+    ctx.dirty = true;
+    let verdict = match &outcome {
+        Ok(text) => report::parse_triage(text),
+        Err(e) => {
+            trace(p, now_ms, "sdlc", format!("triage errored — defaulting to project: {}", trace_preview(e, 60)), ctx);
+            report::TriageVerdict::project_default()
+        }
+    };
+    let track = verdict.track.as_str();
+    p.track = track.to_string();
+    let rationale = if verdict.rationale.trim().is_empty() {
+        "no rationale given".to_string()
+    } else {
+        verdict.rationale.clone()
+    };
+    trace(p, now_ms, "sdlc", format!("classified as {} — {}", track, trace_preview(&rationale, 80)), ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: intake classified as {} — {}", p.id.0, track, trace_preview(&rationale, 160)),
+        ctx,
+    );
+    if matches!(verdict.track, report::TriageTrack::Patch) {
+        build_patch_board(p, now_ms, ctx);
+    } else if p.prd_markdown.trim().is_empty() {
+        // Persona-first race fix (review finding, MAJOR): the first message fires this triage invoke
+        // AND the persona invoke concurrently. If the persona reply — carrying the track's fence —
+        // lands FIRST, the Persona capture path (`invoke_result`) skips capture because
+        // `triage_pending` was still true, and this handler used to just clear that flag: the doc was
+        // silently dropped and the project soft-wedged until the user spoke again. Now that the track
+        // is known, re-scan the LAST office reply in the transcript for that track's fence and run the
+        // IDENTICAL capture path (`try_capture_track_doc`, shared with the primary site) so a raced
+        // doc is captured (and its gate fired) exactly as if triage had resolved first. No-op for
+        // `patch` (handled above, no docs) and a no-op when nothing raced (no office reply yet, or the
+        // reply carried no fence — the persona's normal capture-miss nudge machinery still applies).
+        if let Some(last_reply) = p
+            .office_transcript
+            .iter()
+            .rev()
+            .find(|m| matches!(m.who, ChatAuthor::Office))
+            .map(|m| m.text.clone())
+        {
+            if try_capture_track_doc(p, &last_reply, now_ms, ctx) {
+                trace(p, now_ms, "sdlc", "triage race: recovered doc from a persona reply that beat the verdict", ctx);
+            }
+        }
+    }
+}
+
+/// Attempt to capture the CURRENT track's drafting doc (the PRD on `project`, the change-brief on
+/// `enhancement`; `patch` never captures a doc) out of an office reply: land it, reset the capture
+/// nudge counter, trace + notify, kick research, and fire the PRD/change-brief gate — the EXACT same
+/// capture path the Persona invoke result runs inline. Factored out so the persona-first race fix in
+/// [`handle_triage_result`] re-scans a reply with logic that can never drift out of sync with the
+/// primary capture site. Returns `true` when a doc was captured — the caller must treat the reply as
+/// consumed (no further capture/nudge handling for it), mirroring the `return` after the inline
+/// capture blocks this was extracted from.
+fn try_capture_track_doc(p: &mut Project, reply: &str, now_ms: u64, ctx: &mut Ctx) -> bool {
+    match p.track.as_str() {
+        // ENHANCEMENT: capture the ```change change-brief into the PRD slot (so the gate/research/
+        // JOIN machinery reuses unchanged), then run the SAME research + gate as a PRD; on clear the
+        // PostPrd join skips the TRD/CRD trio for a small breakdown.
+        "enhancement" => {
+            let Some(cb) = office::extract_fenced(reply, "change") else {
+                return false;
+            };
+            p.prd_markdown = cb;
+            p.capture_nudge_count = 0;
+            p.gate_cleared = false;
+            trace(p, now_ms, "capture", format!("change-brief captured ({} bytes)", p.prd_markdown.len()), ctx);
+            queue_notice(
+                p,
+                now_ms,
+                format!(
+                    "office[{}]: change-brief drafted (full text in the Workflow panel) — checking assumptions before the small breakdown; do not authorize yet.",
+                    p.id.0
+                ),
+                ctx,
+            );
+            start_research_at_capture(p, now_ms, ctx);
+            gate_doc(p, Deferred::PostPrd, now_ms, ctx);
+            ctx.dirty = true;
+            true
+        }
+        // PATCH: the board is built programmatically at triage-resolve, so a reply never captures a
+        // doc — nothing to scan for.
+        "patch" => false,
+        // PROJECT (default): the unchanged full-ceremony capture path.
+        _ => {
+            let Some(prd) = office::extract_prd(reply) else {
+                return false;
+            };
+            p.prd_markdown = prd;
+            p.capture_nudge_count = 0; // a successful capture resets the nudge cap
+            p.gate_cleared = false; // fresh doc-set: the PRD gate has not cleared yet
+            trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
+            queue_notice(
+                p,
+                now_ms,
+                format!(
+                    "office[{}]: PRD drafted (full text in the Workflow panel) — researching the stack and checking assumptions in parallel; do not authorize yet.",
+                    p.id.0
+                ),
+                ctx,
+            );
+            // Item 2/4: spawn research now (or defer/skip per research_mode), concurrently with the
+            // PRD gate below.
+            start_research_at_capture(p, now_ms, ctx);
+            gate_doc(p, Deferred::PostPrd, now_ms, ctx);
+            ctx.dirty = true;
+            true
+        }
+    }
+}
+
+/// The intake brief text for a patch task (feature: sdlc-triage): the FIRST user turn in the
+/// transcript — reliably the brief, since a patch board is built immediately after the first message
+/// (before any folding). Empty when somehow absent.
+fn intake_brief_text(p: &Project) -> String {
+    p.office_transcript
+        .iter()
+        .find(|m| matches!(m.who, ChatAuthor::User))
+        .map(|m| m.text.clone())
+        .unwrap_or_default()
+}
+
+/// A short single-line title for a patch task, derived from the brief's first non-empty line.
+fn patch_task_title(brief: &str) -> String {
+    let first = brief
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['#', '-', '*', ' ']))
+        .find(|l| !l.is_empty())
+        .unwrap_or("Patch");
+    let t = trace_preview(first, 80);
+    if t.is_empty() {
+        "Patch".to_string()
+    } else {
+        t
+    }
+}
+
+/// Build the PATCH-track board programmatically (feature: sdlc-triage): NO documents, NO breakdown
+/// invoke — the brief text becomes a single Todo task and the project goes straight Drafting ->
+/// Ready, awaiting authorize. Grind + merge review then run as normal; the final audit is skipped
+/// (merge review is the gate — see [`maybe_complete_project`]). Guarded to Drafting so a late/racey
+/// call can never rebuild a board.
+fn build_patch_board(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if !matches!(p.phase, ProjectPhase::Drafting) {
+        return;
+    }
+    let brief = intake_brief_text(p);
+    let brief = if brief.trim().is_empty() {
+        "Apply the requested change.".to_string()
+    } else {
+        brief
+    };
+    let proj = p.id.0.clone();
+    let epic_id = crate::domain::EpicId(format!("{}/patch", proj));
+    let story_id = crate::domain::StoryId(format!("{}/patch/change", proj));
+    let task_id = TaskId(format!("{}/patch/change/apply", proj));
+    let task = Task {
+        id: task_id.clone(),
+        title: patch_task_title(&brief),
+        description: brief,
+        acceptance: vec![
+            "The change described in the task is fully implemented and working".to_string(),
+            "The delivered tree stays clean (no trash or dead files; README preserved)".to_string(),
+        ],
+        blocked_by: Vec::new(),
+        priority: 0,
+        state: TaskState::Todo,
+        bounces: 0,
+        comments: Vec::new(),
+        desk: None,
+        last_report: None,
+        last_review: None,
+        history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
+    };
+    p.epics = vec![crate::domain::Epic {
+        id: epic_id,
+        title: "Patch".to_string(),
+        intent: "A single-task patch".to_string(),
+        stories: vec![story_id.clone()],
+    }];
+    p.stories = vec![crate::domain::Story {
+        id: story_id,
+        title: "Change".to_string(),
+        intent: "The requested change".to_string(),
+        tasks: vec![task_id],
+    }];
+    p.tasks = vec![task];
+    if let Ok(ph) = step_project(&p.phase, ProjectTransition::AcceptBreakdown) {
+        p.phase = ph;
+    }
+    trace(p, now_ms, "sdlc", "patch board built — 1 task, straight to Ready", ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: board is ready — 1 task (patch track). Authorize with a delivery path (workflow_authorize) to start the production line.",
+            p.id.0
+        ),
+        ctx,
+    );
+    ctx.dirty = true;
+}
+
 /// Append the user turn and issue a persona invoke. If the assembled prompt would cross
 /// the fold threshold, a summarize invoke is issued FIRST (6.2); the persona invoke is
 /// re-issued from `invoke_result` once the fold lands.
@@ -621,6 +1006,13 @@ pub(crate) fn is_approval_intent(msg: &str) -> bool {
 /// (`assumptions_approved`), `pending_assumptions` cleared, and a trace notice queued — so the
 /// persona invoke that follows re-emits the doc and `gate_doc` fails open instead of re-stopping.
 fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
+    // SDLC override (feature: sdlc-triage): a clear "make it a full project" intent on a LIGHT track
+    // (patch/enhancement) that is still pre-authorize re-triages it to the full ceremony. Checked
+    // before anything else, and naturally a no-op on a fresh project (track is still "project").
+    if p.track != "project" && is_pre_authorize(p) && is_override_intent(&text) {
+        retriage_to_project(p, now_ms, ctx);
+    }
+
     if !p.pending_assumptions.is_empty() && is_approval_intent(&text) {
         p.assumptions_approved = true;
         p.pending_assumptions.clear();
@@ -633,6 +1025,20 @@ fn office_message(p: &mut Project, text: String, now_ms: u64, ctx: &mut Ctx) {
             format!("office[{}]: assumptions approved — gate closed for this project.", p.id.0),
             ctx,
         );
+    }
+
+    // Intake TRIAGE (feature: sdlc-triage): the FIRST message of a fresh, docless Drafting project
+    // fires ONE additional lightweight classifier invoke ALONGSIDE the persona reply below. Guarded
+    // so it fires exactly once per project and never on a mid-drafting continuation: an empty
+    // transcript (this is the first user turn), still Drafting, no PRD/change-brief captured yet, and
+    // none already in flight. Built from `text` before it is moved into the transcript.
+    let first_message = p.office_transcript.is_empty();
+    if first_message
+        && matches!(p.phase, ProjectPhase::Drafting)
+        && p.prd_markdown.trim().is_empty()
+        && !p.triage_pending
+    {
+        start_triage(p, &text, now_ms, ctx);
     }
 
     // Trace BEFORE the move: the preview is the first ~80 chars, never the whole message.
@@ -812,13 +1218,39 @@ fn restart_research_if_running(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 /// pre-migration state.
 fn maybe_author_trdcrd(p: &mut Project, now_ms: u64, research_spawned_at_ms: Option<u64>, ctx: &mut Ctx) {
     self_heal_stale_prd_gate(p, now_ms, research_spawned_at_ms, ctx);
-    if p.gate_cleared
-        && p.research.is_none()
-        && p.trd_markdown.trim().is_empty()
-        && p.crd_markdown.trim().is_empty()
-    {
+    if !(p.gate_cleared && p.research.is_none()) {
+        return;
+    }
+    // SDLC enhancement track (feature: sdlc-triage): SKIP the full TRD/CRD trio — go straight to a
+    // small breakdown (the change-brief gate already cleared, standing in for the second gate too).
+    if p.track == "enhancement" {
+        maybe_start_enhancement_breakdown(p, now_ms, ctx);
+    } else if p.trd_markdown.trim().is_empty() && p.crd_markdown.trim().is_empty() {
         start_trdcrd_invoke(p, now_ms, ctx);
     }
+}
+
+/// The ENHANCEMENT-track post-change-brief join (feature: sdlc-triage): once the change-brief gate
+/// has cleared AND research settled, skip the TRD/CRD trio and start a SMALL breakdown directly. The
+/// CRD is inherited if a prior one exists, else a minimal hygiene-only CRD is generated
+/// PROGRAMMATICALLY (no invoke round) so the completion audit still has a checklist. Once-only:
+/// guarded on no stashed breakdown, an empty board, and still Drafting (matching the project join's
+/// "not already captured" idempotency).
+fn maybe_start_enhancement_breakdown(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if p.pending_breakdown.is_some()
+        || !p.tasks.is_empty()
+        || !matches!(p.phase, ProjectPhase::Drafting)
+    {
+        return;
+    }
+    if p.crd_markdown.trim().is_empty() {
+        p.crd_markdown = office::minimal_hygiene_crd();
+        trace(p, now_ms, "sdlc", "enhancement: minimal hygiene CRD generated", ctx);
+    } else {
+        trace(p, now_ms, "sdlc", "enhancement: inheriting existing CRD", ctx);
+    }
+    trace(p, now_ms, "sdlc", "enhancement: skipping TRD/CRD trio — small breakdown", ctx);
+    start_early_breakdown(p, now_ms, ctx);
 }
 
 /// Self-heal a PRD gate wedged by pre-migration state (review finding, design-speedup
@@ -1227,6 +1659,31 @@ fn handle_assume_check_result(
     let items: Vec<String> = check.map(|c| c.items).unwrap_or_default();
     let auto_mode = p.config.assumption_mode == "auto";
 
+    // SDLC escalation (feature: sdlc-triage): an ENHANCEMENT whose change-brief gate (PostPrd)
+    // surfaces MORE than N material assumptions is wider than a change -> escalate to the full
+    // project track. Flip the track + trace here; the gate then finishes normally (resolve/freeze/
+    // verify on the change-brief), and on clear the PostPrd join authors TRD+CRD (project branch)
+    // instead of the small enhancement breakdown. Pre-authorize by construction (the gate runs in
+    // Drafting).
+    if matches!(deferred, Deferred::PostPrd)
+        && p.track == "enhancement"
+        && verdict == report::AssumeVerdict::Assumptions
+        && items.len() > ENHANCEMENT_ASSUMPTION_ESCALATION_MAX
+    {
+        trace(p, now_ms, "sdlc", "escalating enhancement → project", ctx);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: {} material assumptions on the change — wider than an enhancement; reclassified as a full project.",
+                p.id.0,
+                items.len()
+            ),
+            ctx,
+        );
+        p.track = "project".to_string();
+    }
+
     // (1) Inline revision — only the compressed auto-mode gate revises, and only on an assumptions
     // verdict.
     let revised = auto_mode
@@ -1573,11 +2030,36 @@ fn clip_assumptions(items: &[String]) -> String {
 
 /// The hard authorization gate (6.3.3). The driver has already validated + created the
 /// path; `delivery_valid` is its verdict, and `office::authorize` re-checks the shape
-/// before transitioning `Ready -> Running`.
-fn authorize(p: &mut Project, delivery_path: PathBuf, allow_outside: bool, now_ms: u64, ctx: &mut Ctx) {
+/// before transitioning `Ready -> Running`. `worktree` is the driver's git-repo setup verdict
+/// (item 1): `Ok` turns worktree desks on for the project; `Err(reason)` records the fallback to
+/// legacy copy-desks with the reason traced.
+fn authorize(
+    p: &mut Project,
+    delivery_path: PathBuf,
+    allow_outside: bool,
+    worktree: Result<(), String>,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
     let path_str = delivery_path.display().to_string();
     match office::authorize(p, delivery_path, allow_outside) {
         Ok(()) => {
+            match &worktree {
+                Ok(()) => {
+                    p.worktree_desks = true;
+                    trace(p, now_ms, "desk", "worktree desks enabled — delivery is a git repo", ctx);
+                }
+                Err(reason) => {
+                    p.worktree_desks = false;
+                    trace(
+                        p,
+                        now_ms,
+                        "desk",
+                        format!("worktree desks unavailable ({}) — legacy desks", trace_preview(reason, 80)),
+                        ctx,
+                    );
+                }
+            }
             trace(p, now_ms, "authorize", format!("granted — {}", trace_preview(&path_str, 80)), ctx);
             ctx.dirty = true;
         }
@@ -1619,6 +2101,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
         return;
     }
     match purpose {
+        InvokePurpose::Triage => handle_triage_result(p, outcome, now_ms, ctx),
         InvokePurpose::Persona => {
             let reply = match outcome {
                 Ok(t) => t,
@@ -1642,62 +2125,66 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
             // while the board stays empty (live-test 2026-07-15). A fenceless reply while
             // `pending_assumptions` is set re-runs the gate on the newest doc-set so the updated
             // transcript is re-judged.
-            if matches!(p.phase, ProjectPhase::Drafting) {
-                if let Some(prd) = office::extract_prd(&reply) {
-                    p.prd_markdown = prd;
-                    p.capture_nudge_count = 0; // a successful capture resets the nudge cap
-                    p.gate_cleared = false; // fresh doc-set: the PRD gate has not cleared yet
-                    trace(p, now_ms, "capture", format!("PRD captured ({} bytes)", p.prd_markdown.len()), ctx);
-                    queue_notice(
-                        p,
-                        now_ms,
-                        format!(
-                            "office[{}]: PRD drafted (full text in the Workflow panel) — researching the stack and checking assumptions in parallel; do not authorize yet.",
-                            p.id.0
-                        ),
-                        ctx,
-                    );
-                    // Item 2/4: spawn research now (or defer/skip per research_mode), concurrently
-                    // with the PRD gate below.
-                    start_research_at_capture(p, now_ms, ctx);
-                    gate_doc(p, Deferred::PostPrd, now_ms, ctx);
-                    ctx.dirty = true;
+            // Intake TRIAGE (feature: sdlc-triage): while the classifier is still in flight the track
+            // — which decides WHICH fence/contract applies — is not yet known, so a Drafting reply
+            // does NOT capture a doc into the pipeline (`!p.triage_pending`); it only flows to chat
+            // below. Once the track is known, the capture path branches on it.
+            if matches!(p.phase, ProjectPhase::Drafting) && !p.triage_pending {
+                // The fence-capture branch is shared with the persona-first race fix in
+                // `handle_triage_result` (`try_capture_track_doc`) so both sites can never drift out
+                // of sync.
+                if try_capture_track_doc(p, &reply, now_ms, ctx) {
                     return;
                 }
-                let (chat_trd, chat_crd) = office::extract_trd_crd(&reply);
-                if chat_trd.is_some() || chat_crd.is_some() {
-                    reset_trdcrd_capture(p, now_ms, ctx);
-                    p.capture_nudge_count = 0;
-                    if let Some(t) = chat_trd {
-                        p.trd_markdown = t;
+                match p.track.as_str() {
+                    "enhancement" => {
+                        if !p.pending_assumptions.is_empty() {
+                            recheck_pending_assumptions(p, now_ms, ctx);
+                        }
                     }
-                    if let Some(c) = chat_crd {
-                        p.crd_markdown = c;
-                    }
-                    trace(
-                        p,
-                        now_ms,
-                        "capture",
-                        format!("TRD+CRD captured via chat (trd {}B, crd {}B)", p.trd_markdown.len(), p.crd_markdown.len()),
-                        ctx,
-                    );
-                    queue_notice(p, now_ms, format!("office[{}]: TRD + clean-build requirements updated (panel).", p.id.0), ctx);
-                    gate_doc(p, Deferred::Breakdown, now_ms, ctx);
-                    ctx.dirty = true;
-                    return;
-                }
+                    // PATCH: the board is built programmatically at triage-resolve, so a Drafting reply
+                    // never captures a doc — fall through to the chat notice.
+                    // Review finding (COMMENT): patch track: no doc, no assumption gate BY DESIGN even
+                    // in `ask` mode; authorize + merge review are the human gates.
+                    "patch" => {}
+                    // PROJECT (default): the unchanged full-ceremony capture path.
+                    _ => {
+                        let (chat_trd, chat_crd) = office::extract_trd_crd(&reply);
+                        if chat_trd.is_some() || chat_crd.is_some() {
+                            reset_trdcrd_capture(p, now_ms, ctx);
+                            p.capture_nudge_count = 0;
+                            if let Some(t) = chat_trd {
+                                p.trd_markdown = t;
+                            }
+                            if let Some(c) = chat_crd {
+                                p.crd_markdown = c;
+                            }
+                            trace(
+                                p,
+                                now_ms,
+                                "capture",
+                                format!("TRD+CRD captured via chat (trd {}B, crd {}B)", p.trd_markdown.len(), p.crd_markdown.len()),
+                                ctx,
+                            );
+                            queue_notice(p, now_ms, format!("office[{}]: TRD + clean-build requirements updated (panel).", p.id.0), ctx);
+                            gate_doc(p, Deferred::Breakdown, now_ms, ctx);
+                            ctx.dirty = true;
+                            return;
+                        }
 
-                // No fresh fence, but the pipeline is STOPPED on a prior gate's assumptions and the
-                // user just replied — their approval / answers / delegation now sit in the
-                // transcript. Re-run the gate on the newest captured doc so that UPDATED transcript
-                // is re-judged; a clean re-check clears `pending_assumptions` and resumes the
-                // deferred stage. Without this, a stopped gate never re-fires and Drafting wedges
-                // forever (live-test 2026-07-15: the persona answered in prose, no new fence, and
-                // the gate never re-ran). Exactly ONE re-check per persona exchange: the AssumeCheck
-                // result is not a persona result, so it cannot recurse. The persona reply itself
-                // still flows to chat below.
-                if !p.pending_assumptions.is_empty() {
-                    recheck_pending_assumptions(p, now_ms, ctx);
+                        // No fresh fence, but the pipeline is STOPPED on a prior gate's assumptions and the
+                        // user just replied — their approval / answers / delegation now sit in the
+                        // transcript. Re-run the gate on the newest captured doc so that UPDATED transcript
+                        // is re-judged; a clean re-check clears `pending_assumptions` and resumes the
+                        // deferred stage. Without this, a stopped gate never re-fires and Drafting wedges
+                        // forever (live-test 2026-07-15: the persona answered in prose, no new fence, and
+                        // the gate never re-ran). Exactly ONE re-check per persona exchange: the AssumeCheck
+                        // result is not a persona result, so it cannot recurse. The persona reply itself
+                        // still flows to chat below.
+                        if !p.pending_assumptions.is_empty() {
+                            recheck_pending_assumptions(p, now_ms, ctx);
+                        }
+                    }
                 }
             }
 
@@ -1722,22 +2209,29 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
                 }
             }
 
-            // Capture miss (feature: capture nudge): in Drafting, a long reply that landed no
-            // ```prd fence while the PRD slot is still empty is almost always a PRD the office
-            // narrated but forgot to fence (live-test 2026-07-15). Fire ONE deterministic re-invoke
-            // asking for ONLY the fenced doc, capped at MAX_CAPTURE_NUDGES in a row so a model that
-            // never emits the fence falls back to today's wait-for-user behavior instead of looping.
-            // TRD/CRD are authored through their own dedicated invokes, never this Persona channel,
-            // so the PRD is the only doc this nudge targets.
+            // Capture miss (feature: capture nudge): in Drafting, a long reply that landed no primary
+            // doc fence while the doc slot is still empty is almost always a doc the office narrated
+            // but forgot to fence (live-test 2026-07-15). Fire ONE deterministic re-invoke asking for
+            // ONLY the fenced doc, capped at MAX_CAPTURE_NUDGES in a row. The doc is the PRD on the
+            // project track and the change-brief (```change) on the enhancement track (feature:
+            // sdlc-triage) — both live in the PRD slot. Never during triage (track unknown) and never
+            // on the patch track (it drafts no doc); TRD/CRD are authored through dedicated invokes.
             if matches!(p.phase, ProjectPhase::Drafting)
+                && !p.triage_pending
+                && p.track != "patch"
                 && p.prd_markdown.trim().is_empty()
                 && reply.len() > PRD_NUDGE_MIN_REPLY_BYTES
                 && p.capture_nudge_count < MAX_CAPTURE_NUDGES
             {
                 p.capture_nudge_count += 1;
-                trace(p, now_ms, "nudge", format!("PRD capture-miss nudge #{}", p.capture_nudge_count), ctx);
+                let (doc_label, instruction) = if p.track == "enhancement" {
+                    ("change-brief", CHANGE_NUDGE_INSTRUCTION)
+                } else {
+                    ("PRD", PRD_NUDGE_INSTRUCTION)
+                };
+                trace(p, now_ms, "nudge", format!("{doc_label} capture-miss nudge #{}", p.capture_nudge_count), ctx);
                 let (mut system, prompt) = office::build_invoke(p, "");
-                system.push_str(PRD_NUDGE_INSTRUCTION);
+                system.push_str(instruction);
                 emit_draft_invoke(p, ctx, InvokePurpose::Persona, system, prompt);
                 ctx.dirty = true;
                 return;
@@ -1769,6 +2263,7 @@ fn invoke_result(p: &mut Project, purpose: InvokePurpose, outcome: Result<String
         }
         InvokePurpose::AssumeResolve => handle_assume_resolve_result(p, outcome, now_ms, ctx),
         InvokePurpose::AssumeVerify => handle_assume_verify_result(p, outcome, now_ms, ctx),
+        InvokePurpose::SprintReview => finish_sprint_review(p, outcome, now_ms, ctx),
     }
 }
 
@@ -1878,6 +2373,13 @@ fn apply_or_stash_breakdown(
     ctx: &mut Ctx,
 ) {
     if matches!(p.phase, ProjectPhase::Drafting) {
+        // SDLC escalation (feature: sdlc-triage): an ENHANCEMENT whose breakdown returns more than 3
+        // tasks is wider than a change — escalate to the full project ceremony (author TRD+CRD)
+        // instead of stashing this plan. Pre-authorize only (we are in Drafting).
+        if p.track == "enhancement" && breakdown.task_count() > ENHANCEMENT_BREAKDOWN_TASK_MAX {
+            escalate_enhancement_to_project_via_breakdown(p, breakdown.task_count(), now_ms, ctx);
+            return;
+        }
         p.pending_breakdown = Some(text);
         trace(p, now_ms, "breakdown", "breakdown stashed (early)", ctx);
         maybe_apply_breakdown(p, now_ms, ctx);
@@ -1885,6 +2387,31 @@ fn apply_or_stash_breakdown(
     } else {
         land_breakdown(p, breakdown, now_ms, ctx);
     }
+}
+
+/// Escalate an ENHANCEMENT to the full project track because its breakdown was wider than a change
+/// (feature: sdlc-triage). Flip the track, discard the oversized plan and the placeholder hygiene
+/// CRD, and author the real TRD+CRD from the change-brief (which stays in the PRD slot as context).
+/// The change-brief/PRD gate already cleared, so authoring can fire immediately.
+fn escalate_enhancement_to_project_via_breakdown(p: &mut Project, task_count: usize, now_ms: u64, ctx: &mut Ctx) {
+    trace(p, now_ms, "sdlc", "escalating enhancement → project", ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!(
+            "office[{}]: the change needs {} tasks — wider than an enhancement; reclassified as a full project, drafting TRD + CRD.",
+            p.id.0, task_count
+        ),
+        ctx,
+    );
+    p.track = "project".to_string();
+    p.pending_breakdown = None;
+    // The placeholder hygiene CRD (and any partial TRD) is dropped — the project ceremony authors the
+    // real pair. `gate_cleared` stays true (the change-brief/PRD gate passed), so authoring fires now.
+    p.crd_markdown.clear();
+    p.trd_markdown.clear();
+    start_trdcrd_invoke(p, now_ms, ctx);
+    ctx.dirty = true;
 }
 
 /// Land a validated breakdown on the board and announce it — shared by the first attempt,
@@ -1982,14 +2509,20 @@ fn invoke_format(purpose: InvokePurpose) -> Option<&'static str> {
         InvokePurpose::Breakdown | InvokePurpose::BreakdownReask | InvokePurpose::BreakdownCompact => {
             Some("json")
         }
-        InvokePurpose::Persona
+        // Triage asks for the `SDLC-TRIAGE` TEXT block, so it stays OUT of json mode for the same
+        // reason as the assume-check gate (json mode 400s / breaks the tolerant text parser on the
+        // common chat-completions dialects) — and it fails OPEN to `project` on an unparseable result.
+        InvokePurpose::Triage
+        | InvokePurpose::Persona
         | InvokePurpose::TrdCrd
         | InvokePurpose::Fold
         | InvokePurpose::AssumeCheckPrd
         | InvokePurpose::AssumeCheckTrdCrd
         // AssumeResolve / AssumeVerify re-emit / report prose text blocks, never JSON.
         | InvokePurpose::AssumeResolve
-        | InvokePurpose::AssumeVerify => None,
+        | InvokePurpose::AssumeVerify
+        // SprintReview asks for the `SPRINT-REVIEW` TEXT block (tolerant-parsed), never JSON.
+        | InvokePurpose::SprintReview => None,
     }
 }
 
@@ -2013,6 +2546,17 @@ fn hard_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     // for THIS process once Interrupted, by the same "process boundary" reasoning as the on-load
     // default.
     p.gate_invoke_live_hint = false;
+    // Intake triage (feature: sdlc-triage): same "process boundary" reasoning — a triage invoke in
+    // flight at interrupt has its result dropped by the `Interrupted` guard in `invoke_result`, so a
+    // `triage_pending` left `true` would suppress the persona doc-capture forever after resume. Clear
+    // it; the track stays whatever it was (default "project"), which is the safe fallback.
+    p.triage_pending = false;
+    // Sprint review ceremony (review finding, CRITICAL): same "process boundary" reasoning — an
+    // in-flight `SprintReview` invoke's eventual result is dropped by the `Interrupted` guard, so a
+    // hint left `true` would wrongly block `rearm_stranded_sprint_reviews` after resume. Clear it; the
+    // `Command::Resume` handler already re-fires the ceremony directly when it resumes into a sprint
+    // still `InReview`.
+    p.sprint_review_invoke_live = false;
     // Cut off the project-level drafting/completion analysts (research 6.2b, audit 6.2c). They
     // are NOT task bindings, so the normalization loop below never touches them; a dangling
     // researcher/auditor would keep burning tokens against an interrupted project (feature:
@@ -2069,6 +2613,11 @@ fn soft_interrupt(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
     // invoke's result unconditionally (soft drain does not exempt kernel-level invokes, only
     // sub-agent `HostEvent::Result`s), so a hint left `true` would never clear on its own.
     p.gate_invoke_live_hint = false;
+    // Intake triage (feature: sdlc-triage): clear the pending flag for the same reason.
+    p.triage_pending = false;
+    // Sprint review ceremony (review finding, CRITICAL): clear the live-invoke hint for the same
+    // reason — `Command::Resume` re-fires the ceremony directly when applicable.
+    p.sprint_review_invoke_live = false;
 }
 
 /// Kill the project-level analyst bindings (research 6.2b / audit 6.2c) on a hard interrupt
@@ -2098,7 +2647,13 @@ fn kill_project_bindings(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
 fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
     match e {
         HostEvent::Tick => {} // dispatch scan runs after every input
-        HostEvent::Reconcile => runtime_ceiling(p, now_ms, ctx),
+        HostEvent::Reconcile => {
+            runtime_ceiling(p, now_ms, ctx);
+            // Review finding (CRITICAL): the same periodic pass that force-kills a hung worker/
+            // research/audit binding also re-arms a sprint-review ceremony whose invoke was dropped
+            // by a daemon restart.
+            rearm_stranded_sprint_reviews(p, now_ms, ctx);
+        }
         HostEvent::Spawned {
             task,
             agent_id,
@@ -2119,6 +2674,10 @@ fn handle_event(p: &mut Project, e: HostEvent, now_ms: u64, ctx: &mut Ctx) {
         HostEvent::AuditFailed { reason } => audit_degrade(p, reason, now_ms, ctx),
         HostEvent::CommentDelivered { task, comment_id } => {
             on_comment_delivered(p, &task, comment_id, now_ms, ctx)
+        }
+        HostEvent::DeskMerged { task } => on_desk_merged(p, &task, now_ms, ctx),
+        HostEvent::DeskMergeConflict { task, summary, is_conflict } => {
+            on_desk_merge_conflict(p, &task, summary, is_conflict, now_ms, ctx)
         }
     }
 }
@@ -2187,8 +2746,211 @@ fn on_agents_done(p: &mut Project, agent_id: u64, status: &str, error: Option<&s
             ext_agent_id: agent_id,
         });
     } else {
-        requeue_failed(p, idx, now_ms, "worker-error", ctx);
+        diagnose_and_requeue(p, idx, status, error, now_ms, ctx);
     }
+}
+
+/// Milliseconds below which a dead agent counts as an INSTANT death (item 4): it fell over almost
+/// immediately after spawn, so a blind same-millisecond re-dispatch would just replay the death.
+const INSTANT_DEATH_MS: u64 = 5_000;
+
+/// Diagnose a dead worker/reviewer (an `agents.done` with a non-`done` status, or a killed poll)
+/// and re-queue it (item 4). Three cases:
+///  - the death reason names a "daemon restart" -> PAUSE without burning an attempt or backoff; the
+///    existing reconcile/resume flow re-dispatches it (a restart is transient, not the task's fault).
+///  - it died < `INSTANT_DEATH_MS` after spawn -> INSTANT death: record the reason + trace
+///    "attempt N died at step 0", then set a dispatch backoff (10s then 60s) before the retry.
+///  - otherwise (it ran a while, then died) -> re-queue immediately as before, clearing any backoff.
+fn diagnose_and_requeue(p: &mut Project, idx: usize, status: &str, error: Option<&str>, now_ms: u64, ctx: &mut Ctx) {
+    let who = match binding_kind(&p.tasks[idx].state) {
+        Some(AgentKind::Reviewer) => "reviewer",
+        _ => "worker",
+    };
+    let reason = degrade_reason(who, status, error);
+
+    // Daemon-restart deaths are host lifecycle noise, not task failures: don't burn an attempt.
+    if is_daemon_restart(&reason) {
+        pause_for_daemon_restart(p, idx, now_ms, ctx);
+        return;
+    }
+
+    let alive = spawned_ago(&p.tasks[idx].state, now_ms);
+    let instant = matches!(alive, Some(ms) if ms < INSTANT_DEATH_MS);
+    let attempt = current_attempt(&p.tasks[idx].state);
+
+    if instant {
+        // `prior` counts instant deaths already recorded, so the FIRST instant death backs off 10s
+        // (going into the 2nd attempt) and the second 60s (going into the 3rd), matching the spec.
+        let prior = instant_death_count(&p.tasks[idx]);
+        record(&mut p.tasks[idx], now_ms, format!("died-at-step-0:{reason}"));
+        trace(
+            p,
+            now_ms,
+            "death",
+            format!("attempt {attempt} died at step 0: {}", trace_preview(&reason, 80)),
+            ctx,
+        );
+        ctx.dirty = true;
+
+        // item 3: chronic instant death — 3 in a row (this one included) parks the task instead of
+        // retrying forever, mirroring the SpawnFailed pattern (kernel.rs `on_spawn_failed`).
+        // `instant_death_streak` counts CONSECUTIVE instant deaths and resets on a non-instant run,
+        // unlike `prior`/`instant_death_count` above, which is a lifetime tally that only escalates
+        // the backoff and never resets.
+        if instant_death_streak(&p.tasks[idx]) >= 3 {
+            // Same reasoning as the diff_stat gate below: a reviewer death never touched the
+            // worktree, so only reclaim the desk for a chronically-dying WORKER.
+            if who == "worker" {
+                maybe_remove_worktree(p, idx, ctx);
+            }
+            p.tasks[idx].state = TaskState::Parked {
+                reason: ParkReason::InstantDeath(reason.clone()),
+                attempt,
+            };
+            trace(
+                p,
+                now_ms,
+                "death",
+                format!(
+                    "{} parked (chronic instant death): {}",
+                    short_task(&p.tasks[idx].id),
+                    trace_preview(&reason, 80)
+                ),
+                ctx,
+            );
+            check_halt(p, now_ms, ctx);
+            return;
+        }
+
+        let delay = instant_death_backoff_ms(prior);
+        // Re-queue FIRST (moves the task to Todo / Review{None}), then stamp the cooldown on it so
+        // the next dispatch scan defers the retry.
+        requeue_failed(p, idx, now_ms, "worker-error", ctx);
+        p.tasks[idx].dispatch_after_ms = now_ms.saturating_add(delay);
+        // item 1: only a WORKER death touches the worktree — a reviewer never writes to it. Clearing
+        // diff_stat on a reviewer death would permanently wedge the task: worktree-mode review
+        // dispatch (`pending_reviews_sorted`) gates on `diff_stat.is_some()`, and the only writer is
+        // the worker's commit step (driver.rs `maybe_commit_worktree`), which a reviewer never runs.
+        if who == "worker" {
+            p.tasks[idx].diff_stat = None; // a fresh worktree recomputes it on the next commit
+        }
+        trace(
+            p,
+            now_ms,
+            "death",
+            format!("retry deferred {}s (instant-death backoff)", delay / 1000),
+            ctx,
+        );
+    } else {
+        // item 3: an explicit "ran a while" marker so `instant_death_streak` can find the reset
+        // boundary — distinct from the requeue's own "worker-error" tag below, which both the
+        // instant and non-instant paths share and so can't be used to tell them apart.
+        record(&mut p.tasks[idx], now_ms, format!("died-after-run:{reason}"));
+        requeue_failed(p, idx, now_ms, "worker-error", ctx);
+        p.tasks[idx].dispatch_after_ms = 0; // ran a while; retry immediately as before
+        // item 1: see the instant-death branch above — only a worker death clears diff_stat.
+        if who == "worker" {
+            p.tasks[idx].diff_stat = None;
+        }
+    }
+}
+
+/// The instant-death retry backoff for the NEXT attempt, given how many instant deaths already
+/// happened (item 4): first death -> 10s (attempt 2), second onward -> 60s (attempt 3+ cap). No
+/// backoff would be `0`.
+fn instant_death_backoff_ms(prior_instant_deaths: u32) -> u64 {
+    match prior_instant_deaths {
+        0 => 10_000,
+        _ => 60_000,
+    }
+}
+
+/// Count of `died-at-step-0` markers already in a task's history (item 4) — the instant-death
+/// tally that escalates the backoff. Distinct from `spawn_failure_streak`: a spawn succeeds each
+/// retry (recording `spawned:`), so this counts the deaths themselves, not a since-last-spawn run.
+/// A LIFETIME tally that never resets — for the CONSECUTIVE streak used to park chronic instant
+/// deaths (item 3), see [`instant_death_streak`] instead.
+fn instant_death_count(t: &Task) -> u32 {
+    t.history.iter().filter(|e| e.event.starts_with("died-at-step-0")).count() as u32
+}
+
+/// Consecutive instant-death streak, most-recent-first (item 3, chronic-death parking): the number
+/// of instant deaths in a row since the task last proved it isn't chronically instant-dying — a
+/// non-instant death (`died-after-run`), a spawn failure, a runtime-ceiling kill, a daemon-restart
+/// pause, or a normal report/review outcome all reset it. Bookkeeping markers that decorate every
+/// death alike (`next-attempt:`, `spawned:`, the requeue's own `worker-error` tag) are transparent:
+/// they neither count nor break the streak.
+fn instant_death_streak(t: &Task) -> u32 {
+    let mut count = 0;
+    for e in t.history.iter().rev() {
+        if e.event.starts_with("died-at-step-0") {
+            count += 1;
+        } else if e.event.starts_with("next-attempt:") || e.event.starts_with("spawned:") || e.event.starts_with("worker-error") {
+            continue;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Whether a death reason names a daemon restart (item 4): the host tore the agent down because the
+/// daemon itself cycled, not because the task misbehaved — so we should not spend an attempt on it.
+fn is_daemon_restart(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("daemon restart")
+}
+
+/// Milliseconds a task's agent has been alive, from its binding's spawn time (item 4). `None` when
+/// the task carries no live binding (nothing to measure).
+fn spawned_ago(state: &TaskState, now_ms: u64) -> Option<u64> {
+    let at = match state {
+        TaskState::OnProgress { binding, .. } => binding.spawned_at_ms,
+        TaskState::Review { binding: Some(b), .. } => b.spawned_at_ms,
+        _ => return None,
+    };
+    Some(now_ms.saturating_sub(at))
+}
+
+/// The attempt number a task is currently running (item 4), for the death trace.
+fn current_attempt(state: &TaskState) -> u32 {
+    match state {
+        TaskState::OnProgress { attempt, .. } | TaskState::Review { attempt, .. } => *attempt,
+        _ => 0,
+    }
+}
+
+/// Pause a task after a daemon-restart death (item 4): re-queue WITHOUT incrementing the attempt or
+/// applying backoff, so the existing reconcile/resume flow re-dispatches it cleanly. A worker returns
+/// to Todo at the SAME attempt; a reviewer to Review{None}.
+fn pause_for_daemon_restart(p: &mut Project, idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    record(&mut p.tasks[idx], now_ms, "paused:daemon-restart");
+    trace(
+        p,
+        now_ms,
+        "death",
+        format!("{} paused (daemon restart) — awaiting redispatch", short_task(&p.tasks[idx].id)),
+        ctx,
+    );
+    match &p.tasks[idx].state {
+        TaskState::OnProgress { attempt, .. } => {
+            let attempt = *attempt;
+            // Preserve the attempt (re-stamp the SAME number, never +1).
+            set_next_attempt(&mut p.tasks[idx], now_ms, attempt);
+            p.tasks[idx].state = TaskState::Todo;
+            // item 1: only a WORKER binding ever touches the worktree, so only a worker's restart
+            // clears diff_stat. A reviewer restarting into Review{None} keeps its diff_stat — clearing
+            // it here would permanently wedge the task, since `pending_reviews_sorted` gates
+            // worktree-mode review dispatch on `diff_stat.is_some()` and nothing else ever sets it.
+            p.tasks[idx].diff_stat = None; // a fresh worktree recomputes it on the next commit
+        }
+        TaskState::Review { attempt, .. } => {
+            let attempt = *attempt;
+            p.tasks[idx].state = TaskState::Review { binding: None, attempt };
+        }
+        _ => {}
+    }
+    p.tasks[idx].dispatch_after_ms = 0;
+    ctx.dirty = true;
 }
 
 /// A fetched terminal report. Dispatch to the worker or reviewer path by binding kind.
@@ -2272,42 +3034,212 @@ fn on_reviewer_result(p: &mut Project, idx: usize, text: String, now_ms: u64, ct
 
     match rev.verdict {
         Verdict::Pass => {
-            p.tasks[idx].last_review = rev.reasons.or(Some(text));
+            p.tasks[idx].last_review = rev.reasons.clone().or_else(|| Some(text.clone()));
             record(&mut p.tasks[idx], now_ms, "review:pass");
-            p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
-            let label = format!("{} → done (review pass)", short_task(&p.tasks[idx].id));
-            trace(p, now_ms, "task", label, ctx);
             ctx.dirty = true;
-            maybe_complete_project(p, now_ms, ctx);
-            check_halt(p, now_ms, ctx);
-        }
-        Verdict::Fail | Verdict::Unparseable => {
-            p.tasks[idx].bounces += 1;
-            p.tasks[idx].last_review = rev.reasons.or(Some(text));
-            record(&mut p.tasks[idx], now_ms, "review:fail");
-            ctx.dirty = true;
+            // Rolling score (item 3): fold this pass's hygiene grade into the running average; an
+            // absent `hygiene:` line counts as 100 (compat). Done BEFORE the merge so the sag trace
+            // lands with the pass.
+            accumulate_hygiene(p, rev.hygiene.unwrap_or(100), now_ms, ctx);
 
-            if p.tasks[idx].bounces > p.config.bounce_budget {
-                let notice = format!(
-                    "production line: task {} '{}' exceeded the review bounce budget; the office parked it. Advise or edit the board.",
-                    p.tasks[idx].id.0, p.tasks[idx].title
-                );
-                queue_notice(p, now_ms, notice, ctx);
-                p.tasks[idx].state = TaskState::Parked {
-                    reason: ParkReason::ReviewBounceBudget,
-                    attempt,
-                };
-                let label = format!("{} → parked (bounce budget)", short_task(&p.tasks[idx].id));
-                trace(p, now_ms, "task", label, ctx);
-                check_halt(p, now_ms, ctx);
+            if p.worktree_desks {
+                // Worktree desks (item 1): don't complete yet — merge the task branch into main.
+                // A clean merge -> Done (via `on_desk_merged`); a conflict -> bounce.
+                match desk_git_paths(p, idx) {
+                    Some((repo, desk, branch)) => {
+                        // The reviewer is finished; drop its binding and park in the merge wait so
+                        // the slot frees and no reviewer re-dispatches (gated by `awaiting_merge`).
+                        p.tasks[idx].state = TaskState::Review { binding: None, attempt };
+                        p.tasks[idx].awaiting_merge = true;
+                        ctx.fx.push(Effect::MergeDesk {
+                            task: p.tasks[idx].id.clone(),
+                            repo,
+                            desk,
+                            branch,
+                        });
+                        let label = format!("{} passed — merging task branch", short_task(&p.tasks[idx].id));
+                        trace(p, now_ms, "desk", label, ctx);
+                    }
+                    // Worktree mode but no desk path recorded (shouldn't happen): degrade to a plain
+                    // completion so the line never wedges.
+                    None => complete_passed_task(p, idx, now_ms, ctx),
+                }
             } else {
-                set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
-                p.tasks[idx].state = TaskState::Todo;
-                let label = format!("{} → todo (review bounce {})", short_task(&p.tasks[idx].id), p.tasks[idx].bounces);
-                trace(p, now_ms, "task", label, ctx);
+                complete_passed_task(p, idx, now_ms, ctx);
             }
         }
+        Verdict::Fail | Verdict::Unparseable => {
+            let note = rev.reasons.unwrap_or(text);
+            bounce_task(p, idx, attempt, note, now_ms, ctx);
+        }
     }
+}
+
+/// Complete a task whose work is on the main branch (a legacy review pass, or a clean worktree
+/// merge): move it Done, reclaim its worktree (worktree mode, unless `keep_desks`), and run the
+/// project-completion + halt checks. Shared so both paths behave identically.
+fn complete_passed_task(p: &mut Project, idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    p.tasks[idx].state = TaskState::Done { at_ms: now_ms };
+    let label = format!("{} → done (review pass)", short_task(&p.tasks[idx].id));
+    trace(p, now_ms, "task", label, ctx);
+    maybe_remove_worktree(p, idx, ctx);
+    ctx.dirty = true;
+    // Sprints (feature: sprints): while the sprint machinery is grinding/reviewing, completion is
+    // decided by the sprint-review flow (the LAST sprint's zero-carry-over review calls
+    // `maybe_complete_project`), NOT here — the step-level `maybe_review_active_sprint` picks up the
+    // settle after this. When no sprint is active (legacy empty-sprints flow, or the post-sprints
+    // audit-remediation window whose tasks live outside any sprint) fall back to the direct check.
+    if !sprint_phase_active(p) {
+        maybe_complete_project(p, now_ms, ctx);
+    }
+    check_halt(p, now_ms, ctx);
+}
+
+/// Bounce a task back for another attempt — shared by a review FAIL/unparseable and a worktree
+/// MERGE CONFLICT (item 1). `note` becomes the review note the next worker prompt carries. Within
+/// budget -> Todo (attempt++); over budget -> Parked(ReviewBounceBudget) + reclaim the worktree
+/// (unless `keep_desks`) + halt check. `diff_stat` is cleared so a retry recomputes it fresh.
+fn bounce_task(p: &mut Project, idx: usize, attempt: u32, note: String, now_ms: u64, ctx: &mut Ctx) {
+    p.tasks[idx].bounces += 1;
+    p.tasks[idx].last_review = Some(note);
+    p.tasks[idx].diff_stat = None;
+    record(&mut p.tasks[idx], now_ms, "review:fail");
+    ctx.dirty = true;
+
+    // SDLC escalation (feature: sdlc-triage): a PATCH whose single task bounces twice is wider than a
+    // patch — convert the track to enhancement and re-dispatch (do NOT park), giving the task another
+    // life under the richer framing before its next attempt. Running-time relabel, no re-drafting.
+    // Fires once: the track is no longer "patch" afterward.
+    if p.track == "patch" && p.tasks[idx].bounces >= PATCH_BOUNCE_ESCALATION {
+        p.track = "enhancement".to_string();
+        // Review finding (MINOR): an escalated patch was labeled "enhancement" but carried an empty
+        // CRD, so `maybe_complete_project` fell through the `p.track == "patch"` skip AND the
+        // `!p.crd_markdown.trim().is_empty()` audit gate, completing with no ceremony at all —
+        // silently weaker than either track it passed through. Generate the same minimal hygiene CRD
+        // the enhancement track would have (programmatic, no invoke) so completion runs a real audit
+        // against it.
+        p.crd_markdown = office::minimal_hygiene_crd();
+        trace(p, now_ms, "sdlc", "escalating patch → enhancement", ctx);
+        trace(p, now_ms, "sdlc", "escalation: minimal hygiene CRD generated for completion audit", ctx);
+        queue_notice(
+            p,
+            now_ms,
+            format!(
+                "office[{}]: patch bounced {} times — escalating to an enhancement; re-dispatching.",
+                p.id.0, p.tasks[idx].bounces
+            ),
+            ctx,
+        );
+        set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
+        p.tasks[idx].state = TaskState::Todo;
+        let label = format!("{} → todo (patch escalation)", short_task(&p.tasks[idx].id));
+        trace(p, now_ms, "task", label, ctx);
+        // Review finding (COMMENT): this `return` skips the `bounces > bounce_budget` park check below
+        // for THIS bounce, so if `bounces` already exceeds `bounce_budget` the task still gets one more
+        // life instead of parking — intentional: the escalation itself IS the remediation (a richer
+        // framing before the next attempt), not a bypass of the budget.
+        return;
+    }
+
+    if p.tasks[idx].bounces > p.config.bounce_budget {
+        let notice = format!(
+            "production line: task {} '{}' exceeded the review bounce budget; the office parked it. Advise or edit the board.",
+            p.tasks[idx].id.0, p.tasks[idx].title
+        );
+        queue_notice(p, now_ms, notice, ctx);
+        maybe_remove_worktree(p, idx, ctx);
+        p.tasks[idx].state = TaskState::Parked {
+            reason: ParkReason::ReviewBounceBudget,
+            attempt,
+        };
+        let label = format!("{} → parked (bounce budget)", short_task(&p.tasks[idx].id));
+        trace(p, now_ms, "task", label, ctx);
+        check_halt(p, now_ms, ctx);
+    } else {
+        set_next_attempt(&mut p.tasks[idx], now_ms, attempt + 1);
+        p.tasks[idx].state = TaskState::Todo;
+        let label = format!("{} → todo (review bounce {})", short_task(&p.tasks[idx].id), p.tasks[idx].bounces);
+        trace(p, now_ms, "task", label, ctx);
+    }
+}
+
+/// Fold a per-task hygiene grade into the project's rolling clean-build score (item 3). The rolling
+/// score is the running AVERAGE of every pass's `hygiene:` grade; when it drops below
+/// `crd_pass_grade` a "rolling score sagging: NN" trace fires so the drift is visible before the
+/// final audit.
+fn accumulate_hygiene(p: &mut Project, grade: u32, now_ms: u64, ctx: &mut Ctx) {
+    p.hygiene_sum = p.hygiene_sum.saturating_add(grade as u64);
+    p.hygiene_count = p.hygiene_count.saturating_add(1);
+    let avg = (p.hygiene_sum / p.hygiene_count as u64) as u32;
+    trace(p, now_ms, "hygiene", format!("merge hygiene {grade} — rolling {avg}"), ctx);
+    if avg < p.config.crd_pass_grade {
+        trace(p, now_ms, "hygiene", format!("rolling score sagging: {avg}"), ctx);
+    }
+}
+
+/// The `(repo, desk, branch)` a task's worktree git ops need (item 1): the delivery path is the
+/// repo, `Task.desk` the worktree, `task/<slug>` the branch. `None` if either path is missing.
+fn desk_git_paths(p: &Project, idx: usize) -> Option<(PathBuf, PathBuf, String)> {
+    let repo = p.delivery_path.clone()?;
+    let desk = p.tasks[idx].desk.clone()?;
+    let branch = task_branch(&p.tasks[idx].id.0);
+    Some((repo, desk, branch))
+}
+
+/// Emit a `RemoveDesk` for a task's worktree when appropriate (item 1): worktree mode, `keep_desks`
+/// off, and a desk path is recorded. A no-op otherwise (legacy desks, or the user asked to keep
+/// them for inspection).
+fn maybe_remove_worktree(p: &mut Project, idx: usize, ctx: &mut Ctx) {
+    if !p.worktree_desks || p.config.keep_desks {
+        return;
+    }
+    if let Some((repo, desk, branch)) = desk_git_paths(p, idx) {
+        ctx.fx.push(Effect::RemoveDesk { repo, desk, branch });
+    }
+}
+
+/// A task's worktree merged cleanly into main (item 1): clear the merge gate and complete it.
+fn on_desk_merged(p: &mut Project, task: &TaskId, now_ms: u64, ctx: &mut Ctx) {
+    let idx = match find_task(p, task) {
+        Some(i) => i,
+        None => return,
+    };
+    p.tasks[idx].awaiting_merge = false;
+    trace(p, now_ms, "desk", format!("{} merged into main", short_task(task)), ctx);
+    complete_passed_task(p, idx, now_ms, ctx);
+    ctx.dirty = true;
+}
+
+/// A task's worktree merge did not complete (item 1): clear the gate and bounce it; a retry
+/// rebranches off the now-advanced main. `is_conflict` (item 4) picks the wording: a REAL content
+/// conflict tells the user to resolve it, any other merge failure just says the task was re-queued.
+fn on_desk_merge_conflict(
+    p: &mut Project,
+    task: &TaskId,
+    summary: String,
+    is_conflict: bool,
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    let idx = match find_task(p, task) {
+        Some(i) => i,
+        None => return,
+    };
+    p.tasks[idx].awaiting_merge = false;
+    let attempt = match &p.tasks[idx].state {
+        TaskState::Review { attempt, .. } => *attempt,
+        // The task should still be in Review{None} (awaiting merge); if not, nothing to bounce.
+        _ => return,
+    };
+    let note = if is_conflict {
+        format!("merge conflict — resolve then re-deliver: {summary}")
+    } else {
+        format!("merge failed ({summary}) — task re-queued")
+    };
+    let trace_word = if is_conflict { "conflict" } else { "failed" };
+    trace(p, now_ms, "desk", format!("{} merge {trace_word} — bouncing", short_task(task)), ctx);
+    bounce_task(p, idx, attempt, note, now_ms, ctx);
+    ctx.dirty = true;
 }
 
 /// A spawn that failed before producing any report. Re-queue; the third consecutive
@@ -2329,6 +3261,7 @@ fn on_spawn_failed(p: &mut Project, task: &TaskId, reason: String, now_ms: u64, 
     ctx.dirty = true;
 
     if spawn_failure_streak(&p.tasks[idx]) >= 3 {
+        maybe_remove_worktree(p, idx, ctx);
         p.tasks[idx].state = TaskState::Parked {
             reason: ParkReason::SpawnFailed(reason),
             attempt,
@@ -2413,6 +3346,12 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
         None => return,
     };
 
+    // Sprints (feature: sprints): decide which tasks this scan may consider.
+    let scope = dispatch_scope(p);
+    if matches!(scope, Scope::None) {
+        return; // a sprint review ceremony is in flight — grind nothing until it resolves
+    }
+
     let mut budget = session_capacity;
     if budget == 0 {
         return;
@@ -2420,21 +3359,32 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
     let max = p.config.max_workers.clamp(1, MAX_PROJECT_WORKERS);
     let mut held = project_in_flight(p);
 
-    for tid in pending_reviews_sorted(p) {
+    for tid in pending_reviews_sorted(p, now_ms) {
         if budget == 0 || held >= max {
             break;
+        }
+        if !scope.contains(&tid) {
+            continue; // not in the active sprint
         }
         spawn_reviewer(p, &tid, &bound, &delivery, now_ms, ctx);
         held += 1;
         budget -= 1;
     }
 
-    if p.workspace.is_none() {
-        return; // workers need a workspace for their desk
+    if p.workflow_home.is_none() && p.workspace.is_none() {
+        return; // workers need a desk root (the extension home, or the workspace as fallback)
     }
     for tid in ready_set(&p.tasks) {
         if budget == 0 || held >= max {
             break;
+        }
+        if !scope.contains(&tid) {
+            continue; // not in the active sprint
+        }
+        // Instant-death backoff (item 4): skip a task still inside its cooldown; a later Tick /
+        // Reconcile re-scans once `now_ms` passes `dispatch_after_ms` (no busy-wait, no thread).
+        if p.tasks.iter().any(|t| t.id == tid && t.dispatch_after_ms > now_ms) {
+            continue;
         }
         spawn_worker(p, &tid, &bound, &delivery, now_ms, ctx);
         held += 1;
@@ -2442,18 +3392,719 @@ fn dispatch(p: &mut Project, now_ms: u64, session_capacity: u32, ctx: &mut Ctx) 
     }
 }
 
-/// Build the per-task desk directory (ARCHITECTURE.md 7.1): a single flat,
-/// human-readable, obviously-marked dir `desks/<project-slug>/<task-slug>--koma-workflow-desk/`.
-/// `TaskId.0` is the full hierarchical id `<project>/<epic-slug>/<story-slug>/<task-slug>`
-/// (see `office::apply_breakdown`); only the final `/`-delimited segment (the task slug)
-/// is used here, so nested epic/story path segments never leak into the desk tree.
-fn desk_dir(workspace: &Path, project_slug: &str, tid: &TaskId) -> PathBuf {
+// ---------------------------------------------------------------------------
+// Sprints (feature: sprints)
+// ---------------------------------------------------------------------------
+
+/// Which tasks a dispatch scan may consider (feature: sprints).
+enum Scope {
+    /// Every task — the legacy no-sprint flow (empty `sprints`) and the post-sprints remediation
+    /// window (all sprints Done, audit remediation tasks live outside any sprint).
+    All,
+    /// Only the tasks of the ACTIVE sprint (plus any carry-overs folded into it).
+    Sprint(std::collections::HashSet<TaskId>),
+    /// Nothing — a sprint is `InReview`, so the line pauses until the ceremony resolves.
+    None,
+}
+
+impl Scope {
+    fn contains(&self, tid: &TaskId) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Sprint(set) => set.contains(tid),
+            Scope::None => false,
+        }
+    }
+}
+
+/// Compute the dispatch scope for a Running project (feature: sprints). Empty `sprints` -> `All`
+/// (legacy). An `Active` sprint -> its task set. An `InReview` sprint (and no `Active`) -> `None`.
+/// All sprints `Done` (no `Active`, no `InReview`) -> `All`, so post-sprint audit remediation tasks
+/// (which live outside any sprint) still dispatch. `ensure_active_sprint` runs first each tick, so
+/// a live-machinery project always has an `Active` or `InReview` sprint here.
+fn dispatch_scope(p: &Project) -> Scope {
+    if p.sprints.is_empty() {
+        return Scope::All;
+    }
+    if let Some(i) = active_sprint_idx(p) {
+        return Scope::Sprint(p.sprints[i].tasks.iter().cloned().collect());
+    }
+    if p.sprints.iter().any(|s| matches!(s.status, SprintStatus::InReview)) {
+        return Scope::None;
+    }
+    Scope::All
+}
+
+/// The index of the sprint currently being ground (status `Active`), if any (feature: sprints).
+fn active_sprint_idx(p: &Project) -> Option<usize> {
+    p.sprints.iter().position(|s| matches!(s.status, SprintStatus::Active))
+}
+
+/// The index of the sprint whose review ceremony is in flight (status `InReview`), if any.
+fn sprint_under_review_idx(p: &Project) -> Option<usize> {
+    p.sprints.iter().position(|s| matches!(s.status, SprintStatus::InReview))
+}
+
+/// Whether the sprint machinery is currently GOVERNING the project (feature: sprints): a sprint is
+/// `Active` (grinding) or `InReview` (ceremony). False for the legacy flow (empty `sprints`) and the
+/// post-sprints remediation window (all sprints `Done`) — in both, `maybe_complete_project` and the
+/// global dispatch scope take over exactly as before.
+fn sprint_phase_active(p: &Project) -> bool {
+    p.sprints
+        .iter()
+        .any(|s| matches!(s.status, SprintStatus::Active | SprintStatus::InReview))
+}
+
+/// Self-heal the sprint invariant at the top of each Running tick (feature: sprints): if the
+/// machinery is live but NO sprint is `Active` or `InReview` while a `Pending` one remains, activate
+/// the earliest `Pending` sprint. In steady state `apply_breakdown` makes sprint 0 `Active` and
+/// `finish_sprint_review` activates the next, so this only fires defensively (e.g. an odd reload) —
+/// keeping the line from stalling with everything `Pending`.
+///
+/// Review finding (MINOR): the mirror-image invariant break — TWO (or more) sprints somehow `Active`
+/// at once (bad data / an old race) — self-heals here too. `active_sprint_idx` only ever returns the
+/// FIRST match, so `dispatch_scope`/`sprint_settled`/`maybe_review_active_sprint` already only ever
+/// see ONE of them; this keeps the LOWEST-index Active sprint (the one actually meant to be grinding)
+/// and demotes every other Active sprint back to `Pending`, traced. The demotion assigns the status
+/// directly (not via `step_sprint`) because this REPAIRS an invalid invariant rather than modeling a
+/// legal transition — `Active -> Pending` is not one of the machine's normal edges.
+fn ensure_active_sprint(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if p.sprints.is_empty() {
+        return;
+    }
+
+    let active_idxs: Vec<usize> = p
+        .sprints
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s.status, SprintStatus::Active))
+        .map(|(i, _)| i)
+        .collect();
+    if active_idxs.len() > 1 {
+        let keep = active_idxs[0];
+        for &i in &active_idxs[1..] {
+            p.sprints[i].status = SprintStatus::Pending;
+            trace(
+                p,
+                now_ms,
+                "sprint",
+                format!("sprint {} demoted to Pending (multiple Active, keeping sprint {})", i + 1, keep + 1),
+                ctx,
+            );
+        }
+        ctx.dirty = true;
+    }
+
+    if active_sprint_idx(p).is_some() || sprint_under_review_idx(p).is_some() {
+        return;
+    }
+    if let Some(i) = p.sprints.iter().position(|s| matches!(s.status, SprintStatus::Pending)) {
+        if let Ok(st) = step_sprint(&p.sprints[i].status, SprintTransition::Activate) {
+            p.sprints[i].status = st;
+            trace(p, now_ms, "sprint", format!("sprint {} activated", i + 1), ctx);
+            ctx.dirty = true;
+        }
+    }
+}
+
+/// Whether the active sprint has SETTLED — no further grind progress is possible (feature: sprints):
+/// none of its tasks is running (OnProgress / Review / awaiting a merge) and none is `Todo`-and-ready
+/// (dependencies Done). This subsumes the spec's "all tasks terminal (done/parked)" and also handles
+/// a `Todo` task permanently blocked behind a parked sibling (it can never become ready, so the
+/// sprint carries it over rather than wedging). A task inside its instant-death backoff still counts
+/// as ready via `ready_set`, so a sprint never settles out from under a pending retry.
+fn sprint_settled(p: &Project, sprint_idx: usize) -> bool {
+    let set: std::collections::HashSet<&TaskId> = p.sprints[sprint_idx].tasks.iter().collect();
+    // Any task still being worked keeps the sprint open.
+    let running = p.tasks.iter().any(|t| {
+        set.contains(&t.id)
+            && (matches!(t.state, TaskState::OnProgress { .. } | TaskState::Review { .. })
+                || t.awaiting_merge)
+    });
+    if running {
+        return false;
+    }
+    // Any ready task (deps Done) keeps the sprint open — it will dispatch next scan.
+    let ready = ready_set(&p.tasks);
+    !ready.iter().any(|tid| set.contains(tid))
+}
+
+/// If the active sprint has settled, open its review ceremony (feature: sprints). No-op for the
+/// legacy flow, when no sprint is Active, or when the active sprint is still grinding. Called in
+/// `step` after each dispatch scan, so it fires exactly once per settle (the sprint flips to
+/// `InReview` and this guard then finds no Active sprint).
+///
+/// Review finding (MAJOR): an `Active` sprint with ZERO tasks (e.g. a PM `drop` adjustment removed
+/// every one of the next sprint's planned tasks with no carry-overs to fill it) can never "settle" its
+/// way to a ceremony invoke — nothing is running, nothing is ready, and the old empty-guard just
+/// returned, leaving it `Active` forever with the dispatch scope pointed at an empty task set (a
+/// silent stall). There is nothing to review, so it is auto-closed instead (`auto_close_empty_sprint`)
+/// rather than routed through the ceremony.
+fn maybe_review_active_sprint(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    let Some(si) = active_sprint_idx(p) else {
+        return;
+    };
+    if p.sprints[si].tasks.is_empty() {
+        auto_close_empty_sprint(p, si, now_ms, ctx);
+        return;
+    }
+    if !sprint_settled(p, si) {
+        return;
+    }
+    enter_sprint_review(p, si, now_ms, ctx);
+}
+
+/// Settle a task-less `Active` sprint directly to `Done` with NO ceremony invoke — there is nothing to
+/// review (review finding, MAJOR). Mirrors `finish_sprint_review`'s zero-carryover tail: activate the
+/// next `Pending` sprint if one exists, else the project is complete (existing audit/complete flow).
+fn auto_close_empty_sprint(p: &mut Project, sprint_idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    if let Ok(st) = step_sprint(&p.sprints[sprint_idx].status, SprintTransition::Review) {
+        p.sprints[sprint_idx].status = st;
+    }
+    if let Ok(st) = step_sprint(&p.sprints[sprint_idx].status, SprintTransition::Complete) {
+        p.sprints[sprint_idx].status = st;
+    }
+    trace(p, now_ms, "sprint", format!("sprint {} empty sprint auto-closed", sprint_idx + 1), ctx);
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: sprint {} had no tasks — auto-closed, no review needed.", p.id.0, sprint_idx + 1),
+        ctx,
+    );
+    ctx.dirty = true;
+
+    if let Some(i) = p.sprints.iter().position(|s| matches!(s.status, SprintStatus::Pending)) {
+        if let Ok(st) = step_sprint(&p.sprints[i].status, SprintTransition::Activate) {
+            p.sprints[i].status = st;
+            trace(p, now_ms, "sprint", format!("sprint {} activated", i + 1), ctx);
+        }
+    } else {
+        maybe_complete_project(p, now_ms, ctx);
+    }
+}
+
+/// Open a sprint's review ceremony (feature: sprints): flip it `Active -> InReview`, tag the delivery
+/// repo `sprint-<n>` (worktree mode only — the last merge has landed by now), assemble the
+/// programmatic participant transcript from REAL task data, and fire the SINGLE `SprintReview` invoke
+/// that adds the PM's synthesis. Exactly one invoke per review.
+fn enter_sprint_review(p: &mut Project, sprint_idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    if let Ok(st) = step_sprint(&p.sprints[sprint_idx].status, SprintTransition::Review) {
+        p.sprints[sprint_idx].status = st;
+    }
+    let n = sprint_idx + 1;
+    // Tag the delivery repo at the sprint's last merge (git repos only). Best-effort in the driver.
+    if p.worktree_desks {
+        if let Some(repo) = p.delivery_path.clone() {
+            ctx.fx.push(Effect::TagSprint { repo, tag: format!("sprint-{n}") });
+            trace(p, now_ms, "sprint", format!("tagging delivery sprint-{n}"), ctx);
+        }
+    }
+    trace(p, now_ms, "sprint", format!("sprint {n} settled — opening review"), ctx);
+    fire_sprint_review(p, sprint_idx, now_ms, ctx);
+}
+
+/// (Re-)assemble the sprint's participant transcript and fire the ONE `SprintReview` invoke
+/// (feature: sprints). Split from `enter_sprint_review` so `Resume` can re-enter a ceremony whose
+/// invoke was dropped by the interrupt guard WITHOUT re-tagging or re-tracing the settle. Idempotent:
+/// it REPLACES the sprint transcript with freshly-assembled participant lines each call, so a
+/// re-fire never accumulates duplicates.
+fn fire_sprint_review(p: &mut Project, sprint_idx: usize, now_ms: u64, ctx: &mut Ctx) {
+    let transcript = assemble_sprint_transcript(p, sprint_idx);
+    p.sprints[sprint_idx].transcript = transcript.clone();
+
+    let goal = p.sprints[sprint_idx].goal.clone();
+    let carry_titles = sprint_carryover_titles(p, sprint_idx);
+    let next = next_sprint_editable(p, sprint_idx);
+    let (system, prompt) = office::build_sprint_review_prompt(
+        p,
+        &goal,
+        &transcript,
+        &carry_titles,
+        next.as_ref().map(|(g, t)| (g.as_str(), t.as_slice())),
+    );
+    trace(p, now_ms, "sprint", format!("sprint {} review — PM synthesizing", sprint_idx + 1), ctx);
+    // On the office_role like a persona reply, but NOT a doc-drafting invoke, so `emit_invoke` (no
+    // `drafter_model` override) — see `InvokePurpose::SprintReview`.
+    emit_invoke(ctx, InvokePurpose::SprintReview, &p.config.office_role, system, prompt);
+    // Review finding (CRITICAL): the ceremony invoke is memory-only — mark it live so a daemon
+    // restart / dropped result can be detected and re-armed (`rearm_stranded_sprint_reviews`) instead
+    // of silently freezing the whole project (`dispatch_scope` returns `Scope::None` while any sprint
+    // is `InReview`).
+    p.sprint_review_invoke_live = true;
+    ctx.dirty = true;
+}
+
+/// Self-heal a stranded sprint-review ceremony (review finding, CRITICAL). The `SprintReview` invoke
+/// fired by `fire_sprint_review` is memory-only — nothing on disk records "a review invoke is
+/// outstanding" — so a daemon restart (or lease transfer) mid-ceremony drops it with no way for the
+/// normal result path to ever fire: `Command::Resume` only re-enters from `Interrupted` (illegal from
+/// `Running`), and neither `HostEvent::Tick` nor the ordinary `Reconcile` runtime-ceiling pass ever
+/// re-scans for it. Meanwhile `dispatch_scope` returns `Scope::None` for the WHOLE project while any
+/// sprint is `InReview`, so the strand freezes every task, not just the sprint. Checked on every
+/// rate-limited `Reconcile` pass (the same periodic cadence `runtime_ceiling` already uses): any
+/// sprint still `InReview` with `!sprint_review_invoke_live` — this process has no invoke in flight
+/// for it, whether because none was ever fired by THIS process (a fresh reload) or because the prior
+/// one already resolved and cleared the hint — gets re-armed. `fire_sprint_review` is idempotent (it
+/// REPLACES the sprint transcript rather than appending to it, and does not re-tag — tagging only
+/// happens once, at `enter_sprint_review`'s initial settle), so a re-fire can never double-count or
+/// duplicate work.
+///
+/// Gated to `Running` — mirrors the phase gate `step` already applies to `ensure_active_sprint`/
+/// `dispatch`/`maybe_review_active_sprint` — so this never races `Command::Resume`'s own unconditional
+/// re-fire for an `Interrupted` project resuming back into a still-`InReview` sprint (which would
+/// otherwise waste a duplicate model call whose result the `Interrupted` guard in `invoke_result`
+/// would just drop).
+fn rearm_stranded_sprint_reviews(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
+    if !matches!(p.phase, ProjectPhase::Running) {
+        return;
+    }
+    if let Some(si) = sprint_under_review_idx(p) {
+        if !p.sprint_review_invoke_live {
+            trace(p, now_ms, "sprint", format!("sprint {} review re-armed (invoke lost)", si + 1), ctx);
+            fire_sprint_review(p, si, now_ms, ctx);
+        }
+    }
+}
+
+/// Assemble a sprint's review transcript PROGRAMMATICALLY from real task data (feature: sprints):
+/// one line per worker persona (its tasks' OFFICE-REPORT summaries, compacted), one reviewer line
+/// (pass/carry counts + rolling hygiene), and the researcher as a silent observer. The single
+/// ceremony invoke appends the PM's closing line later.
+fn assemble_sprint_transcript(p: &Project, sprint_idx: usize) -> Vec<SprintLine> {
+    let ids: Vec<&TaskId> = p.sprints[sprint_idx].tasks.iter().collect();
+    let mut lines: Vec<SprintLine> = Vec::new();
+
+    // Worker lines, grouped by the task's deterministic persona (stable across respawns).
+    let mut by_persona: Vec<(String, Vec<String>)> = Vec::new();
+    for tid in &ids {
+        let Some(t) = p.tasks.iter().find(|t| &t.id == *tid) else {
+            continue;
+        };
+        let persona = crate::persona::worker_persona(&t.id.0).to_string();
+        let summary = report::parse_report(t.last_report.as_deref().unwrap_or(""))
+            .summary
+            .unwrap_or_else(|| task_outcome_word(&t.state).to_string());
+        let entry = format!("{} — {}", short_task(&t.id), trace_preview(&summary, 200));
+        match by_persona.iter_mut().find(|(name, _)| *name == persona) {
+            Some((_, v)) => v.push(entry),
+            None => by_persona.push((persona, vec![entry])),
+        }
+    }
+    for (persona, entries) in by_persona {
+        lines.push(SprintLine {
+            speaker: persona,
+            line: trace_preview(&entries.join("; "), 600),
+        });
+    }
+
+    // Reviewer line: pass/carry counts + the project's rolling hygiene average.
+    let done = ids
+        .iter()
+        .filter(|tid| matches!(task_state_of(p, tid), Some(TaskState::Done { .. })))
+        .count();
+    let carried = ids.len().saturating_sub(done);
+    let hygiene = if p.hygiene_count > 0 {
+        (p.hygiene_sum / p.hygiene_count as u64) as u32
+    } else {
+        100
+    };
+    lines.push(SprintLine {
+        speaker: "reviewer".to_string(),
+        line: format!(
+            "{} task{} passed, {} carried over; rolling hygiene {}.",
+            done,
+            if done == 1 { "" } else { "s" },
+            carried,
+            hygiene
+        ),
+    });
+
+    // Researcher: present as a silent observer.
+    lines.push(SprintLine {
+        speaker: "researcher".to_string(),
+        line: "(observing — no new research this sprint)".to_string(),
+    });
+
+    lines
+}
+
+/// A one-word outcome for a task with no usable report summary (feature: sprints), used only as the
+/// fallback text for a worker line.
+fn task_outcome_word(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Done { .. } => "done",
+        TaskState::Parked { .. } => "parked (carried over)",
+        _ => "carried over",
+    }
+}
+
+/// The state of a task id, if it exists (feature: sprints helper).
+fn task_state_of<'a>(p: &'a Project, tid: &TaskId) -> Option<&'a TaskState> {
+    p.tasks.iter().find(|t| &t.id == tid).map(|t| &t.state)
+}
+
+/// The titles of a sprint's carry-over (non-Done) tasks (feature: sprints), for the ceremony prompt.
+fn sprint_carryover_titles(p: &Project, sprint_idx: usize) -> Vec<String> {
+    p.sprints[sprint_idx]
+        .tasks
+        .iter()
+        .filter_map(|tid| p.tasks.iter().find(|t| &t.id == tid))
+        .filter(|t| !matches!(t.state, TaskState::Done { .. }))
+        .map(|t| trace_preview(&t.title, 120))
+        .collect()
+}
+
+/// The next sprint's `(goal, [(task-id, title)])` the PM may adjust (feature: sprints), or `None`
+/// when this is the last sprint. "Next" is the first sprint AFTER `sprint_idx` (any status — normally
+/// the immediately-following Pending one).
+fn next_sprint_editable(p: &Project, sprint_idx: usize) -> Option<(String, Vec<(String, String)>)> {
+    let ni = sprint_idx + 1;
+    let next = p.sprints.get(ni)?;
+    let tasks: Vec<(String, String)> = next
+        .tasks
+        .iter()
+        .filter_map(|tid| p.tasks.iter().find(|t| &t.id == tid))
+        .map(|t| (t.id.0.clone(), t.title.clone()))
+        .collect();
+    Some((next.goal.clone(), tasks))
+}
+
+/// The `SprintReview` invoke returned (feature: sprints) — finish the ceremony. Parse the PM plan
+/// (an `Err`/garbled result -> no changes, carry-overs only), append the PM's line to the transcript,
+/// feed the transcript into `research_notes` (item 4), notify, then fold the sprint forward: apply
+/// the PM's adjustments to the REAL next sprint (drop/add/modify), move the non-done carry-overs into
+/// the next (or a new trailing) sprint, mark this sprint Done, and activate the next. When there is
+/// no next sprint AND zero carry-overs, the project is complete -> the existing audit/complete flow
+/// runs unchanged. `check_halt` after activation catches a trailing sprint that is immediately stuck
+/// (a lone parked carry-over), so the ceremony can never loop forever.
+fn finish_sprint_review(p: &mut Project, outcome: Result<String, String>, now_ms: u64, ctx: &mut Ctx) {
+    let Some(si) = sprint_under_review_idx(p) else {
+        // No sprint is InReview — a stale/duplicate result (e.g. after an interrupt cleared it). No-op.
+        return;
+    };
+    ctx.dirty = true;
+    // Review finding (CRITICAL): this is the ONE arm that handles BOTH the success and error outcome
+    // of a `SprintReview` invoke (the `Err` branch just falls back to a default plan below), so
+    // clearing the live-invoke hint here covers both terminal cases in one place.
+    p.sprint_review_invoke_live = false;
+
+    let plan = match outcome {
+        Ok(text) => report::parse_sprint_review(&text),
+        Err(e) => {
+            trace(p, now_ms, "sprint", format!("sprint {} review errored ({}) — carry-overs only", si + 1, trace_preview(&e, 60)), ctx);
+            report::SprintReviewPlan::default()
+        }
+    };
+
+    // The PM's closing line, appended to the programmatic transcript.
+    let summary = if plan.summary.trim().is_empty() {
+        "Sprint reviewed.".to_string()
+    } else {
+        plan.summary.clone()
+    };
+    p.sprints[si].transcript.push(SprintLine {
+        speaker: "office".to_string(),
+        line: trace_preview(&summary, 800),
+    });
+
+    // Researcher context feed (item 4): fold the transcript + summary into research_notes (capped).
+    feed_sprint_learnings(p, si);
+
+    let n = si + 1;
+    queue_notice(
+        p,
+        now_ms,
+        format!("office[{}]: sprint {} review — {}", p.id.0, n, sprint_notice_body(p, si)),
+        ctx,
+    );
+
+    // Carry-overs: every non-Done task still in the closing sprint.
+    let carry: Vec<TaskId> = p.sprints[si]
+        .tasks
+        .iter()
+        .filter(|tid| !matches!(task_state_of(p, tid), Some(TaskState::Done { .. })))
+        .cloned()
+        .collect();
+
+    let had_next = si + 1 < p.sprints.len();
+
+    if let Ok(st) = step_sprint(&p.sprints[si].status, SprintTransition::Complete) {
+        p.sprints[si].status = st;
+    }
+
+    // Determine the target sprint for carry-overs + adjustments. A real following sprint is the
+    // target; otherwise a NON-empty carry-over spawns a trailing sprint. A last sprint with zero
+    // carry-overs completes the project.
+    let target = if had_next {
+        Some(si + 1)
+    } else if !carry.is_empty() {
+        p.sprints.push(Sprint {
+            goal: "Carry-over work".to_string(),
+            tasks: Vec::new(),
+            status: SprintStatus::Pending,
+            transcript: Vec::new(),
+        });
+        trace(p, now_ms, "sprint", "trailing sprint opened for carry-overs", ctx);
+        Some(p.sprints.len() - 1)
+    } else {
+        None
+    };
+
+    match target {
+        Some(ti) => {
+            // Adjustments target the REAL next sprint's planned tasks (never a fresh trailing one,
+            // where the model was offered no adjustments).
+            if had_next {
+                apply_sprint_adjustments(p, ti, &plan.adjustments, now_ms, ctx);
+            }
+            move_carryovers(p, si, ti, &carry);
+            if let Ok(st) = step_sprint(&p.sprints[ti].status, SprintTransition::Activate) {
+                p.sprints[ti].status = st;
+            }
+            trace(
+                p,
+                now_ms,
+                "sprint",
+                format!("sprint {} done — {} carried over, sprint {} active", n, carry.len(), ti + 1),
+                ctx,
+            );
+            // A trailing sprint of only parked carry-overs is globally stuck -> halt (breaks any loop).
+            check_halt(p, now_ms, ctx);
+        }
+        None => {
+            trace(p, now_ms, "sprint", format!("sprint {n} done — zero carry-over, project complete"), ctx);
+            maybe_complete_project(p, now_ms, ctx);
+        }
+    }
+}
+
+/// Fold a finished sprint's transcript + PM summary into `research_notes` (feature: sprints item 4),
+/// capped via [`office::append_research_learnings`] so the next sprint's workers/prompts see the
+/// learnings through the existing research-notes plumbing.
+fn feed_sprint_learnings(p: &mut Project, sprint_idx: usize) {
+    let mut block = format!("## Sprint {} review — {}\n", sprint_idx + 1, p.sprints[sprint_idx].goal);
+    for line in &p.sprints[sprint_idx].transcript {
+        block.push_str(&format!("- {}: {}\n", line.speaker, line.line));
+    }
+    p.research_notes = office::append_research_learnings(&p.research_notes, &block);
+}
+
+/// A compact one-line ceremony body for the outbox notice (feature: sprints): the PM's summary line,
+/// clipped.
+fn sprint_notice_body(p: &Project, sprint_idx: usize) -> String {
+    p.sprints[sprint_idx]
+        .transcript
+        .iter()
+        .rev()
+        .find(|l| l.speaker == "office")
+        .map(|l| trace_preview(&l.line, 240))
+        .unwrap_or_else(|| "reviewed".to_string())
+}
+
+/// Move a sprint's carry-over task ids from the closing sprint into the target sprint (feature:
+/// sprints), preserving order and de-duplicating. The tasks keep their board state (a parked
+/// carry-over stays parked; a blocked-Todo stays Todo) — only their sprint membership changes.
+fn move_carryovers(p: &mut Project, from: usize, to: usize, carry: &[TaskId]) {
+    if from == to {
+        return;
+    }
+    let carry_set: std::collections::HashSet<&TaskId> = carry.iter().collect();
+    p.sprints[from].tasks.retain(|tid| !carry_set.contains(tid));
+    for tid in carry {
+        if !p.sprints[to].tasks.contains(tid) {
+            p.sprints[to].tasks.push(tid.clone());
+        }
+    }
+}
+
+/// Apply the PM's sprint-review adjustments to the target (next) sprint's task list (feature:
+/// sprints), DEFENSIVELY — every op is a no-op when its target can't be resolved or the task has
+/// already started. `drop`/`modify` only touch a not-yet-started (`Todo`/`Backlog`) task the target
+/// sprint owns; `add` appends a fresh `Todo` task to the board and the sprint.
+fn apply_sprint_adjustments(
+    p: &mut Project,
+    target_idx: usize,
+    adjustments: &[report::SprintAdjustment],
+    now_ms: u64,
+    ctx: &mut Ctx,
+) {
+    for adj in adjustments {
+        match adj.kind {
+            report::SprintAdjustmentKind::Drop => {
+                if let Some(tid) = resolve_sprint_task(p, target_idx, &adj.target) {
+                    if is_not_started(p, &tid) {
+                        p.sprints[target_idx].tasks.retain(|t| t != &tid);
+                        p.tasks.retain(|t| t.id != tid);
+                        trace(p, now_ms, "sprint", format!("adjustment: dropped {}", short_task(&tid)), ctx);
+                        // Review finding (MAJOR): a dropped id left dangling in another task's
+                        // `blocked_by` is never "done" (`graph::ready_set`) and never "poisoned"
+                        // (`graph::line_is_stuck` treats a missing blocker as NOT poisoned) — the
+                        // dependent waits forever with no halt signal. Strip it from every task.
+                        let stripped = strip_dangling_blocker(p, &tid);
+                        if stripped > 0 {
+                            trace(
+                                p,
+                                now_ms,
+                                "sprint",
+                                format!(
+                                    "adjustment: stripped dangling blocker {} from {} dependent task(s)",
+                                    short_task(&tid),
+                                    stripped
+                                ),
+                                ctx,
+                            );
+                        }
+                    }
+                }
+            }
+            report::SprintAdjustmentKind::Modify => {
+                if let Some(tid) = resolve_sprint_task(p, target_idx, &adj.target) {
+                    if is_not_started(p, &tid) && !adj.text.trim().is_empty() {
+                        if let Some(t) = p.tasks.iter_mut().find(|t| t.id == tid) {
+                            t.description = adj.text.trim().to_string();
+                            record(t, now_ms, "sprint-adjust:modify");
+                        }
+                        trace(p, now_ms, "sprint", format!("adjustment: modified {}", short_task(&tid)), ctx);
+                    }
+                }
+            }
+            report::SprintAdjustmentKind::Add => {
+                let title = adj.target.trim();
+                if title.is_empty() {
+                    continue;
+                }
+                let id = mint_added_task_id(p, title);
+                let description = if adj.text.trim().is_empty() {
+                    title.to_string()
+                } else {
+                    adj.text.trim().to_string()
+                };
+                let mut task = Task {
+                    id: id.clone(),
+                    title: trace_preview(title, 120),
+                    description,
+                    acceptance: vec![
+                        "The task described is fully implemented and working".to_string(),
+                        "The delivered tree stays clean (no trash or dead files)".to_string(),
+                    ],
+                    blocked_by: Vec::new(),
+                    priority: 0,
+                    state: TaskState::Todo,
+                    bounces: 0,
+                    comments: Vec::new(),
+                    desk: None,
+                    last_report: None,
+                    last_review: None,
+                    history: Vec::new(),
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
+                };
+                record(&mut task, now_ms, "sprint-adjust:add");
+                p.tasks.push(task);
+                p.sprints[target_idx].tasks.push(id.clone());
+                trace(p, now_ms, "sprint", format!("adjustment: added {}", short_task(&id)), ctx);
+            }
+        }
+    }
+}
+
+/// Strip a dropped task id from every remaining task's `blocked_by` (review finding, MAJOR:
+/// `apply_sprint_adjustments`' `Drop` case used to retain the dangling dependency). Returns the
+/// number of tasks that actually had the id removed, for the caller's trace.
+fn strip_dangling_blocker(p: &mut Project, dropped: &TaskId) -> usize {
+    let mut stripped = 0usize;
+    for t in p.tasks.iter_mut() {
+        let before = t.blocked_by.len();
+        t.blocked_by.retain(|b| b != dropped);
+        if t.blocked_by.len() != before {
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
+/// Resolve a PM adjustment `target` to a task id the target sprint owns (feature: sprints): match the
+/// FULL hierarchical id, else the short last-segment slug. `None` when nothing in that sprint matches.
+fn resolve_sprint_task(p: &Project, sprint_idx: usize, target: &str) -> Option<TaskId> {
+    let t = target.trim();
+    p.sprints[sprint_idx]
+        .tasks
+        .iter()
+        .find(|tid| tid.0 == t || short_task(tid) == t)
+        .cloned()
+}
+
+/// Whether a task has NOT started yet (feature: sprints) — `Todo` or `Backlog`, so an adjustment can
+/// safely drop/modify it. In-flight, in-review, parked, and done tasks are left untouched.
+fn is_not_started(p: &Project, tid: &TaskId) -> bool {
+    matches!(task_state_of(p, tid), Some(TaskState::Todo) | Some(TaskState::Backlog))
+}
+
+/// Mint a unique task id for a PM-added task (feature: sprints): `<project>/added/<slug>`, with a
+/// numeric suffix on collision. The slug is derived from the title (lowercased, non-`[a-z0-9]` runs
+/// collapsed to `-`).
+fn mint_added_task_id(p: &Project, title: &str) -> TaskId {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "task" } else { slug };
+    let base = format!("{}/added/{}", p.id.0, slug);
+    if !p.tasks.iter().any(|t| t.id.0 == base) {
+        return TaskId(base);
+    }
+    let mut n = 2u64;
+    loop {
+        let cand = format!("{base}-{n}");
+        if !p.tasks.iter().any(|t| t.id.0 == cand) {
+            return TaskId(cand);
+        }
+        n += 1;
+    }
+}
+
+/// Build the per-task desk directory (ARCHITECTURE.md 7.1, item 1). The desk lives under the
+/// EXTENSION's own workspace (`~/.koma-workflow`, `Project.workflow_home`), never next to the
+/// delivery product — the user rule is that the delivery folder receives ONLY the product. `TaskId.0`
+/// is the full hierarchical id `<project>/<epic-slug>/<story-slug>/<task-slug>` (see
+/// `office::apply_breakdown`); only the final `/`-delimited segment (the task slug) is used, so
+/// nested epic/story path segments never leak into the desk tree.
+///
+/// - `workflow_home` seeded (the norm): `<home>/desks/<project-slug>/<task-slug>/` — clean, and a
+///   git worktree in worktree-desks mode.
+/// - `workflow_home` absent (pre-feature state files, and unit tests that don't seed it): the
+///   HISTORICAL marker path under the user's workspace, preserving legacy behavior.
+///
+/// `None` only when neither a workflow home nor a workspace is known (a desk cannot be placed).
+fn desk_dir(p: &Project, tid: &TaskId) -> Option<PathBuf> {
     let task_slug = tid.0.rsplit('/').next().unwrap_or(&tid.0);
-    workspace
-        .join("koma-workflow")
-        .join("desks")
-        .join(project_slug)
-        .join(format!("{}--koma-workflow-desk", task_slug))
+    match &p.workflow_home {
+        Some(home) => Some(home.join("desks").join(&p.id.0).join(task_slug)),
+        None => p.workspace.as_ref().map(|ws| {
+            ws.join("koma-workflow")
+                .join("desks")
+                .join(&p.id.0)
+                .join(format!("{}--koma-workflow-desk", task_slug))
+        }),
+    }
+}
+
+/// The git branch a task's worktree lives on (item 1): `task/<task-slug>`. The slug is the final
+/// `/`-segment of the hierarchical task id (globally unique per `apply_breakdown`) and is
+/// `[a-z0-9-]`, so it is always a valid ref name. `pub` so the driver's `git worktree add` uses the
+/// exact same name the kernel stamps on its `MergeDesk`/`RemoveDesk` effects (one source of truth).
+pub fn task_branch(tid: &str) -> String {
+    let slug = tid.rsplit('/').next().unwrap_or(tid);
+    format!("task/{slug}")
 }
 
 fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now_ms: u64, ctx: &mut Ctx) {
@@ -2461,11 +4112,10 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
         Some(i) => i,
         None => return,
     };
-    let workspace = match &p.workspace {
-        Some(w) => w.clone(),
-        None => return,
+    let desk = match desk_dir(p, tid) {
+        Some(d) => d,
+        None => return, // no desk root known (no workflow home and no workspace)
     };
-    let desk = desk_dir(&workspace, &p.id.0, tid);
     let attempt = next_attempt(&p.tasks[idx]);
     let review_notes = p.tasks[idx].last_review.clone();
 
@@ -2498,10 +4148,14 @@ fn spawn_worker(p: &mut Project, tid: &TaskId, bound: &str, delivery: &Path, now
     // and onto the binding so the office view can label the desk.
     let persona = crate::persona::worker_agent_id(&tid.0);
 
-    ctx.fx.push(Effect::EnsureDesk {
-        task: tid.clone(),
-        dir: desk.clone(),
-    });
+    // Legacy desks need the driver to `mkdir` the scratch dir; worktree desks are materialized by
+    // the driver's `git worktree add` inside `exec_spawn` (fresh each dispatch), so no EnsureDesk.
+    if !p.worktree_desks {
+        ctx.fx.push(Effect::EnsureDesk {
+            task: tid.clone(),
+            dir: desk.clone(),
+        });
+    }
     ctx.fx.push(Effect::Spawn {
         task: tid.clone(),
         prompt,
@@ -2624,6 +4278,16 @@ fn maybe_complete_project(p: &mut Project, now_ms: u64, ctx: &mut Ctx) {
         return;
     }
     if p.tasks.is_empty() || !p.tasks.iter().all(|t| matches!(t.state, TaskState::Done { .. })) {
+        return;
+    }
+    // SDLC patch track (feature: sdlc-triage): no CRD and merge review IS the gate, so SKIP the final
+    // clean-build audit, traced. (A pure patch has an empty CRD and would complete without an audit
+    // anyway; this makes the skip explicit + testable. A patch that ESCALATED to enhancement has
+    // track != "patch", so it still takes the audit path below.)
+    if p.track == "patch" {
+        complete_project(p, now_ms);
+        trace(p, now_ms, "sdlc", "audit skipped (patch track)", ctx);
+        trace(p, now_ms, "phase", "project complete — all tasks done", ctx);
         return;
     }
     // A CRD present + no audit already running -> gate completion on a clean-build audit. If the
@@ -2836,6 +4500,9 @@ into full compliance with the Clean-build Requirement Document (docs tab)."
         last_report: None,
         last_review: None,
         history: Vec::new(),
+        diff_stat: None,
+        awaiting_merge: false,
+        dispatch_after_ms: 0,
     };
     record(&mut task, now_ms, format!("crd-remediation:round-{}", round));
     p.tasks.push(task);
@@ -3006,11 +4673,18 @@ fn project_in_flight(p: &Project) -> u32 {
         .count() as u32
 }
 
-fn pending_reviews_sorted(p: &Project) -> Vec<TaskId> {
+fn pending_reviews_sorted(p: &Project, now_ms: u64) -> Vec<TaskId> {
     let mut v: Vec<&Task> = p
         .tasks
         .iter()
         .filter(|t| matches!(t.state, TaskState::Review { binding: None, .. }))
+        // Not while a merge is in flight for this task (item 1: the reviewer already passed).
+        .filter(|t| !t.awaiting_merge)
+        // Instant-death backoff (item 4): honor a reviewer cooldown just like a worker one.
+        .filter(|t| t.dispatch_after_ms <= now_ms)
+        // Worktree desks (item 2): a review only starts once the worker's tree has been committed
+        // onto its branch (the diff-stat is stashed then). Legacy desks have no such gate.
+        .filter(|t| !p.worktree_desks || t.diff_stat.is_some())
         .collect();
     v.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
     v.into_iter().map(|t| t.id.clone()).collect()

@@ -148,6 +148,9 @@ mod tests {
                         at_ms: now,
                         event: "Created".to_string(),
                     }],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Todo state
                 Task {
@@ -170,6 +173,9 @@ mod tests {
                     last_report: None,
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in OnProgress state
                 Task {
@@ -195,6 +201,9 @@ mod tests {
                     last_report: None,
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Review state with binding
                 Task {
@@ -220,6 +229,9 @@ mod tests {
                     last_report: Some("Implemented basic retry".to_string()),
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Review state without binding
                 Task {
@@ -239,6 +251,9 @@ mod tests {
                     last_report: Some("Added redis cache".to_string()),
                     last_review: Some("Need persistent backend".to_string()),
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Parked (ReviewBounceBudget) state
                 Task {
@@ -258,6 +273,9 @@ mod tests {
                     last_report: Some("Attempted integration".to_string()),
                     last_review: Some("Schema mismatch".to_string()),
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Parked (WorkerBlocked) state
                 Task {
@@ -279,6 +297,9 @@ mod tests {
                     last_report: Some("Blocked waiting for credentials".to_string()),
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Parked (SpawnFailed) state
                 Task {
@@ -300,6 +321,9 @@ mod tests {
                     last_report: None,
                     last_review: None,
                     history: vec![],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
                 // Task in Done state
                 Task {
@@ -325,8 +349,20 @@ mod tests {
                         at_ms: now + 5000,
                         event: "Completed".to_string(),
                     }],
+                    diff_stat: None,
+                    awaiting_merge: false,
+                    dispatch_after_ms: 0,
                 },
             ],
+            sprints: vec![Sprint {
+                goal: "First increment".to_string(),
+                tasks: vec![TaskId("shop-crawler/e1-ingest/s1-parse/t1-http".to_string())],
+                status: SprintStatus::InReview,
+                transcript: vec![SprintLine {
+                    speaker: "nova".to_string(),
+                    line: "delivered the http fetcher".to_string(),
+                }],
+            }],
             config: ProjectConfig {
                 max_workers: 2,
                 bounce_budget: 3,
@@ -364,8 +400,16 @@ mod tests {
             interrupted_from: Some(ProjectPhase::Running),
             gate_cleared: false,
             gate_invoke_live_hint: false,
+            // sdlc-triage: a non-default track must round-trip through serde intact.
+            track: "enhancement".to_string(),
+            triage_pending: false,
+            sprint_review_invoke_live: false,
             pending_breakdown: None,
             seq: 42,
+            worktree_desks: false,
+            workflow_home: None,
+            hygiene_sum: 0,
+            hygiene_count: 0,
         };
 
         // Serialize to JSON
@@ -398,6 +442,8 @@ mod tests {
         assert_eq!(deserialized.config.safeguard_role, "safeguard");
         // The approval/nudge additive fields + the autonomous-safeguard fields all round-trip.
         assert!(deserialized.assumptions_approved, "assumptions_approved round-trips");
+        // sdlc-triage: the intake track round-trips intact (not coerced back to the default).
+        assert_eq!(deserialized.track, "enhancement", "the SDLC track round-trips");
         assert_eq!(deserialized.self_resolved_assumptions.len(), 1);
         assert_eq!(deserialized.capture_nudge_count, 2);
         assert_eq!(deserialized.assumption_rounds, 1);
@@ -466,6 +512,11 @@ mod tests {
         assert!(p.pending_breakdown.is_none(), "absent pending_breakdown defaults to None");
         assert_eq!(p.config.research_mode, "auto", "absent research_mode defaults to 'auto'");
         assert!(p.config.drafter_model.is_none(), "absent drafter_model defaults to None");
+        // SDLC intake track (feature: sdlc-triage): absent on a pre-feature state file -> the safe
+        // full-ceremony "project" default (a named-fn default, NOT an empty string); the runtime-only
+        // `triage_pending` flag is `#[serde(skip)]` and deserializes to false.
+        assert_eq!(p.track, "project", "absent track defaults to 'project', not empty");
+        assert!(!p.triage_pending, "absent/skip triage_pending defaults to false");
     }
 
     #[test]

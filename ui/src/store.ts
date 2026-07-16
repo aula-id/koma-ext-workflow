@@ -50,6 +50,9 @@ export interface Project {
   /** Ungrounded assumptions the safeguard flagged in the last drafting doc gate (6.2c, full
    * snapshot only). Non-empty means the pipeline is stopped awaiting the user's approval. */
   pendingAssumptions?: string[];
+  /** SDLC intake track (feature: sdlc-triage): `'project'` | `'enhancement'` | `'patch'`. Wire
+   * field `track` (office-core `digest.rs`); optional so older snapshots stay back-compat. */
+  track?: string;
   [key: string]: any;
 }
 
