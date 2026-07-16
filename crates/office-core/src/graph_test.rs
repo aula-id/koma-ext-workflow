@@ -73,6 +73,9 @@ mod tests {
             outbox: vec![],
             trace: vec![],
             interrupted_from: None,
+            gate_cleared: false,
+            gate_invoke_live_hint: false,
+            pending_breakdown: None,
             seq: 0,
         }
     }

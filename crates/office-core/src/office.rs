@@ -60,34 +60,40 @@ pub enum InvokePurpose {
     /// The summarize-and-fold call. Result replaces `office_summary`; then the pending
     /// persona invoke is re-issued.
     Fold,
-    /// The Technical Requirements Document authoring call (ARCHITECTURE.md 6.2b), issued after
-    /// web-research (or a research degrade) lands during Drafting. `Ok` with a ```trd fence ->
-    /// store `trd_markdown` and run the safeguard gate then the CRD; a missing fence or any
-    /// `Err` STILL proceeds to the CRD (from the PRD alone) — Drafting never wedges on a TRD
-    /// failure.
-    Trd,
-    /// The Clean-build Requirement Document authoring call (ARCHITECTURE.md 6.2c), issued after
-    /// the TRD (and its safeguard gate). `Ok` with a ```crd fence -> store `crd_markdown`, run
-    /// the safeguard gate, then request the breakdown; a missing fence or any `Err` STILL
-    /// requests the breakdown — the project just completes without a clean-build audit.
-    Crd,
-    /// The safeguard no-assume gate over the PRD (ARCHITECTURE.md 6.2c). Runs on the
-    /// `safeguard_role`. `clean` -> proceed to research; `assumptions` -> stop with
-    /// `pending_assumptions`; `Err` -> FAIL-OPEN (proceed). Copy/Eq is preserved by using a
-    /// distinct variant per doc instead of a payload.
+    /// The COMBINED Technical + Clean-build Requirement Document authoring call (design-speedup
+    /// item 3), issued once the PRD gate has cleared AND research has settled (the research join).
+    /// One invoke authors BOTH docs: the reply must carry a ```trd fenced block AND a ```crd fenced
+    /// block. Both are captured; a capture-miss nudge fires (shared budget) if EITHER is missing. A
+    /// captured TRD kicks off the early breakdown and runs the single combined TRD+CRD safeguard
+    /// gate; any `Err` still proceeds so Drafting never wedges. Supersedes the old separate `Trd`
+    /// and `Crd` invokes.
+    TrdCrd,
+    /// The safeguard no-assume gate over the PRD (ARCHITECTURE.md 6.2c / design-speedup one-shot
+    /// gate). Runs on the `safeguard_role`. It is the ENUMERATE pass; in `assumption_mode == "auto"`
+    /// it ALSO resolves the non-critical items inline and re-emits the revised ```prd (compressed
+    /// gate). When `research_mode == "auto"` it additionally answers the well-known boolean that
+    /// decides whether to run research. `clean` -> proceed (research join); `assumptions` -> resolve
+    /// / verify / freeze-critical per mode; `Err` -> FAIL-OPEN. A distinct variant per doc-set keeps
+    /// the type `Copy`.
     AssumeCheckPrd,
-    /// The safeguard no-assume gate over the TRD (6.2c). `clean` -> proceed to the CRD invoke.
-    AssumeCheckTrd,
-    /// The safeguard no-assume gate over the CRD (6.2c). `clean` -> proceed to the breakdown.
-    AssumeCheckCrd,
-    /// The autonomous assumption-RESOLUTION invoke (autonomous-safeguard pivot 2026-07-15). Emitted
-    /// in `assumption_mode == "auto"` when the checker flagged only `[auto]` (non-critical) items:
-    /// the office decides each one itself with best judgment + the research notes, revises the doc,
-    /// and re-emits the COMPLETE doc in its `<doc>` fence. The kernel then updates that doc and
-    /// re-runs the matching `AssumeCheck{Prd,Trd,Crd}` gate. Which doc it targets is recovered from
-    /// state (`newest_gated_doc`) exactly like the re-check-on-reply path, so a single Copy variant
-    /// suffices. An `Err` or a missing fence PROCEEDS anyway (never wedges).
+    /// The safeguard no-assume gate over the COMBINED TRD+CRD doc-set (design-speedup one-shot gate,
+    /// item 3+5). Same shape as `AssumeCheckPrd` but over both docs at once; a clean/settled verdict
+    /// proceeds to the breakdown join. Supersedes the old separate `AssumeCheckTrd`/`AssumeCheckCrd`.
+    AssumeCheckTrdCrd,
+    /// The batch assumption-RESOLUTION invoke, emitted only in `assumption_mode == "ask"` for the
+    /// non-critical remainder after the enumerate pass surfaced (and froze on) any critical items
+    /// (design-speedup one-shot gate; in `auto` mode the resolution is folded into the enumerate
+    /// invoke instead). The office decides each `[auto]` item itself, revises the doc-set, and
+    /// re-emits the COMPLETE doc(s) in their fence(s). The kernel updates the doc(s) then runs the
+    /// single VERIFY pass. The doc-set is recovered from state (`newest_gated_doc`), so one Copy
+    /// variant suffices. An `Err`/missing fence PROCEEDS (never wedges).
     AssumeResolve,
+    /// The FINAL verify pass of the one-shot gate (design-speedup item 5). Runs on the
+    /// `safeguard_role` over the revised doc-set. It may ONLY confirm clean OR list REMAINING
+    /// material assumptions to DISCLOSE — it never triggers another resolve round. Newly-flagged
+    /// items are recorded as disclosed (`self_resolved_assumptions`) and the gate clears anyway. The
+    /// doc-set is recovered from state (`newest_gated_doc`), so one Copy variant suffices.
+    AssumeVerify,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +267,69 @@ pub fn extract_research(text: &str) -> String {
     truncate_bytes(&raw, RESEARCH_NOTES_CAP)
 }
 
+/// The explicit trailing fence reminder appended LAST to every doc-drafting / revision prompt
+/// (design-speedup item 1: fence hardening). Recency compliance — a slow model that narrated the
+/// doc but forgot the fence wastes a whole round on a capture miss (each miss = a capture nudge), so
+/// the very last thing the model reads is the EXACT required wrapper. Per-doc `tags` (`["prd"]`, or
+/// `["trd", "crd"]` for the combined authoring invoke). Kept OUT of `extract_fenced` (the capture
+/// engine is untouched) — this only steers the model toward emitting what that engine already reads.
+pub fn fence_reminder(tags: &[&str]) -> String {
+    match tags {
+        [tag] => format!(
+            "\nReminder: your reply MUST END with the document — nothing after its closing fence. \
+             Wrap it EXACTLY as:\n```{tag}\n...\n```\n",
+        ),
+        many => {
+            let mut s = String::from(
+                "\nReminder: your reply MUST END with EVERY document below — nothing after the final \
+                 closing fence. Wrap each EXACTLY in its OWN fenced block:\n",
+            );
+            for t in many {
+                s.push_str(&format!("```{t}\n...\n```\n"));
+            }
+            s
+        }
+    }
+}
+
+/// Capture the TRD and CRD from a COMBINED reply that carries BOTH a ```trd and a ```crd block
+/// (design-speedup item 3). [`extract_fenced`] is deliberately greedy (its close is the LAST lone
+/// ``` so an embedded code block survives), which for two ADJACENT doc fences would let the FIRST
+/// swallow the second. This helper first splits the reply at the boundary between the two opening
+/// fences (in either order), then runs [`extract_fenced`] on each half — so each doc is captured on
+/// its own while embedded code blocks WITHIN a doc still survive. `extract_fenced` itself is left
+/// untouched. Returns `(trd, crd)`; either is `None` when its fence is absent.
+pub fn extract_trd_crd(reply: &str) -> (Option<String>, Option<String>) {
+    let lines: Vec<&str> = reply.lines().collect();
+    let trd_open = lines.iter().rposition(|l| open_fence_is(l, "trd"));
+    let crd_open = lines.iter().rposition(|l| open_fence_is(l, "crd"));
+    match (trd_open, crd_open) {
+        (Some(t), Some(c)) => {
+            // Split at the later opening fence so neither half contains the other's fence.
+            let (first_tag, first_range, second_tag, second_range) = if t < c {
+                ("trd", 0..c, "crd", c..lines.len())
+            } else {
+                ("crd", 0..t, "trd", t..lines.len())
+            };
+            let first = extract_fenced(&lines[first_range].join("\n"), first_tag);
+            let second = extract_fenced(&lines[second_range].join("\n"), second_tag);
+            if first_tag == "trd" {
+                (first, second)
+            } else {
+                (second, first)
+            }
+        }
+        // Only one (or neither) fence present: greedy extraction is already correct.
+        _ => (extract_fenced(reply, "trd"), extract_fenced(reply, "crd")),
+    }
+}
+
+/// Whether `line` opens a ` ```<tag> ` fenced block (case-insensitive first info token). Thin
+/// re-export of the private [`is_open_fence`] shape for [`extract_trd_crd`]'s boundary scan.
+fn open_fence_is(line: &str, tag: &str) -> bool {
+    is_open_fence(line, tag)
+}
+
 fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
     let mut prompt = String::new();
     if !summary.trim().is_empty() {
@@ -278,6 +347,8 @@ fn assemble(summary: &str, turns: &[&ChatMsg], new_user_msg: &str) -> String {
     prompt.push_str(PERSONA_CONTRACT);
     prompt.push_str(POWERLESSNESS_CLAUSE);
     prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
+    // Fence hardening (item 1): the LAST line the model reads is the exact ```prd wrapper.
+    prompt.push_str(&fence_reminder(&["prd"]));
     prompt
 }
 
@@ -407,14 +478,17 @@ ONLY — no prose, no code fences, nothing outside the JSON object.\n",
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
-/// Build the TRD authoring `(system, prompt)` for `models.invoke` (ARCHITECTURE.md 6.2b). The
-/// prompt is the PRD (capped) plus the web-research findings when present (capped), then the
-/// output contract: a COMPLETE Technical Requirements Document inside a ```trd fenced block.
-/// Pure and byte-bounded exactly like [`build_breakdown_prompt`].
-pub fn build_trd_prompt(p: &Project) -> (String, String) {
+/// Build the COMBINED TRD+CRD authoring `(system, prompt)` for `models.invoke` (design-speedup
+/// item 3). ONE invoke authors BOTH docs: the reply must carry a ```trd fenced block AND a ```crd
+/// fenced block. Built from the PRD (+ research findings when present), byte-bounded, and — item 1
+/// — ENDS with the explicit both-fences reminder. Supersedes `build_trd_prompt`/`build_crd_prompt`.
+pub fn build_trdcrd_prompt(p: &Project) -> (String, String) {
     let system = prompts::office_system(&board_digest(p));
     let mut prompt = String::new();
-    prompt.push_str("Draft the Technical Requirements Document (TRD) for the PRD below.\n\n");
+    prompt.push_str(
+        "Draft BOTH the Technical Requirements Document (TRD) and the Clean-build Requirement \
+Document (CRD) for the PRD below, in ONE reply.\n\n",
+    );
     prompt.push_str("PRD:\n");
     prompt.push_str(&truncate_bytes(&p.prd_markdown, HARD_PROMPT_CAP / 3));
     if !p.research_notes.trim().is_empty() {
@@ -422,73 +496,42 @@ pub fn build_trd_prompt(p: &Project) -> (String, String) {
         prompt.push_str(&truncate_bytes(&p.research_notes, HARD_PROMPT_CAP / 4));
     }
     prompt.push_str(
-        "\n\nEmit the COMPLETE Technical Requirements Document as markdown inside a fenced block \
-that starts with ```trd and ends with ``` — that exact fence is how the system captures the \
-TRD. Cover, as sections: technology stack with SPECIFIC current stable versions, architecture, \
-data model, API surface, testing strategy, deployment, and constraints. Be concrete and \
-decisive; this document drives the epic/story/task breakdown.\n",
+        "\n\nEmit TWO fenced blocks, in this order:\n\
+1) The COMPLETE Technical Requirements Document inside a block that starts with ```trd and ends \
+with ``` — cover, as sections: technology stack with SPECIFIC current stable versions, \
+architecture, data model, API surface, testing strategy, deployment, and constraints. This \
+document drives the epic/story/task breakdown.\n\
+2) The COMPLETE Clean-build Requirement Document inside a block that starts with ```crd and ends \
+with ``` — a concrete, gradeable acceptance checklist a read-only auditor grades the delivered \
+tree against. Cover: expected file-tree shape (what must and must NOT be present); no unwired \
+files; no trash (temp/`.bak`/dead deps/commented-out code/debug prints); build + lint pass; a \
+README present; any project-specific correctness gates. End it with a 'Grading rubric' section \
+whose point weights SUM TO EXACTLY 100.\n\
+Be concrete and decisive; the CRD must match the TRD's choices.\n",
     );
     prompt.push_str(NO_ASSUME_CLAUSE);
     prompt.push_str(POWERLESSNESS_CLAUSE);
     prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
+    // Fence hardening (item 1): the last lines the model reads are the exact ```trd + ```crd wrappers.
+    prompt.push_str(&fence_reminder(&["trd", "crd"]));
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
-/// Build the CRD authoring `(system, prompt)` for `models.invoke` (ARCHITECTURE.md 6.2c). The
-/// CRD is a Clean-build Requirement Document: a concrete, gradeable acceptance checklist for
-/// THIS project's delivered tree — expected file-tree shape, no unwired files (modules nothing
-/// imports), no trash (temp/`.bak`/dead deps/commented-out code/debug prints), build + lint
-/// pass, a README present — PLUS a grading rubric whose point weights sum to 100. It drives the
-/// completion-time auditor. Built from the PRD (+ TRD when present), byte-bounded like
-/// [`build_trd_prompt`].
-pub fn build_crd_prompt(p: &Project) -> (String, String) {
-    let system = prompts::office_system(&board_digest(p));
-    let mut prompt = String::new();
-    prompt.push_str("Draft the Clean-build Requirement Document (CRD) for the project below.\n\n");
-    prompt.push_str("PRD:\n");
-    prompt.push_str(&truncate_bytes(&p.prd_markdown, HARD_PROMPT_CAP / 3));
-    if !p.trd_markdown.trim().is_empty() {
-        prompt.push_str("\n\nTRD (technical requirements — the CRD must match these choices):\n");
-        prompt.push_str(&truncate_bytes(&p.trd_markdown, HARD_PROMPT_CAP / 3));
-    }
-    prompt.push_str(
-        "\n\nEmit the COMPLETE Clean-build Requirement Document as markdown inside a fenced block \
-that starts with ```crd and ends with ``` — that exact fence is how the system captures the CRD. \
-It is the checklist a read-only auditor will grade the delivered code against, so make every \
-item concrete and checkable by inspecting the delivered tree. Cover, as sections:\n\
-- Expected file-tree shape: the directories/files a correct delivery must contain (and must NOT).\n\
-- No unwired files: every module/file is imported/used by something; nothing dangling.\n\
-- No trash: no temp/scratch/`.bak` files, no dead dependencies, no commented-out code, no debug \
-prints/logging left in.\n\
-- Build + lint: the project builds and lints/type-checks clean with the stack's standard tooling.\n\
-- Docs: a README (or equivalent) is present and describes setup/run.\n\
-- Any project-specific correctness gates implied by the PRD/TRD.\n\
-Then a 'Grading rubric' section: a bulleted list of checks, each with an explicit point weight, \
-whose weights SUM TO EXACTLY 100.\n",
-    );
-    prompt.push_str(NO_ASSUME_CLAUSE);
-    prompt.push_str(POWERLESSNESS_CLAUSE);
-    prompt.push_str(DISCLOSE_REEMIT_CLAUSE);
-    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+/// The combined TRD+CRD doc-set body (design-speedup item 3), labeled per doc, used as the
+/// `doc_body` for the single TRD+CRD safeguard gate (check / resolve / verify). Missing docs render
+/// as a placeholder so a partially-captured set still gates cleanly.
+pub fn trdcrd_body(p: &Project) -> String {
+    let trd = if p.trd_markdown.trim().is_empty() { "(not drafted)" } else { p.trd_markdown.as_str() };
+    let crd = if p.crd_markdown.trim().is_empty() { "(not drafted)" } else { p.crd_markdown.as_str() };
+    format!("## Technical Requirements Document (TRD)\n{trd}\n\n## Clean-build Requirement Document (CRD)\n{crd}")
 }
 
-/// Build the safeguard no-assume gate `(system, prompt)` for one drafting doc (ARCHITECTURE.md
-/// 6.2c). Given ONLY the user's own chat turns (transcript `User` entries) + the research notes
-/// + the doc itself, the safeguard lists every choice in the doc that the user did NOT state,
-/// research did NOT ground, and the user did NOT explicitly delegate. `doc_label` is the human
-/// label ("PRD"/"TRD"/"CRD"); `doc_body` is that doc's markdown. Pure + byte-bounded; the caller
-/// (kernel) emits it on the `safeguard_role`.
-pub fn build_assume_check_prompt(p: &Project, doc_label: &str, doc_body: &str) -> (String, String) {
-    let system = "You are a requirements safeguard with a HIGH bar. Your ONE job is to catch \
-MATERIAL ungrounded assumptions: decisions that shape cost, scope, or the deliverable that the \
-user never stated, research never established, and the user never delegated. You do NOT rewrite \
-the document and you do NOT nitpick implementation details — you flag only choices that would \
-change WHAT gets built or how much it costs. Be precise and conservative: when in doubt, do not \
-flag."
-        .to_string();
-
-    // Only the user's OWN turns are ground truth — the office's prior replies are not (an
-    // assumption the office already made is exactly what we are trying to catch).
+/// The shared prompt preamble for every safeguard gate pass (design-speedup one-shot gate): the
+/// user's OWN turns (ground truth), the research notes, the doc-set under review, and the material-
+/// vs-micro-detail flag rules. The distinct passes (enumerate / verify) append their own output
+/// contracts. Only the user's own turns count as ground truth — the office's prior replies are
+/// exactly the assumptions we are trying to catch.
+fn assume_context(p: &Project, doc_label: &str, doc_body: &str) -> String {
     let user_turns: String = p
         .office_transcript
         .iter()
@@ -507,7 +550,7 @@ flag."
         prompt.push_str("\nRESEARCH FINDINGS (also count as grounded):\n");
         prompt.push_str(&truncate_bytes(&p.research_notes, HARD_PROMPT_CAP / 4));
     }
-    prompt.push_str(&format!("\n{} UNDER REVIEW:\n", doc_label));
+    prompt.push_str(&format!("\n{doc_label} UNDER REVIEW:\n"));
     prompt.push_str(&truncate_bytes(doc_body, HARD_PROMPT_CAP / 3));
     prompt.push_str(
         "\n\nFlag ONLY MATERIAL assumptions — a choice is material only if it changes cost, scope, \
@@ -523,73 +566,182 @@ UI transitions, naming, trimming input, character counts, or other reasonable de
 NEVER flag anything the document discloses under a heading like 'Proposed defaults', 'Delegated \
 decisions', or 'Open questions' — those are already surfaced, not hidden assumptions.\n\
 If the user's statements contain ANY delegation ('you decide' / 'up to you' / 'your call' / \
-'approved' / 'proceed'), the verdict is clean — the user handed the office the pen.\n\
-\nTAG EACH flagged item with its criticality — the office will decide the rest ITSELF, so reserve \
-[critical] for the NARROW set of choices that genuinely need a human:\n\
+'approved' / 'proceed'), the verdict is clean — the user handed the office the pen.\n",
+    );
+    prompt
+}
+
+/// The `[critical]`/`[auto]` criticality-tagging instructions, shared by the enumerate passes.
+const ASSUME_TAG_RULES: &str = "\nTAG EACH flagged item with its criticality — the office will \
+decide the rest ITSELF, so reserve [critical] for the NARROW set of choices that genuinely need a \
+human:\n\
 - [critical] ONLY IF the choice: spends real money; requires accounts, credentials, or secrets; \
 modifies or deletes EXISTING user data or systems; picks a deployment target going live; or \
 creates legal-exposure content. These need a human before anything happens.\n\
 - [auto] for EVERYTHING else — stack / library / framework / language / database choice, data \
 format, project structure, scope details, UX details, and every other reasonable design decision. \
 The office is trusted to decide these; do NOT mark them critical.\n\
-When unsure, tag [auto], not [critical].\n\
-Output ONLY this block, nothing else:\n\
+When unsure, tag [auto], not [critical].\n";
+
+/// The `well-known:` addendum (design-speedup item 4, `research_mode == "auto"`): the ONE extra
+/// boolean the PRD enumerate pass also answers so the kernel can decide whether to run research.
+const WELL_KNOWN_ADDENDUM: &str = "\nSEPARATELY, judge the technology involved: is the ENTIRE stack \
+this document implies mainstream and well-known (so current versions / best practices need no web \
+research)? Add EXACTLY one line:\n\
+well-known: yes | no\n";
+
+/// Build the ENUMERATE pass of the one-shot safeguard gate `(system, prompt)` (design-speedup item
+/// 5 + amendment A). `tags` are the fence tag(s) of the doc-set (`["prd"]` or `["trd", "crd"]`).
+/// When `resolve_inline` (`assumption_mode == "auto"`) the safeguard ALSO decides the non-critical
+/// items itself and re-emits the revised document(s) in the SAME reply — collapsing enumerate +
+/// batch-resolve into one invoke. When `ask_wellknown` (PRD + `research_mode == "auto"`) it also
+/// answers the well-known boolean. Emitted by the kernel on the `safeguard_role`.
+pub fn build_assume_check_prompt(
+    p: &Project,
+    doc_label: &str,
+    doc_body: &str,
+    tags: &[&str],
+    resolve_inline: bool,
+    ask_wellknown: bool,
+) -> (String, String) {
+    let mut system = String::from(
+        "You are a requirements safeguard with a HIGH bar. Your ONE job is to catch MATERIAL \
+ungrounded assumptions: decisions that shape cost, scope, or the deliverable that the user never \
+stated, research never established, and the user never delegated. You do NOT nitpick implementation \
+details — you flag only choices that would change WHAT gets built or how much it costs. Be precise \
+and conservative: when in doubt, do not flag.",
+    );
+    if resolve_inline {
+        system.push_str(
+            " In addition you are TRUSTED to DECIDE every non-critical ([auto]) assumption yourself \
+— stack, libraries, formats, structure, UX — and revise the document(s) to bake those decisions in, \
+leaving [critical] items UNRESOLVED and open for the human.",
+        );
+    }
+
+    let mut prompt = assume_context(p, doc_label, doc_body);
+    prompt.push_str(ASSUME_TAG_RULES);
+    prompt.push_str(
+        "\nFIRST output this block:\n\
 ASSUME-CHECK\n\
 verdict: clean | assumptions\n\
 - [critical] <one MATERIAL ungrounded assumption per line>\n\
 - [auto] <one MATERIAL ungrounded assumption per line>\n\
 (omit the '- ' lines entirely when verdict is clean; an untagged item is treated as [auto])\n",
     );
+    if ask_wellknown {
+        prompt.push_str(WELL_KNOWN_ADDENDUM);
+    }
+    if resolve_inline {
+        prompt.push_str(
+            "\nTHEN, for every [auto] item (leave [critical] items untouched and open), DECIDE it \
+yourself with best judgment and the research notes, revise the document(s) so each decision is \
+baked in under a 'Delegated decisions (auto)' heading (one-line rationale each), and re-emit the \
+COMPLETE revised document(s) — each in its OWN fenced block:\n",
+        );
+        for t in tags {
+            prompt.push_str(&format!("```{t}\n...revised {}...\n```\n", t.to_uppercase()));
+        }
+        prompt.push_str(
+            "Put the ASSUME-CHECK block (and any well-known line) FIRST, then the fenced \
+document(s). When the verdict is clean, emit no fenced document.\n",
+        );
+    }
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
 }
 
-/// Build the autonomous assumption-resolution `(system, prompt)` for `models.invoke`
-/// (autonomous-safeguard pivot 2026-07-15). In `assumption_mode == "auto"`, when the checker
-/// flagged only non-critical `[auto]` assumptions, the office decides each ITSELF — "research,
-/// decide, disclose" — rather than freezing on the human. The prompt hands it the doc, the list of
-/// auto assumptions to settle, and the research notes when present, and instructs it to REVISE the
-/// doc, record every decision under a 'Delegated decisions (auto)' heading with a one-line
-/// rationale, and re-emit the COMPLETE revised document inside its `<doc>` fence (the same fence the
-/// gate captures). `doc_label` is "PRD"/"TRD"/"CRD"; the fence tag is its lowercase form. Pure +
-/// byte-bounded like the other builders.
+/// Build the FINAL VERIFY pass of the one-shot safeguard gate `(system, prompt)` (design-speedup
+/// item 5). The doc-set has already been revised; this pass may ONLY confirm it is clean OR LIST any
+/// material assumptions that REMAIN (for disclosure) — it NEVER rewrites or resolves, so the gate
+/// can never loop. Emitted on the `safeguard_role`; the kernel records any listed items as disclosed.
+pub fn build_assume_verify_prompt(p: &Project, doc_label: &str, doc_body: &str) -> (String, String) {
+    let system = "You are a requirements safeguard doing a FINAL verification pass. The document(s) \
+below have ALREADY been revised to resolve open assumptions. Your ONLY job now is to VERIFY: either \
+confirm they are clean, or LIST any MATERIAL ungrounded assumptions that still REMAIN. You do NOT \
+rewrite, resolve, or re-open anything — you only report what is left. Be precise and conservative."
+        .to_string();
+
+    let mut prompt = assume_context(p, doc_label, doc_body);
+    prompt.push_str(
+        "\nOutput ONLY this block, nothing else — no fenced document, no rewrite:\n\
+ASSUME-CHECK\n\
+verdict: clean | assumptions\n\
+- <one MATERIAL ungrounded assumption that REMAINS, per line>\n\
+(omit the '- ' lines entirely when verdict is clean)\n",
+    );
+    (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// Build the ASK-mode batch assumption-resolution `(system, prompt)` for `models.invoke` (design-
+/// speedup one-shot gate). Emitted only in `assumption_mode == "ask"` for the non-critical remainder
+/// after the enumerate pass surfaced (and froze on) any critical items. The office decides each
+/// `[auto]` item itself and re-emits the COMPLETE revised document(s), each in its OWN fence
+/// (`tags`: `["prd"]` or `["trd", "crd"]`). Pure + byte-bounded.
 pub fn build_assume_resolve_prompt(
     p: &Project,
     doc_label: &str,
     doc_body: &str,
     auto_items: &[String],
+    tags: &[&str],
 ) -> (String, String) {
-    let tag = doc_label.to_ascii_lowercase();
     let system = format!(
         "You are the Workflow front office resolving your own open assumptions. You are TRUSTED to \
 decide reasonable design choices yourself — stack, libraries, formats, structure, UX details. \
-Decide each assumption below with best judgment and the research notes, then revise the {label} to \
-reflect those decisions. Be decisive; do NOT punt back to the human on non-critical calls.",
-        label = doc_label
+Decide each assumption below with best judgment and the research notes, then revise the {doc_label} \
+to reflect those decisions. Be decisive; do NOT punt back to the human on non-critical calls.",
     );
 
     let mut prompt = String::new();
-    prompt.push_str(&format!("{} UNDER REVISION:\n", doc_label));
+    prompt.push_str(&format!("{doc_label} UNDER REVISION:\n"));
     prompt.push_str(&truncate_bytes(doc_body, HARD_PROMPT_CAP / 3));
     prompt.push_str("\n\nASSUMPTIONS TO DECIDE YOURSELF (each is non-critical — settle it):\n");
     if auto_items.is_empty() {
-        prompt.push_str("(none listed — re-emit the document unchanged)\n");
+        prompt.push_str("(none listed — re-emit the document(s) unchanged)\n");
     } else {
-        let list: String = auto_items.iter().map(|a| format!("- {}\n", a)).collect();
+        let list: String = auto_items.iter().map(|a| format!("- {a}\n")).collect();
         prompt.push_str(&truncate_bytes(&list, HARD_PROMPT_CAP / 4));
     }
     if !p.research_notes.trim().is_empty() {
         prompt.push_str("\nRESEARCH FINDINGS (lean on these where relevant):\n");
         prompt.push_str(&truncate_bytes(&p.research_notes, HARD_PROMPT_CAP / 4));
     }
-    prompt.push_str(&format!(
+    prompt.push_str(
         "\n\nDecide EVERY assumption above yourself using best judgment and the research notes. \
-REVISE the document so each decision is baked in, and add a 'Delegated decisions (auto)' section \
-where every decision appears with a one-line rationale. Then re-emit the COMPLETE revised document \
-as markdown inside a fenced block that starts with ```{tag} and ends with ``` — that exact fence is \
-how the system captures it. Output NOTHING outside that fence — no JSON, no preamble, no prose.\n",
-        tag = tag
-    ));
+REVISE the document(s) so each decision is baked in, add a 'Delegated decisions (auto)' section \
+where every decision appears with a one-line rationale, and re-emit the COMPLETE revised \
+document(s) — each in its OWN fenced block. Output NOTHING outside those fences — no JSON, no \
+preamble, no prose.\n",
+    );
+    // Fence hardening (item 1): the last lines are the exact per-doc wrappers.
+    prompt.push_str(&fence_reminder(tags));
     (system, truncate_bytes(&prompt, HARD_PROMPT_CAP))
+}
+
+/// Parse the safeguard gate's `well-known: yes|no` line (design-speedup item 4, `research_mode ==
+/// "auto"`) from an enumerate-pass reply. `Some(true)` when the model reported the stack is
+/// mainstream/well-known (skip research), `Some(false)` when not, `None` when the line is
+/// absent/unparseable (the kernel then defaults to running research). Tolerant: case-insensitive,
+/// matches the first `well-known:`/`well known:` line and reads a leading yes/true vs no/false.
+pub fn parse_well_known(text: &str) -> Option<bool> {
+    for line in text.lines() {
+        let l = line.trim().to_ascii_lowercase();
+        let rest = l
+            .strip_prefix("well-known:")
+            .or_else(|| l.strip_prefix("well known:"))
+            .or_else(|| l.strip_prefix("- well-known:"))
+            .or_else(|| l.strip_prefix("well-known"))
+            .map(|s| s.trim_start_matches([':', ' ', '-']));
+        if let Some(v) = rest {
+            let v = v.trim();
+            if v.starts_with("yes") || v.starts_with("true") {
+                return Some(true);
+            }
+            if v.starts_with("no") || v.starts_with("false") {
+                return Some(false);
+            }
+        }
+    }
+    None
 }
 
 /// Why a breakdown JSON was rejected. Surfaced (quoted) on the single re-ask (6.3.2).

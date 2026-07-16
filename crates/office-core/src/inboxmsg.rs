@@ -104,3 +104,12 @@ pub fn archive_project(project: &str) -> Value {
 pub fn approve(project: &str) -> Value {
     json!({ "op": "approve", "project": project })
 }
+
+/// `{ "op": "skip", "project": <project> }`.
+///
+/// Skip the web-research analyst for a drafting project (design-speedup item 7): kill the in-flight
+/// researcher and advance the pipeline toward the TRD+CRD authoring. `project` is required by the
+/// parser; the office confirms as a chat notice, same as every other command tool.
+pub fn skip(project: &str) -> Value {
+    json!({ "op": "skip", "project": project })
+}

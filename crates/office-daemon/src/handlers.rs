@@ -48,6 +48,10 @@ pub enum Command {
     /// assumptions (6.2c): clears `pending_assumptions` and resumes the drafting pipeline.
     /// No contributed tool; MCP `workflow_approve` + inbox, owner-only like `authorize`.
     Approve { project: String },
+    /// `{ op: "skip", project }` — user-driven skip-research (design-speedup item 7,
+    /// `workflow_skip`): kill the in-flight researcher and advance the drafting pipeline. Owner-only
+    /// like `approve`.
+    Skip { project: String },
     /// An off-loop `models.invoke` completed (W9): posted by the invoke worker pool onto
     /// the driver channel, NOT parsed from the wire. `req_id` matches the driver's pending
     /// job; `result` is the model output or the error string. The driver applies its one
@@ -78,7 +82,8 @@ pub enum Command {
     /// `{ op: "edit_deps", task, ... }`.
     EditDeps { task: String, patch: Value },
     /// `{ op: "config_set", project, maxWorkers?, bounceBudget?, workerModel?,
-    /// reviewerModel?, keepDesks?, crdPassGrade?, assumptionCheck?, assumptionMode? }`.
+    /// reviewerModel?, keepDesks?, crdPassGrade?, assumptionCheck?, assumptionMode?,
+    /// researchMode?, drafterModel? }`.
     ConfigSet {
         project: String,
         max_workers: Option<u32>,
@@ -89,6 +94,8 @@ pub enum Command {
         crd_pass_grade: Option<u32>,
         assumption_check: Option<bool>,
         assumption_mode: Option<String>,
+        research_mode: Option<String>,
+        drafter_model: Option<String>,
     },
     /// `{ op: "project_create", name }`.
     ProjectCreate { name: String },
@@ -436,7 +443,16 @@ fn handle_panel_msg(params: Value, tx: &Sender<Input>) -> Value {
                     .map(|n| n as u32),
                 assumption_check: payload.get("assumptionCheck").and_then(Value::as_bool),
                 assumption_mode: opt_str_field(&payload, "assumptionMode"),
+                research_mode: opt_str_field(&payload, "researchMode"),
+                drafter_model: opt_str_field(&payload, "drafterModel"),
             }
+        }
+        "skip" => {
+            let project = match str_field(&payload, "project") {
+                Some(p) if !p.is_empty() => p,
+                _ => return error("op 'skip' requires a non-empty 'project'"),
+            };
+            Command::Skip { project }
         }
         "project_create" => {
             let name = match str_field(&payload, "name") {

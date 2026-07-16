@@ -4,7 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::inboxmsg::{approve, authorize, breakdown, brief, comment, interrupt, resume, status};
+    use crate::inboxmsg::{approve, authorize, breakdown, brief, comment, interrupt, resume, skip, status};
     use serde_json::json;
 
     #[test]
@@ -66,6 +66,11 @@ mod tests {
     #[test]
     fn breakdown_emits_project() {
         assert_eq!(breakdown("shop"), json!({ "op": "breakdown", "project": "shop" }));
+    }
+
+    #[test]
+    fn skip_emits_project() {
+        assert_eq!(skip("shop"), json!({ "op": "skip", "project": "shop" }));
     }
 
     #[test]

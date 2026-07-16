@@ -60,6 +60,9 @@ fn project(phase: ProjectPhase, tasks: Vec<Task>) -> Project {
         outbox: Vec::new(),
         trace: Vec::new(),
         interrupted_from: None,
+        gate_cleared: false,
+        gate_invoke_live_hint: false,
+        pending_breakdown: None,
         seq: 0,
     }
 }
@@ -1081,6 +1084,8 @@ fn config_set_applies_only_the_provided_fields() {
             crd_pass_grade: Some(90),
             assumption_check: Some(false),
             assumption_mode: Some("ask".to_string()),
+            research_mode: None,
+            drafter_model: None,
         }),
         1000,
         4,
@@ -1112,6 +1117,8 @@ fn config_set_crd_pass_grade_is_clamped_to_100() {
             crd_pass_grade: Some(250),
             assumption_check: None,
             assumption_mode: None,
+            research_mode: None,
+            drafter_model: None,
         }),
         1000,
         4,
@@ -1133,6 +1140,8 @@ fn config_set_max_workers_is_clamped_within_1_to_4() {
             crd_pass_grade: None,
             assumption_check: None,
             assumption_mode: None,
+            research_mode: None,
+            drafter_model: None,
         }),
         1000,
         4,
@@ -1150,6 +1159,8 @@ fn config_set_max_workers_is_clamped_within_1_to_4() {
             crd_pass_grade: None,
             assumption_check: None,
             assumption_mode: None,
+            research_mode: None,
+            drafter_model: None,
         }),
         1000,
         4,
@@ -1172,6 +1183,8 @@ fn config_set_with_no_fields_is_a_no_op_and_does_not_mark_dirty() {
             crd_pass_grade: None,
             assumption_check: None,
             assumption_mode: None,
+            research_mode: None,
+            drafter_model: None,
         }),
         1000,
         4,
@@ -1256,6 +1269,9 @@ fn breakdown_non_timeout_error_surfaces_immediately_no_compact_fallback() {
 #[test]
 fn breakdown_compact_success_lands_tasks_and_ready_notice() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    // design-speedup item 8: a breakdown result in Drafting is stashed and applied by the JOIN once
+    // the TRD+CRD gate has cleared; pin gate_cleared so this isolates the breakdown-landing itself.
+    p.gate_cleared = true;
     let fx = step(
         &mut p,
         invoke_result(InvokePurpose::BreakdownCompact, Ok(BREAKDOWN_JSON_OK.to_string())),
@@ -1338,6 +1354,7 @@ fn breakdown_parse_failure_reasks_once_then_surfaces_unchanged() {
 #[test]
 fn breakdown_reask_success_lands_tasks_unchanged() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.gate_cleared = true; // item 8: the JOIN applies the stashed breakdown once the gate cleared
     let fx = step(
         &mut p,
         invoke_result(InvokePurpose::BreakdownReask, Ok(BREAKDOWN_JSON_OK.to_string())),
@@ -1354,21 +1371,20 @@ fn breakdown_reask_success_lands_tasks_unchanged() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn prd_capture_spawns_research_and_defers_breakdown() {
-    // A ```prd fence in a Drafting reply lands the PRD and kicks off web-research — NOT the
-    // breakdown. No models.invoke fires yet (research runs first). assumption_check is disabled
-    // here so this test isolates the pipeline mechanics from the 6.2c safeguard gate (which,
-    // when on, would sit between the PRD capture and the research spawn — see
-    // `prd_capture_runs_assume_check_then_research` for the gated flow).
+fn prd_capture_starts_research_in_parallel_gate_off() {
+    // ADAPTED (design-speedup item 2): with the gate OFF and research "always", a ```prd fence lands
+    // the PRD and spawns research IMMEDIATELY (parallel), and the TRD+CRD authoring join then WAITS
+    // for research to settle — no TRD+CRD/breakdown invoke yet.
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.config.assumption_check = false;
+    p.config.research_mode = "always".to_string();
     let reply = "Agreed.\n```prd\n# App\nBuild a CLI.\n```\nShall we?";
     let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.to_string())), 1000, 4);
 
     assert_eq!(p.prd_markdown, "# App\nBuild a CLI.");
     assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research spawn emitted");
-    assert!(invoke_effects(&fx).is_empty(), "no breakdown/TRD invoke until research finishes");
-    // A provisional (id 0) project-level research binding is recorded, two-phase.
+    assert!(invoke_effects(&fx).is_empty(), "no TRD+CRD/breakdown invoke until research settles");
+    assert!(p.gate_cleared, "gate off -> the PRD gate immediately clears");
     match &p.research {
         Some(b) => {
             assert_eq!(b.kind, AgentKind::Researcher);
@@ -1376,7 +1392,6 @@ fn prd_capture_spawns_research_and_defers_breakdown() {
         }
         None => panic!("a research binding must be recorded"),
     }
-    assert!(p.outbox.iter().any(|n| n.text.contains("research")), "notice mentions researching");
 }
 
 #[test]
@@ -1388,23 +1403,48 @@ fn research_done_status_fetches_the_findings() {
 }
 
 #[test]
-fn research_result_stores_capped_notes_and_starts_trd() {
+fn research_result_settles_the_join_and_authors_trdcrd() {
+    // ADAPTED (item 2/3): research completing settles the research side of the join; with the PRD
+    // gate already cleared, the COMBINED TRD+CRD authoring invoke fires (not the old TRD-then-CRD).
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.prd_markdown = "# App\nBuild a Rust CLI.".into();
+    p.gate_cleared = true;
     p.research = Some(researcher_binding(55, 1000));
-    let report = "preamble\nOFFICE-RESEARCH\nfindings: - use clap v4\n- ratatui for the TUI\n";
+    let report = "preamble\nOFFICE-RESEARCH\nfindings: - use clap v4\n";
     let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 55, text: report.into() }), 2000, 4);
 
     assert!(p.research_notes.contains("clap v4"));
     assert!(p.research.is_none(), "binding cleared once the findings land");
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Trd);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd);
     assert!(p.outbox.iter().any(|n| n.text.contains("research done")));
 }
 
 #[test]
-fn research_failed_degrades_to_a_prd_only_trd() {
+fn research_result_before_the_gate_clears_waits_for_the_join() {
+    // NEW (item 2): the JOIN — research finishing BEFORE the PRD gate clears stashes the notes and
+    // fires NOTHING; the gate clearing later is what authors the docs.
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.prd_markdown = "# App".into();
+    p.gate_cleared = false;
+    // Mirrors the real emission: `gate_doc` sets this the instant the PRD-capture step fires the
+    // AssumeCheckPrd invoke (kernel.rs), so a genuinely in-process race has it `true` here. Without
+    // it, `self_heal_stale_prd_gate` would (correctly, per its OWN contract) treat this as a
+    // process-boundary reload and heal immediately, which is exactly what this test must NOT see.
+    p.gate_invoke_live_hint = true;
+    p.research = Some(researcher_binding(55, 1000));
+    let fx = step(&mut p, Input::Host(HostEvent::Result { agent_id: 55, text: "OFFICE-RESEARCH\nfindings: - clap\n".into() }), 2000, 4);
+    assert!(p.research.is_none(), "notes stashed, binding cleared");
+    assert!(invoke_effects(&fx).is_empty(), "no authoring until the gate clears too");
+
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 2100, 4);
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::TrdCrd, "gate-clear fires the join");
+}
+
+#[test]
+fn research_failed_degrades_and_authors_from_the_prd_alone() {
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = true;
     p.research = Some(researcher_binding(0, 1000)); // provisional; spawn never confirmed
     let fx = step(
         &mut p,
@@ -1414,7 +1454,7 @@ fn research_failed_degrades_to_a_prd_only_trd() {
     );
 
     assert!(p.research.is_none());
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Trd, "degrade goes straight to the TRD invoke");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "degrade authors TRD+CRD from the PRD");
     assert!(p
         .outbox
         .iter()
@@ -1422,70 +1462,156 @@ fn research_failed_degrades_to_a_prd_only_trd() {
 }
 
 #[test]
-fn research_runtime_ceiling_kills_and_degrades_to_trd() {
-    // A hung researcher is force-killed by the reconcile ceiling and Drafting degrades to a
-    // PRD-only TRD — the pipeline never wedges on a dead researcher.
+fn research_runtime_ceiling_kills_and_degrades() {
+    // A hung researcher is force-killed by the reconcile ceiling; with the PRD gate cleared, Drafting
+    // degrades to a PRD-only TRD+CRD — the pipeline never wedges on a dead researcher.
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.prd_markdown = "# App".into();
+    p.gate_cleared = true;
     p.research = Some(researcher_binding(700, 0));
     let now = p.config.worker_max_runtime_ms + 5_000;
     let fx = step(&mut p, Input::Host(HostEvent::Reconcile), now, 0);
 
     assert!(fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 700 })));
     assert!(p.research.is_none(), "over-age researcher cleared");
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Trd);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd);
     assert!(p.outbox.iter().any(|n| n.text.contains("research skipped")));
 }
 
 #[test]
-fn trd_result_lands_then_crd_then_breakdown_carries_the_trd() {
-    // Feature A inserts the CRD between the TRD and the breakdown: a captured TRD proceeds to
-    // the CRD invoke (not straight to breakdown), and the breakdown still carries the TRD once
-    // the CRD lands. assumption_check is off here to isolate the pipeline from the 6.2c gate.
+fn stale_pre_migration_gate_cleared_self_heals_on_research_degrade() {
+    // Review finding (CRITICAL, migration wedge): a `state.json` persisted before the
+    // `gate_cleared` field existed loads with it `false` even though the OLD flow (research only
+    // ever ran AFTER the PRD gate passed) had already cleared the gate — clearance was real but
+    // never persisted. No `AssumeCheckPrd` invoke will ever be (re-)fired for this PRD in the new
+    // build, so the stale researcher binding just settles via the reconcile runtime ceiling
+    // (dead-agent path) here. Unhealed, `maybe_author_trdcrd` would no-op forever (silent Drafting
+    // wedge) because `gate_cleared` stays `false`. The self-heal must presume the gate cleared and
+    // proceed with the TRD+CRD join.
     let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.config.assumption_check = false;
-    p.prd_markdown = "# App\nPRD body".into();
-    let trd_reply = "Here:\n```trd\n# TRD\nUse axum 0.7 and sqlx.\n```";
-    let fx = step(&mut p, invoke_result(InvokePurpose::Trd, Ok(trd_reply.to_string())), 1000, 4);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = false; // never persisted by the pre-migration build
+    p.pending_assumptions.clear(); // nothing waiting on the user — no outcome can ever arrive
+    p.research = Some(researcher_binding(700, 0)); // live pre-migration binding, reloaded stale
+    let now = p.config.worker_max_runtime_ms + 5_000; // old enough that no gate invoke could still be in flight
+    let fx = step(&mut p, Input::Host(HostEvent::Reconcile), now, 0);
 
-    assert_eq!(p.trd_markdown, "# TRD\nUse axum 0.7 and sqlx.");
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Crd, "a captured TRD proceeds to the CRD invoke");
-    assert!(p.outbox.iter().any(|n| n.text.contains("TRD drafted")));
-
-    // The CRD lands -> the breakdown runs, and its prompt still folds in the TRD.
-    let crd_reply = "```crd\n# CRD\n- README present (100 pts)\n```";
-    let fx2 = step(&mut p, invoke_result(InvokePurpose::Crd, Ok(crd_reply.to_string())), 2000, 4);
-    assert!(p.crd_markdown.contains("README present"));
-    let invokes = invoke_effects(&fx2);
-    assert_eq!(invokes.len(), 1);
-    match invokes[0] {
-        Effect::InvokeModel { purpose, prompt, .. } => {
-            assert_eq!(*purpose, InvokePurpose::Breakdown);
-            assert!(prompt.contains("axum 0.7"), "the TRD is folded into the breakdown prompt: {prompt}");
-        }
-        other => panic!("expected a breakdown InvokeModel, got {other:?}"),
-    }
+    assert!(fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 700 })));
+    assert!(p.research.is_none(), "over-age researcher cleared");
+    assert!(p.gate_cleared, "gate presumed cleared by the self-heal");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "self-heal unwedges the TRD+CRD join");
+    assert!(
+        p.trace.iter().any(|e| e.summary.contains("presumed cleared")),
+        "self-heal trace recorded"
+    );
 }
 
 #[test]
-fn trd_error_still_proceeds_to_crd_from_the_prd() {
-    // A TRD failure (Err / no fence) has nothing to safeguard-check, so it proceeds straight to
-    // the CRD invoke (the TRD's successor stage), built from the PRD alone — Drafting never
-    // wedges. Previously (pre-6.2c) a TRD Err went directly to breakdown; the CRD now sits in
-    // between so the completed project can still be clean-build audited.
+fn migrated_project_deserialized_fresh_heals_even_with_a_young_researcher() {
+    // Coordinator hardening: age alone misses two real wedges — (1) a fast daemon upgrade kills a
+    // research binding that is only minutes old (well under `worker_max_runtime_ms`), and (2) a
+    // migrated project whose researcher was ALREADY dead pre-upgrade respawns a FRESH researcher on
+    // resume (`resume_should_respawn_research`) that then completes normally at a young age. Both
+    // settle with `gate_cleared=false` and a YOUNG research binding — the age belt alone would never
+    // fire. The correct signal is the PROCESS BOUNDARY: `gate_invoke_live_hint` is `#[serde(skip)]`,
+    // so ANY project deserialized from disk has it `false` regardless of what the in-memory state
+    // looked like before the reload — proven here with an ACTUAL serde round-trip (not just a
+    // manually-set field), including starting from `true` to show the round-trip is what resets it.
     let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.config.assumption_check = false;
     p.prd_markdown = "# App".into();
+    p.gate_cleared = false;
+    p.gate_invoke_live_hint = true; // as if a gate invoke WAS in flight when this state was saved
+    p.research = Some(researcher_binding(900, 10_000));
+
+    let json = serde_json::to_string(&p).expect("serialize");
+    let mut reloaded: Project = serde_json::from_str(&json).expect("deserialize");
+    assert!(!reloaded.gate_invoke_live_hint, "the skip field never round-trips through disk");
+
+    // The researcher settles normally, well under `worker_max_runtime_ms` since spawn — the age
+    // belt alone would NOT fire here; only the hint (correctly `false` post-reload) heals it.
+    let now = 10_500;
+    assert!(now - 10_000 < reloaded.config.worker_max_runtime_ms, "settle is young, not ceiling-stale");
     let fx = step(
-        &mut p,
-        invoke_result(InvokePurpose::Trd, Err("model call timed out".into())),
-        1000,
+        &mut reloaded,
+        Input::Host(HostEvent::Result { agent_id: 900, text: "OFFICE-RESEARCH\nfindings: - clap\n".into() }),
+        now,
         4,
     );
 
-    assert!(p.trd_markdown.is_empty(), "a failed TRD leaves trd_markdown empty");
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Crd, "TRD failure proceeds to the CRD, from the PRD alone");
-    assert!(p.outbox.iter().any(|n| n.text.contains("TRD call failed")));
+    assert!(reloaded.gate_cleared, "gate presumed cleared by the hint-based self-heal");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "self-heal unwedges the TRD+CRD join");
+    assert!(
+        reloaded.trace.iter().any(|e| e.summary.contains("presumed cleared")),
+        "self-heal trace recorded"
+    );
+}
+
+#[test]
+fn in_process_gate_invoke_hint_blocks_heal_even_when_young() {
+    // Companion to `research_result_before_the_gate_clears_waits_for_the_join`, added for explicit
+    // coverage of the hint as the PRIMARY self-heal signal (not just the age belt): a genuinely
+    // in-process PRD gate invoke (`gate_invoke_live_hint = true`, as `gate_doc` sets the instant it
+    // fires the AssumeCheckPrd invoke) must NOT be healed away just because research happens to
+    // settle first, no matter how young the binding is.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = false;
+    p.gate_invoke_live_hint = true; // the PRD gate invoke is genuinely in flight THIS process
+    p.research = Some(researcher_binding(55, 1000));
+
+    let fx = step(
+        &mut p,
+        Input::Host(HostEvent::Result { agent_id: 55, text: "OFFICE-RESEARCH\nfindings: - clap\n".into() }),
+        2000,
+        4,
+    );
+
+    assert!(!p.gate_cleared, "hint blocks the self-heal — the invoke may still land");
+    assert!(invoke_effects(&fx).is_empty(), "no authoring until the gate itself clears");
+}
+
+#[test]
+fn trdcrd_result_captures_both_docs_and_gates_them_together() {
+    // ADAPTED (item 3): ONE invoke authors BOTH docs; both fences are captured and the SINGLE
+    // combined TRD+CRD gate runs over them.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App\nPRD body".into();
+    let reply = "Here:\n```trd\n# TRD\nUse axum 0.7.\n```\n```crd\n# CRD\n- README (100 pts)\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::TrdCrd, Ok(reply.to_string())), 1000, 4);
+
+    assert_eq!(p.trd_markdown, "# TRD\nUse axum 0.7.");
+    assert!(p.crd_markdown.contains("README"));
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckTrdCrd, "one combined gate over both docs");
+    assert!(p.outbox.iter().any(|n| n.text.contains("TRD + clean-build requirements drafted")));
+}
+
+#[test]
+fn trdcrd_result_missing_one_fence_nudges_on_the_shared_budget() {
+    // NEW (item 3): a long reply missing EITHER fence gets one capture-miss nudge (shared budget)
+    // and captures NOTHING until both fences arrive.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    let only_trd = format!("```trd\n# TRD\n```\n{}", "narration. ".repeat(60));
+    assert!(only_trd.len() > 500);
+    let fx = step(&mut p, invoke_result(InvokePurpose::TrdCrd, Ok(only_trd)), 1000, 4);
+
+    assert_eq!(p.capture_nudge_count, 1, "a missing fence nudges (shared budget)");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "re-ask for BOTH fences");
+    assert!(p.trd_markdown.is_empty(), "nothing captured until both fences arrive");
+}
+
+#[test]
+fn trdcrd_error_still_proceeds_to_breakdown() {
+    // ADAPTED: a TRD+CRD Err proceeds to the breakdown (the gate clears, early breakdown starts),
+    // built from the PRD alone — Drafting never wedges.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_check = false;
+    p.prd_markdown = "# App".into();
+    let fx = step(&mut p, invoke_result(InvokePurpose::TrdCrd, Err("model call timed out".into())), 1000, 4);
+
+    assert!(p.trd_markdown.is_empty(), "a failed TRD+CRD leaves the docs empty");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "TRD+CRD failure -> breakdown from the PRD");
+    assert!(p.outbox.iter().any(|n| n.text.contains("TRD+CRD call failed")));
 }
 
 #[test]
@@ -1502,116 +1628,177 @@ fn ready_phase_chat_trd_fence_updates_without_breakdown() {
 }
 
 // ---------------------------------------------------------------------------
-// Safeguard no-assume gate (6.2c feature C)
+// One-shot safeguard gate (design-speedup items 2/4/5 + amendment A)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn prd_fence_runs_assume_check_then_spawns_research_on_clean() {
-    // Gate ON (default): a ```prd fence emits an AssumeCheckPrd invoke, NOT a research spawn —
-    // research is deferred behind the check.
+fn prd_fence_runs_gate_and_research_in_parallel() {
+    // ADAPTED (item 2): gate ON + research "always" -> a ```prd fence emits the AssumeCheckPrd gate
+    // AND spawns research at the SAME time (research is no longer deferred behind the gate).
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "always".to_string();
     let reply = "```prd\n# App\nBuild a CLI.\n```";
     let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
 
     assert_eq!(p.prd_markdown, "# App\nBuild a CLI.");
-    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research is gated");
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research runs in PARALLEL now");
     assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd);
-    assert!(p.research.is_none(), "no research binding until the check clears");
-
-    // REGRESSION: the assume-check must NEVER run in json mode — its prompt demands the
-    // ASSUME-CHECK text block, and response_format json on chat-completions dialects
-    // 400s or yields unparseable JSON, silently fail-opening the safeguard.
+    assert!(p.research.is_some());
+    // REGRESSION: the assume-check must NEVER run in json mode (fail-opens the safeguard).
     match invoke_effects(&fx)[0] {
-        Effect::InvokeModel { format, .. } => {
-            assert!(format.is_none(), "assume-check invokes must not force json mode")
-        }
+        Effect::InvokeModel { format, .. } => assert!(format.is_none(), "assume-check must not force json"),
         other => panic!("expected InvokeModel, got {other:?}"),
     }
-
-    // A clean check clears pending_assumptions and spawns research (the deferred stage).
-    let fx2 = step(
-        &mut p,
-        invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())),
-        1100,
-        4,
-    );
-    assert!(fx2.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "clean check spawns research");
-    assert!(p.research.is_some());
-    assert!(p.pending_assumptions.is_empty());
 }
 
 #[test]
-fn assume_check_assumptions_stops_the_pipeline() {
-    // FLAGGED (autonomous-safeguard pivot 2026-07-15): this asserts the freeze-and-ask behavior,
-    // which is now the 'ask' mode. The default is 'auto' (autonomous resolution), so the test pins
-    // 'ask' explicitly. The freeze contract itself is unchanged — this is the 'ask' path verbatim.
+fn auto_gate_clean_is_one_invoke() {
+    // NEW (amendment A): a CLEAN auto-mode gate is ONE invoke total. research "never" isolates the
+    // gate; on clean it clears and authors the docs.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
+    p.prd_markdown = "# App".into();
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1000, 4);
+    assert!(
+        !invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeVerify, .. })),
+        "clean -> no verify invoke"
+    );
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "clean gate + research skipped -> author");
+    assert!(p.gate_cleared);
+}
+
+#[test]
+fn auto_gate_dirty_resolves_inline_then_verifies_two_invokes_never_three() {
+    // NEW (amendment A): a DIRTY auto-mode gate is EXACTLY two invokes — the enumerate (resolves
+    // inline + returns the revised doc) and the single verify. Never three.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
+    p.prd_markdown = "# App v1".into();
+    let enumerate = "ASSUME-CHECK\nverdict: assumptions\n- [auto] picked Postgres\n```prd\n# App v2 (Postgres, delegated)\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(enumerate.into())), 1000, 4);
+    assert_eq!(p.prd_markdown, "# App v2 (Postgres, delegated)", "the doc is revised inline (invoke #1)");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeVerify, "invoke #2 is the verify");
+    assert!(p.pending_assumptions.is_empty(), "auto resolution leaves no disk waiting-state");
+
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::AssumeVerify, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1100, 4);
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::TrdCrd, "verify clean -> author; the WHOLE gate was 2 invokes");
+}
+
+#[test]
+fn verify_disclose_records_and_never_loops() {
+    // NEW (item 5c): a verify that flags NEW items DISCLOSES them and clears the gate — it NEVER
+    // triggers another resolve round.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
+    p.prd_markdown = "# App".into();
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeVerify, Ok("ASSUME-CHECK\nverdict: assumptions\n- leftover choice\n".into())), 1000, 4);
+    assert!(
+        !invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeResolve, .. })),
+        "verify never resolves again"
+    );
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "gate clears anyway -> author");
+    assert!(p.self_resolved_assumptions.iter().any(|a| a == "leftover choice"), "the new item is disclosed");
+    assert!(p.trace.iter().any(|e| e.summary.contains("disclosed")));
+}
+
+#[test]
+fn ask_mode_critical_items_freeze_before_any_rewrite() {
+    // ADAPTED (amendment A): 'ask' mode surfaces CRITICAL items to the user before any rewrite; only
+    // the critical item freezes (the non-critical remainder is left for after).
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.config.assumption_mode = "ask".to_string();
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
-    let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed Postgres\n- assumed React\n";
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [critical] spends money on SMS\n- [auto] uses Postgres\n";
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
 
-    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "assumptions STOP the pipeline");
-    assert!(invoke_effects(&fx).is_empty(), "no further invoke — the user must act");
-    assert_eq!(
-        p.pending_assumptions,
-        vec!["assumed Postgres".to_string(), "assumed React".to_string()]
-    );
-    assert!(p
-        .outbox
-        .iter()
-        .any(|n| n.text.contains("unapproved assumption") && n.text.contains("PRD")));
+    assert!(invoke_effects(&fx).is_empty(), "a critical freeze emits no invoke — the user must act");
+    assert_eq!(p.pending_assumptions, vec!["spends money on SMS".to_string()], "only the critical item freezes");
+    assert!(p.outbox.iter().any(|n| n.text.contains("critical assumption") && n.text.contains("PRD")));
+}
+
+#[test]
+fn ask_mode_noncritical_resolves_then_verifies() {
+    // ADAPTED (amendment A): 'ask' mode with only non-critical items batch-resolves them (a separate
+    // resolve invoke), then verifies — enumerate + resolve + verify.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_mode = "ask".to_string();
+    p.config.research_mode = "never".to_string();
+    p.prd_markdown = "# App".into();
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [auto] uses Postgres\n- picked React\n";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeResolve, "ask resolves the non-critical remainder");
+    assert!(p.pending_assumptions.is_empty(), "no freeze on non-critical in ask mode");
+
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Ok("```prd\n# App v2\n```".into())), 1100, 0);
+    assert_eq!(p.prd_markdown, "# App v2");
+    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::AssumeVerify, "resolve -> verify");
 }
 
 #[test]
 fn assume_check_error_fails_open_and_proceeds() {
+    // ADAPTED: a check Err fails open; with research "never" the join authors the docs.
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
-    let fx = step(
-        &mut p,
-        invoke_result(InvokePurpose::AssumeCheckPrd, Err("model call timed out".into())),
-        1000,
-        4,
-    );
-    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "a check error FAILS OPEN");
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Err("model call timed out".into())), 1000, 4);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "a check error FAILS OPEN");
     assert!(p.outbox.iter().any(|n| n.text.contains("assumption check skipped")));
 }
 
 #[test]
 fn clean_check_clears_prior_pending_assumptions() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
     p.pending_assumptions = vec!["stale".to_string()];
-    step(
-        &mut p,
-        invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())),
-        1000,
-        0,
-    );
+    step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1000, 0);
     assert!(p.pending_assumptions.is_empty(), "a clean check clears pending_assumptions");
 }
 
 #[test]
-fn assume_check_trd_clean_proceeds_to_crd_and_crd_clean_to_breakdown() {
-    // The gate's deferred stage is a pure function of the doc: TRD -> CRD, CRD -> breakdown.
+fn trdcrd_gate_clean_proceeds_to_breakdown() {
+    // ADAPTED: the SINGLE combined TRD+CRD gate clearing proceeds to the breakdown.
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.trd_markdown = "# TRD".into();
-    let fx = step(
-        &mut p,
-        invoke_result(InvokePurpose::AssumeCheckTrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())),
-        1000,
-        4,
-    );
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Crd);
-
     p.crd_markdown = "# CRD".into();
-    let fx2 = step(
-        &mut p,
-        invoke_result(InvokePurpose::AssumeCheckCrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())),
-        1100,
-        4,
-    );
-    assert_eq!(sole_invoke_purpose(&fx2), InvokePurpose::Breakdown);
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckTrdCrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1000, 4);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "clean TRD+CRD gate -> (early) breakdown");
+}
+
+#[test]
+fn research_mode_never_skips_research_entirely() {
+    // NEW (item 4): "never" skips research; the PRD gate off -> author immediately.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_check = false;
+    p.config.research_mode = "never".to_string();
+    let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# App\n```".into())), 1000, 4);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "never -> no research spawn");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "no research -> author immediately");
+    assert!(p.trace.iter().any(|e| e.summary.contains("research skipped (config)")));
+}
+
+#[test]
+fn research_mode_auto_skips_when_stack_is_well_known() {
+    // NEW (item 4): "auto" reads the PRD gate's well-known:yes and skips research.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "auto".to_string();
+    p.prd_markdown = "# App".into();
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\nwell-known: yes\n".into())), 1000, 4);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "well-known -> no research");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "skip research -> author");
+    assert!(p.trace.iter().any(|e| e.summary.contains("well-known")));
+}
+
+#[test]
+fn research_mode_auto_runs_when_not_well_known() {
+    // NEW (item 4): "auto" + well-known:no runs research; authoring then waits for it.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "auto".to_string();
+    p.prd_markdown = "# App".into();
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\nwell-known: no\n".into())), 1000, 4);
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "not well-known -> research runs");
+    assert!(invoke_effects(&fx).is_empty(), "authoring waits for research");
 }
 
 // ---------------------------------------------------------------------------
@@ -1818,21 +2005,21 @@ fn recheck_clean_clears_pending_and_resumes_deferred_stage() {
 }
 
 #[test]
-fn recheck_still_dirty_updates_the_pending_list() {
-    // FLAGGED (autonomous-safeguard pivot): 'ask' mode, so a still-dirty re-check refreshes the
-    // pending list instead of auto-resolving. Under the default 'auto' mode these untagged (= auto)
-    // items would be resolved autonomously, not frozen (covered by the auto-mode tests below).
+fn recheck_still_dirty_on_critical_updates_the_pending_list() {
+    // ADAPTED (amendment A): 'ask' mode now freezes on CRITICAL items only, so a still-dirty re-check
+    // that still flags a [critical] item refreshes the pending list (untagged items would resolve).
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.config.assumption_mode = "ask".to_string();
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
-    p.pending_assumptions = vec!["assumed Postgres".to_string(), "assumed React".to_string()];
-    // Fenceless reply re-emits the gate; the verdict is still dirty but with a shorter list.
+    p.pending_assumptions = vec!["deploys to prod".to_string(), "spends money".to_string()];
+    // Fenceless reply re-emits the gate; the verdict is still dirty but a shorter critical list.
     step(&mut p, invoke_result(InvokePurpose::Persona, Ok("here is my reasoning".into())), 1000, 4);
-    let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed React\n";
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [critical] deploys to prod\n";
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1100, 0);
 
-    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "still stopped");
-    assert_eq!(p.pending_assumptions, vec!["assumed React".to_string()], "list refreshed (shrank)");
+    assert!(invoke_effects(&fx).is_empty(), "still stopped on the critical item");
+    assert_eq!(p.pending_assumptions, vec!["deploys to prod".to_string()], "critical list refreshed (shrank)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1842,13 +2029,14 @@ fn recheck_still_dirty_updates_the_pending_list() {
 #[test]
 fn approve_assumptions_clears_resumes_and_records_the_turn() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string(); // isolate the resume from research
     p.prd_markdown = "# App".into();
     p.pending_assumptions = vec!["assumed Postgres".to_string()];
     let fx = step(&mut p, Input::Command(Command::ApproveAssumptions), 1000, 4);
 
     assert!(p.pending_assumptions.is_empty(), "human approval clears pending DIRECTLY");
-    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage resumes");
-    assert!(invoke_effects(&fx).is_empty(), "no safeguard re-invoke — approval outranks the checker");
+    // ADAPTED: the PRD stage's resume is now the TRD+CRD authoring join (research skipped here).
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "the deferred stage resumes (no safeguard re-invoke)");
     // The approval is recorded as a User turn so any later gate sees the delegation.
     let last = p.office_transcript.last().expect("a turn was appended");
     assert!(matches!(last.who, ChatAuthor::User), "recorded as a User turn");
@@ -1874,154 +2062,113 @@ fn approve_with_nothing_pending_only_notices() {
 }
 
 // ---------------------------------------------------------------------------
-// Autonomous assumption resolution (autonomous-safeguard pivot 2026-07-15)
+// One-shot gate: resolution + verify (design-speedup items 5 + amendment A)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn auto_mode_all_auto_assumptions_resolve_autonomously_without_freezing() {
-    // Default 'auto' mode: an assumptions verdict of only non-critical (untagged = auto) items does
-    // NOT freeze. Instead the kernel emits an AssumeResolve invoke, leaves pending EMPTY (no disk
-    // waiting-state), and bumps the round counter. The pipeline is never stalled on the human.
+fn auto_mode_dirty_without_inline_revision_still_goes_to_verify() {
+    // ADAPTED (amendment A): the auto-mode gate is ONE-SHOT. Even when the enumerate flags [auto]
+    // items but returns NO revised fence, the kernel does NOT loop a resolve round — it proceeds to
+    // the single verify pass, with no disk waiting-state.
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
     assert_eq!(p.config.assumption_mode, "auto", "default is autonomous");
     let check = "ASSUME-CHECK\nverdict: assumptions\n- [auto] uses Postgres\n- picked React\n";
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
-
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeResolve, "auto items are resolved, not frozen");
-    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage is not run yet");
-    assert!(p.pending_assumptions.is_empty(), "auto resolution leaves NO disk waiting-state");
-    assert_eq!(p.assumption_rounds, 1, "one resolution round has started");
-    assert!(p.outbox.iter().any(|n| n.text.contains("resolving") && n.text.contains("autonomously")));
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeVerify, "auto dirty -> single verify, never a resolve loop");
+    assert!(p.pending_assumptions.is_empty(), "auto mode leaves NO disk waiting-state");
 }
 
 #[test]
-fn auto_resolve_result_updates_the_doc_and_reruns_the_gate() {
-    // The resolution invoke returns a revised ```prd fence -> the PRD is updated in place and the
-    // SAME gate (AssumeCheckPrd) re-runs on the revised body. assumption_rounds is NOT reset (a
-    // resolution capture is not a fresh capture).
+fn ask_resolve_result_revises_the_doc_and_verifies() {
+    // ADAPTED: the ask-mode batch resolve invoke returns a revised ```prd -> the PRD is updated in
+    // place and the single VERIFY pass runs (NEVER another gate round).
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_mode = "ask".to_string();
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App\nv1".into();
-    p.assumption_rounds = 1;
     let revised = "Here is the revised doc:\n```prd\n# App\nv2 — Postgres chosen\n```";
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Ok(revised.into())), 1100, 0);
-
     assert_eq!(p.prd_markdown, "# App\nv2 — Postgres chosen", "the doc is updated in place");
-    assert_eq!(p.assumption_rounds, 1, "a resolution capture does NOT reset the round budget");
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "the gate re-runs on the revised doc");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeVerify, "resolve -> verify, never re-loop");
 }
 
 #[test]
-fn auto_resolve_then_clean_check_resumes_the_deferred_stage() {
-    // Full loop: all-auto verdict -> resolve invoke -> revised doc -> clean re-check -> the deferred
-    // stage (research) finally runs. The pipeline advanced with zero human involvement.
+fn ask_full_loop_resolve_verify_then_authors() {
+    // Full 'ask' loop: enumerate (non-critical) -> resolve -> verify(clean) -> author. Zero human
+    // involvement, and the gate never loops.
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.assumption_mode = "ask".to_string();
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
     step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: assumptions\n- picked React\n".into())), 1000, 0);
-    assert_eq!(p.assumption_rounds, 1);
     step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Ok("```prd\n# App\nReact (delegated)\n```".into())), 1100, 0);
-    // The re-check comes back clean now that the assumption is baked in.
-    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1200, 0);
-    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage resumes autonomously");
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeVerify, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1200, 0);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "the pipeline authors autonomously");
     assert!(p.pending_assumptions.is_empty());
 }
 
 #[test]
-fn auto_mode_round_cap_proceeds_with_undecided_disclosure() {
-    // After AUTO_ROUND_CAP (2) resolution rounds on one doc, another all-auto verdict PROCEEDS
-    // anyway with a disclosure notice — ultra-automatic mode never stalls on paperwork.
+fn resolve_error_proceeds_anyway() {
+    // A resolution invoke Err never wedges: proceed (research never -> author) + a disclosure notice.
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
-    p.assumption_rounds = 2; // cap already reached
-    let check = "ASSUME-CHECK\nverdict: assumptions\n- [auto] still ungrounded\n";
-    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
-
-    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the pipeline proceeds past the cap");
-    assert!(!invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeResolve, .. })), "no further resolve invoke past the cap");
-    assert!(p.pending_assumptions.is_empty());
-    assert!(p.outbox.iter().any(|n| n.text.contains("proceeding with") && n.text.contains("undecided")));
-}
-
-#[test]
-fn auto_resolve_error_proceeds_anyway() {
-    // A resolution invoke Err never wedges: proceed with the deferred stage + a disclosure notice.
-    let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.prd_markdown = "# App".into();
-    p.assumption_rounds = 1;
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Err("model call timed out".into())), 1100, 0);
-    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "an Err resolve fails open");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "an Err resolve fails open");
     assert!(p.outbox.iter().any(|n| n.text.contains("could not finish")));
 }
 
 #[test]
-fn auto_resolve_missing_fence_proceeds_anyway() {
-    // A resolution reply without the doc's fence also fails open (never wedges).
+fn resolve_missing_fence_proceeds_anyway() {
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
-    p.assumption_rounds = 1;
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeResolve, Ok("I decided everything but forgot the fence.".into())), 1100, 0);
-    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "a fenceless resolve fails open");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "a fenceless resolve fails open");
     assert!(p.outbox.iter().any(|n| n.text.contains("could not finish")));
 }
 
 #[test]
-fn auto_mode_critical_items_freeze_but_only_the_critical_ones() {
-    // A [critical] item stops for the human even in auto mode — but pending carries ONLY the
-    // critical items (the auto ones are dropped this round), and no resolve invoke fires.
+fn critical_items_freeze_but_only_the_critical_ones() {
+    // A [critical] item stops for the human even in auto mode — pending carries ONLY the critical
+    // items (the [auto] ones were resolved inline / dropped this round), and no invoke fires.
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
     let check = "ASSUME-CHECK\nverdict: assumptions\n- [critical] spends money on a paid SMS gateway\n- [auto] uses Postgres\n";
     let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
-
-    assert!(invoke_effects(&fx).is_empty(), "a critical freeze emits no invoke — the user must act");
-    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "critical assumptions STOP the pipeline");
+    assert!(invoke_effects(&fx).is_empty(), "a critical freeze emits no invoke");
     assert_eq!(
         p.pending_assumptions,
         vec!["spends money on a paid SMS gateway".to_string()],
-        "ONLY the critical item is pending (tag stripped); the auto item is dropped"
+        "ONLY the critical item is pending (tag stripped)"
     );
     assert!(p.outbox.iter().any(|n| n.text.contains("critical assumption") && n.text.contains("PRD")));
 }
 
 #[test]
-fn auto_mode_critical_freeze_is_cleared_by_approve() {
-    // The workflow_approve path still clears a critical freeze and resumes, exactly like before.
+fn critical_freeze_is_cleared_by_approve() {
+    // The workflow_approve path clears a critical freeze and resumes (research never -> author).
     let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
     step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok("ASSUME-CHECK\nverdict: assumptions\n- [critical] deploys to production\n".into())), 1000, 0);
     assert_eq!(p.pending_assumptions.len(), 1, "frozen on the critical item");
     let fx = step(&mut p, Input::Command(Command::ApproveAssumptions), 1100, 4);
     assert!(p.pending_assumptions.is_empty(), "approval clears the critical freeze");
-    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "the deferred stage resumes");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "the pipeline resumes (authors the docs)");
 }
 
 #[test]
-fn ask_mode_freezes_on_untagged_items_exactly_like_before() {
-    // Belt for the flagged pins: with assumption_mode = "ask", untagged items freeze the pipeline
-    // (the pre-pivot behavior), never auto-resolving.
+fn fresh_prd_capture_resets_the_gate() {
+    // ADAPTED (design-speedup): a fresh persona ```prd capture reopens the gate for the new doc-set.
     let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.config.assumption_mode = "ask".to_string();
-    p.prd_markdown = "# App".into();
-    let check = "ASSUME-CHECK\nverdict: assumptions\n- [auto] uses Postgres\n- picked React\n";
-    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
-
-    assert!(invoke_effects(&fx).is_empty(), "ask mode never emits a resolve invoke");
-    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "ask mode freezes");
-    assert_eq!(
-        p.pending_assumptions,
-        vec!["uses Postgres".to_string(), "picked React".to_string()],
-        "ask mode freezes on EVERY material item (tags stripped, critical-first ordering)"
-    );
-}
-
-#[test]
-fn fresh_prd_capture_resets_the_auto_round_budget() {
-    // A fresh persona ```prd capture resets assumption_rounds so the resolution budget is per-doc.
-    let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.assumption_rounds = 2; // a prior doc exhausted its budget
+    p.gate_cleared = true; // a prior doc-set had cleared
     let reply = "```prd\n# App v2\n```";
     let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
-    assert_eq!(p.assumption_rounds, 0, "a fresh capture resets the round budget");
+    assert!(!p.gate_cleared, "a fresh capture reopens the gate");
     assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::AssumeCheckPrd, "and re-runs the gate on the new doc");
 }
 
@@ -2035,6 +2182,8 @@ fn config_set_assumption_mode_roundtrips_and_rejects_unknown_values() {
         max_workers: None, bounce_budget: None, worker_model: None, reviewer_model: None,
         keep_desks: None, crd_pass_grade: None, assumption_check: None,
         assumption_mode: Some("ask".to_string()),
+        research_mode: None,
+        drafter_model: None,
     }), 1000, 4);
     assert_eq!(p.config.assumption_mode, "ask", "a valid mode is applied");
 
@@ -2043,68 +2192,116 @@ fn config_set_assumption_mode_roundtrips_and_rejects_unknown_values() {
         max_workers: None, bounce_budget: None, worker_model: None, reviewer_model: None,
         keep_desks: None, crd_pass_grade: None, assumption_check: None,
         assumption_mode: Some("banana".to_string()),
+        research_mode: None,
+        drafter_model: None,
     }), 1000, 4);
     assert_eq!(p.config.assumption_mode, "ask", "an unknown mode is ignored, not applied");
 }
 
 // ---------------------------------------------------------------------------
-// CRD invoke (6.2c feature A)
+// Early breakdown + JOIN (design-speedup item 8)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn crd_result_fence_gate_off_requests_breakdown() {
+fn early_breakdown_join_builds_board_on_gate_clear() {
+    // NEW (item 8): a clean TRD+CRD gate starts the early breakdown AND clears the gate; the JOIN
+    // then builds the board when the breakdown lands — so authorize finds a ready board.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.trd_markdown = "# TRD".into();
+    p.crd_markdown = "# CRD".into();
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckTrdCrd, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1000, 4);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "the early breakdown starts at gate-clear");
+    assert!(p.gate_cleared);
+    assert!(matches!(p.phase, ProjectPhase::Drafting), "still Drafting until the breakdown lands");
+    assert!(p.trace.iter().any(|e| e.summary.contains("started early")));
+
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(BREAKDOWN_JSON_OK.to_string())), 2000, 4);
+    assert!(invoke_effects(&fx2).is_empty());
+    assert_eq!(p.phase, ProjectPhase::Ready, "the board is built and the project is Ready to authorize");
+    assert_eq!(p.tasks.len(), 1);
+    assert!(p.pending_breakdown.is_none(), "the stash was consumed");
+}
+
+#[test]
+fn early_breakdown_lands_before_verify_and_join_waits() {
+    // NEW (item 8): in the DIRTY gate path the early breakdown runs in parallel with the verify; if
+    // it lands FIRST it is stashed and applied only once the verify clears the gate.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.research_mode = "never".into();
+    p.trd_markdown = "# TRD".into();
+    p.crd_markdown = "# CRD".into();
+    let enumerate = "ASSUME-CHECK\nverdict: assumptions\n- [auto] x\n```trd\n# TRD v2\n```\n```crd\n# CRD v2\n```";
+    let fx = step(&mut p, invoke_result(InvokePurpose::AssumeCheckTrdCrd, Ok(enumerate.into())), 1000, 4);
+    assert!(invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeVerify, .. })), "verify emitted");
+    assert!(invoke_effects(&fx).iter().any(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::Breakdown, .. })), "early breakdown parallel with verify");
+    assert!(!p.gate_cleared, "gate not cleared until the verify returns");
+
+    step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(BREAKDOWN_JSON_OK.to_string())), 1100, 4);
+    assert!(matches!(p.phase, ProjectPhase::Drafting), "stashed, not applied while the verify is in flight");
+    assert!(p.pending_breakdown.is_some());
+
+    step(&mut p, invoke_result(InvokePurpose::AssumeVerify, Ok("ASSUME-CHECK\nverdict: clean\n".into())), 1200, 4);
+    assert_eq!(p.phase, ProjectPhase::Ready, "the verify clearing the gate fires the JOIN");
+    assert_eq!(p.tasks.len(), 1);
+}
+
+#[test]
+fn breakdown_redone_on_fresh_trdcrd_capture() {
+    // NEW (item 8): a fresh TRD+CRD capture (a revised doc-set) DISCARDS a stale stashed breakdown
+    // and reopens the gate. Gate ON so the fresh capture leaves the gate un-cleared (in flight).
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.trd_markdown = "# TRD v1".into();
+    p.crd_markdown = "# CRD v1".into();
+    p.pending_breakdown = Some("stale".into());
+    p.gate_cleared = true;
+    let reply = "```trd\n# TRD v2\n```\n```crd\n# CRD v2\n```";
+    step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.pending_breakdown.is_none(), "the stale breakdown is discarded");
+    assert!(!p.gate_cleared, "the gate reopens for the revised doc-set");
+    assert!(p.trace.iter().any(|e| e.summary.contains("breakdown redone")));
+}
+
+#[test]
+fn breakdown_failure_then_manual_rerun_builds_the_board() {
+    // NEW (item 8 fallback): if the early breakdown fails, the pipeline waits; a manual
+    // workflow_breakdown re-run then stashes + applies (the gate already cleared).
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.trd_markdown = "# TRD".into();
+    p.crd_markdown = "# CRD".into();
+    p.gate_cleared = true; // gate already cleared, breakdown owed
+    step(&mut p, invoke_result(InvokePurpose::Breakdown, Err("bad request".into())), 1000, 4);
+    assert!(matches!(p.phase, ProjectPhase::Drafting), "no board yet");
+    assert!(p.pending_breakdown.is_none());
+
+    step(&mut p, Input::Command(Command::RequestBreakdown), 1100, 4);
+    step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(BREAKDOWN_JSON_OK.to_string())), 1200, 4);
+    assert_eq!(p.phase, ProjectPhase::Ready, "the manual re-run builds the board");
+    assert_eq!(p.tasks.len(), 1);
+}
+
+#[test]
+fn manual_breakdown_in_ready_applies_immediately() {
+    // ADAPTED (item 8): a breakdown result in READY (a manual re-plan) applies immediately (replaces
+    // the board), rather than stashing.
+    let mut p = project(ProjectPhase::Ready, vec![task("old", TaskState::Todo, 0, &[])]);
+    let fx = step(&mut p, invoke_result(InvokePurpose::Breakdown, Ok(BREAKDOWN_JSON_OK.to_string())), 1000, 4);
+    let _ = fx;
+    assert_eq!(p.phase, ProjectPhase::Ready, "stays Ready");
+    assert!(p.pending_breakdown.is_none(), "not stashed in Ready");
+    assert!(p.tasks.iter().any(|t| t.id.0.ends_with("/t1")), "the board is replaced by the re-plan");
+}
+
+#[test]
+fn chat_trdcrd_fence_gate_off_proceeds_to_breakdown() {
+    // ADAPTED: a chat-authored ```trd + ```crd in Drafting (gate off) captures both and proceeds to
+    // the (early) breakdown.
     let mut p = project(ProjectPhase::Drafting, vec![]);
     p.config.assumption_check = false;
-    p.prd_markdown = "# App".into();
-    let fx = step(
-        &mut p,
-        invoke_result(InvokePurpose::Crd, Ok("```crd\n# CRD\n- README (100 pts)\n```".into())),
-        1000,
-        4,
-    );
-    assert!(p.crd_markdown.contains("README"));
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown);
-    assert!(p.outbox.iter().any(|n| n.text.contains("clean-build requirements")));
-}
-
-#[test]
-fn crd_error_fails_open_to_breakdown_without_audit() {
-    let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.prd_markdown = "# App".into();
-    let fx = step(
-        &mut p,
-        invoke_result(InvokePurpose::Crd, Err("model call timed out".into())),
-        1000,
-        4,
-    );
-    assert!(p.crd_markdown.is_empty(), "a failed CRD leaves crd_markdown empty");
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "CRD failure still breaks down");
-    assert!(p.outbox.iter().any(|n| n.text.contains("without a clean-build audit")));
-}
-
-#[test]
-fn crd_no_fence_fails_open_to_breakdown() {
-    let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.prd_markdown = "# App".into();
-    let fx = step(
-        &mut p,
-        invoke_result(InvokePurpose::Crd, Ok("here is the crd: build clean".into())),
-        1000,
-        4,
-    );
-    assert!(p.crd_markdown.is_empty());
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown);
-    assert!(p.outbox.iter().any(|n| n.text.contains("CRD call skipped")));
-}
-
-#[test]
-fn chat_crd_fence_gate_off_proceeds_to_breakdown() {
-    let mut p = project(ProjectPhase::Drafting, vec![]);
-    p.config.assumption_check = false;
-    let reply = "Here:\n```crd\n# CRD\n- builds clean (100 pts)\n```";
+    let reply = "Here:\n```trd\n# TRD\n```\n```crd\n# CRD\n- builds clean (100 pts)\n```";
     let fx = step(&mut p, invoke_result(InvokePurpose::Persona, Ok(reply.into())), 1000, 4);
+    assert!(p.trd_markdown.contains("# TRD"));
     assert!(p.crd_markdown.contains("builds clean"));
-    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown);
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::Breakdown, "gate off -> straight to the early breakdown");
 }
 
 // ---------------------------------------------------------------------------
@@ -2378,19 +2575,19 @@ fn trace_records_capture_gate_and_research() {
 }
 
 #[test]
-fn trace_records_gate_stop_on_assumptions() {
+fn trace_records_gate_stop_on_critical_assumptions() {
+    // ADAPTED (amendment A): the gate now stops only on [critical] items (both modes). Drive two
+    // critical items to exercise (and trace) the freeze-and-stop path with its flagged count.
     let mut p = project(ProjectPhase::Drafting, vec![]);
-    // Unification 2026-07-15: the default mode is now "auto" (untagged items auto-resolve, no
-    // stop), so drive "ask" mode to exercise (and trace) the freeze-and-stop path.
-    p.config.assumption_mode = "ask".to_string();
+    p.config.research_mode = "never".to_string();
     p.prd_markdown = "# App".into();
-    let check = "ASSUME-CHECK\nverdict: assumptions\n- assumed Postgres\n- assumed React\n";
+    let check = "ASSUME-CHECK\nverdict: assumptions\n- [critical] deploys to prod\n- [critical] spends money\n";
     step(&mut p, invoke_result(InvokePurpose::AssumeCheckPrd, Ok(check.into())), 1000, 0);
     assert!(
         p.trace
             .iter()
             .any(|e| e.kind == "gate" && e.summary.contains("STOPPED") && e.summary.contains("2 assumption")),
-        "the gate stop records the flagged count: {:?}",
+        "the critical gate stop records the flagged count: {:?}",
         p.trace
     );
 }
@@ -2449,4 +2646,161 @@ fn invoke_result_is_ignored_while_interrupted() {
             .any(|e| e.kind == "invoke" && e.summary.contains("ignored") && e.summary.contains("interrupted")),
         "the ignored result is recorded on the diary"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resume respawns research (design-speedup item 6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resume_respawns_research_when_it_was_mid_research() {
+    // NEW (item 6): a hard interrupt during Drafting killed the researcher; resuming with a captured
+    // PRD, no notes, and no TRD respawns it immediately instead of waiting for a user message.
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    p.interrupted_from = Some(ProjectPhase::Drafting);
+    p.prd_markdown = "# App".into();
+    p.research_notes = String::new();
+    p.research = None;
+    let fx = step(&mut p, Input::Command(Command::Resume), 1000, 4);
+    assert!(matches!(p.phase, ProjectPhase::Drafting));
+    assert!(fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "research is respawned on resume");
+    assert!(p.research.is_some());
+    assert!(p.trace.iter().any(|e| e.kind == "research" && e.summary.contains("respawned on resume")));
+}
+
+#[test]
+fn resume_does_not_respawn_when_research_already_done() {
+    // NEW (item 6): if research already finished (notes present), resume does NOT respawn it.
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    p.interrupted_from = Some(ProjectPhase::Drafting);
+    p.prd_markdown = "# App".into();
+    p.research_notes = "already researched".into();
+    let fx = step(&mut p, Input::Command(Command::Resume), 1000, 4);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "no respawn once research is done");
+}
+
+#[test]
+fn resume_does_not_respawn_when_research_mode_never() {
+    // NEW (item 6): "never" projects never respawn research on resume.
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    p.interrupted_from = Some(ProjectPhase::Drafting);
+    p.prd_markdown = "# App".into();
+    p.config.research_mode = "never".into();
+    let fx = step(&mut p, Input::Command(Command::Resume), 1000, 4);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::SpawnResearch { .. })), "never -> no respawn");
+}
+
+// ---------------------------------------------------------------------------
+// workflow_skip (design-speedup item 7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn workflow_skip_kills_research_and_advances_the_join() {
+    // NEW (item 7): skip while research is in flight kills the researcher and advances the TRD+CRD
+    // authoring join (the PRD gate already cleared here).
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = true;
+    p.research = Some(researcher_binding(88, 500));
+    let fx = step(&mut p, Input::Command(Command::SkipResearch), 1000, 4);
+    assert!(fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 88 })), "the researcher is killed");
+    assert!(p.research.is_none(), "research binding cleared (skipped)");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "the pipeline advances to TRD+CRD authoring");
+    assert!(p.trace.iter().any(|e| e.summary.contains("research skipped by user")));
+}
+
+#[test]
+fn workflow_skip_on_a_migrated_project_also_heals_the_stale_gate() {
+    // Coordinator hardening point 6: a user calling workflow_skip on a migrated project (deserialized
+    // -> `gate_invoke_live_hint = false`, `gate_cleared = false` never persisted by the pre-migration
+    // build) must ALSO unwedge it, exactly like a settle via research_degrade/on_research_result.
+    // `skip_research` funnels through the same `maybe_author_trdcrd` -> `self_heal_stale_prd_gate`
+    // join, so this locks that path in too.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.prd_markdown = "# App".into();
+    p.gate_cleared = false; // never persisted by the pre-migration build
+    p.gate_invoke_live_hint = false; // deserialized fresh — no invoke can be in flight
+    p.research = Some(researcher_binding(88, 500)); // live pre-migration binding, reloaded stale
+    let fx = step(&mut p, Input::Command(Command::SkipResearch), 1000, 4); // young settle — age belt would NOT fire
+    assert!(fx.iter().any(|e| matches!(e, Effect::Kill { ext_agent_id: 88 })), "the researcher is killed");
+    assert!(p.research.is_none(), "research binding cleared (skipped)");
+    assert!(p.gate_cleared, "gate presumed cleared by the hint-based self-heal");
+    assert_eq!(sole_invoke_purpose(&fx), InvokePurpose::TrdCrd, "the pipeline advances to TRD+CRD authoring");
+    assert!(p.trace.iter().any(|e| e.summary.contains("presumed cleared")));
+}
+
+#[test]
+fn workflow_skip_with_no_research_returns_a_friendly_notice() {
+    // NEW (item 7): skip with nothing in flight is a no-op beyond a notice naming the phase.
+    let mut p = project(ProjectPhase::Running, vec![]);
+    let fx = step(&mut p, Input::Command(Command::SkipResearch), 1000, 4);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Kill { .. })), "nothing to kill");
+    assert!(p.outbox.iter().any(|n| n.text.contains("no research is running to skip") && n.text.contains("running")));
+}
+
+// ---------------------------------------------------------------------------
+// drafter_model routing (design-speedup item 4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drafter_model_routes_doc_drafting_invokes_but_not_the_gate() {
+    // NEW (item 4): drafter_model overrides the model on doc-drafting invokes (persona reply,
+    // TRD+CRD) but NOT on the gate/safeguard checks.
+    let mut p = project(ProjectPhase::Drafting, vec![]);
+    p.config.drafter_model = Some("strong-drafter".to_string());
+    // A persona reply invoke carries the drafter model.
+    let fx = step(&mut p, Input::Command(Command::OfficeMessage { text: "build me a todo app".into() }), 1000, 4);
+    match invoke_effects(&fx)[0] {
+        Effect::InvokeModel { purpose, model, .. } => {
+            assert_eq!(*purpose, InvokePurpose::Persona);
+            assert_eq!(model.as_deref(), Some("strong-drafter"), "persona uses the drafter model");
+        }
+        other => panic!("expected InvokeModel, got {other:?}"),
+    }
+    // The PRD gate invoke does NOT carry the drafter model.
+    let fx2 = step(&mut p, invoke_result(InvokePurpose::Persona, Ok("```prd\n# App\n```".into())), 1100, 4);
+    let gate = invoke_effects(&fx2)
+        .into_iter()
+        .find(|e| matches!(e, Effect::InvokeModel { purpose: InvokePurpose::AssumeCheckPrd, .. }))
+        .expect("a gate invoke");
+    match gate {
+        Effect::InvokeModel { model, .. } => assert!(model.is_none(), "the gate keeps the safeguard role's model"),
+        _ => unreachable!(),
+    }
+
+    // The combined TRD+CRD authoring invoke also carries the drafter model.
+    let mut p2 = project(ProjectPhase::Drafting, vec![]);
+    p2.config.drafter_model = Some("strong-drafter".to_string());
+    p2.prd_markdown = "# App".into();
+    p2.gate_cleared = true;
+    p2.research = Some(researcher_binding(9, 1));
+    let fx3 = step(&mut p2, Input::Host(HostEvent::Result { agent_id: 9, text: "OFFICE-RESEARCH\nfindings: - x\n".into() }), 1200, 4);
+    match invoke_effects(&fx3)[0] {
+        Effect::InvokeModel { purpose, model, .. } => {
+            assert_eq!(*purpose, InvokePurpose::TrdCrd);
+            assert_eq!(model.as_deref(), Some("strong-drafter"), "TRD+CRD authoring uses the drafter model");
+        }
+        other => panic!("expected InvokeModel, got {other:?}"),
+    }
+}
+
+#[test]
+fn config_set_research_mode_and_drafter_model_roundtrip() {
+    // NEW (item 4): the two new config knobs apply (and research_mode rejects unknown values;
+    // drafter_model empty-string clears).
+    let mut p = project(ProjectPhase::Interrupted, vec![]);
+    assert_eq!(p.config.research_mode, "auto", "default research_mode is auto");
+    let cfg = |research_mode: Option<&str>, drafter: Option<&str>| Command::ConfigSet {
+        max_workers: None, bounce_budget: None, worker_model: None, reviewer_model: None,
+        keep_desks: None, crd_pass_grade: None, assumption_check: None, assumption_mode: None,
+        research_mode: research_mode.map(str::to_string),
+        drafter_model: drafter.map(str::to_string),
+    };
+    step(&mut p, Input::Command(cfg(Some("always"), Some("m1"))), 1000, 4);
+    assert_eq!(p.config.research_mode, "always");
+    assert_eq!(p.config.drafter_model.as_deref(), Some("m1"));
+    // Unknown research_mode ignored; empty drafter clears.
+    step(&mut p, Input::Command(cfg(Some("banana"), Some(""))), 1000, 4);
+    assert_eq!(p.config.research_mode, "always", "unknown research_mode ignored");
+    assert_eq!(p.config.drafter_model, None, "empty string clears the drafter override");
 }

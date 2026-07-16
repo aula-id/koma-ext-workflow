@@ -11,6 +11,7 @@ import OfficeMap from './OfficeMap';
 import TraceLog from './TraceLog';
 import ConfirmButton from '../components/ConfirmButton';
 import { docCards, DocCard } from '../lib/docCards';
+import { isResearchLive } from '../lib/officeLayout';
 
 /** Project shape, full mode, per docs/PANEL_PROTOCOL.md 2.1 (frozen W7 contract). */
 export interface ProjectPhase {
@@ -399,6 +400,20 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
     }
   };
 
+  // `skip` (design-speedup item 7, workflow_skip): same panel-op door as interrupt/resume above —
+  // kills the in-flight researcher and advances the drafting pipeline. Only ever sent while
+  // `isResearchLive(project)` is true (the button itself is gated the same way), so the daemon's
+  // "no research in flight" no-op path is never hit from a stale click.
+  const runSkip = async () => {
+    if (!project) return;
+    try {
+      const res = await bridge.send({ op: 'skip', project: project.id });
+      if (res?.error) setToast(res.error);
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : 'skip failed');
+    }
+  };
+
   if (!project) {
     return (
       <div style={{ padding: '2rem', color: 'var(--wf-dim)' }}>
@@ -456,6 +471,13 @@ export const Board: React.FC<BoardProps> = ({ projectId, onBack, onSettings: _on
             )}
             {phaseKind === 'interrupted' && (
               <ConfirmButton label="resume" className="wf-btn wf-btn-accent" onConfirm={() => void runResume()} testId="resume-btn" />
+            )}
+            {/* Skip research (design-speedup item 7): only while the project-level researcher is
+                actually in flight (`researchActive`/`research` binding, same signal the office map's
+                researcher desk animates off) — disappears the moment research settles, same as the
+                trace-only "research: spawned"/"done" pair it mirrors. */}
+            {isResearchLive(project) && (
+              <ConfirmButton label="skip research" className="wf-btn" onConfirm={() => void runSkip()} testId="skip-research-btn" />
             )}
           </div>
         </div>

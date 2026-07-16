@@ -245,6 +245,23 @@ pub struct ProjectConfig {
     /// default flips to autonomous.)
     #[serde(default = "default_assumption_mode")]
     pub assumption_mode: String,
+    /// Whether — and how eagerly — the drafting pipeline runs the web-research analyst (design-
+    /// speedup): `"always"` = always research (the pre-speedup behavior), `"never"` = skip research
+    /// entirely (trace `research skipped (config)`), `"auto"` (default) = ask the PRD safeguard-gate
+    /// model one extra boolean (is the stack entirely mainstream/well-known?) and skip research when
+    /// it says yes. Only those three values are accepted; any other is ignored like an absent field.
+    /// Named-fn default `"auto"` (not `#[serde(default)]`, which would force an empty string) so
+    /// legacy state files load with the auto policy.
+    #[serde(default = "default_research_mode")]
+    pub research_mode: String,
+    /// Optional model override for the DOC-DRAFTING invokes only (design-speedup): the PRD persona
+    /// reply, the combined TRD+CRD authoring invoke, and the ask-mode auto-resolve rewrite. When
+    /// `Some`, those invokes carry it as the `models.invoke` `model` param (mirroring how
+    /// `worker_model`/`reviewer_model` ride `sessions.spawn_into`); the gate/safeguard checks keep
+    /// resolving against `safeguard_role` with no override. `None` (default) = every invoke resolves
+    /// its role's model as before. `#[serde(default)]` (None) for back-compat.
+    #[serde(default)]
+    pub drafter_model: Option<String>,
 }
 
 fn default_crd_pass_grade() -> u32 {
@@ -263,6 +280,10 @@ fn default_assumption_mode() -> String {
     "auto".to_string()
 }
 
+fn default_research_mode() -> String {
+    "auto".to_string()
+}
+
 impl ProjectConfig {
     pub fn default_config() -> Self {
         Self {
@@ -277,6 +298,8 @@ impl ProjectConfig {
             assumption_check: default_assumption_check(),
             safeguard_role: default_safeguard_role(),
             assumption_mode: default_assumption_mode(),
+            research_mode: default_research_mode(),
+            drafter_model: None,
         }
     }
 }
@@ -388,6 +411,37 @@ pub struct Project {
     /// pre-feature state files (which never encode it) still load clean.
     #[serde(default)]
     pub interrupted_from: Option<ProjectPhase>,
+    /// Whether the CURRENT drafting doc-set's safeguard gate has cleared (design-speedup one-shot
+    /// gate + parallel joins). Because the pipeline authors PRD then TRD+CRD strictly in order and
+    /// each fresh capture resets this, ONE flag serves both join points: during the PRD stage it
+    /// records "PRD gate cleared" (the research join in `maybe_author_trdcrd`); during the TRD+CRD
+    /// stage it records "TRD+CRD gate cleared" (the breakdown join in `maybe_apply_breakdown`). Reset
+    /// to `false` on every fresh doc capture (PRD or TRD+CRD). `#[serde(default)]` (false) for
+    /// back-compat.
+    #[serde(default)]
+    pub gate_cleared: bool,
+    /// A validated epic/story/task breakdown computed EARLY — as soon as the TRD is captured, in
+    /// parallel with the TRD+CRD gate verify (design-speedup item 8) — and stashed here as its raw
+    /// (already-parsed-once) model text until the gate clears, at which point it is re-parsed and
+    /// applied to build the board (`maybe_apply_breakdown`, Drafting -> Ready). Discarded on a fresh
+    /// TRD+CRD capture (a revised TRD invalidates the stale plan — "breakdown redone"). Raw text
+    /// rather than the parsed `office::Breakdown` so the domain layer need not depend on `office`.
+    /// `#[serde(default)]` (None) for back-compat.
+    #[serde(default)]
+    pub pending_breakdown: Option<String>,
+    /// Runtime-only hint (review finding, migration self-heal): "a PRD gate (`AssumeCheckPrd` /
+    /// resolve / verify) invoke was fired by THIS process and may still be in flight". Set `true`
+    /// at every PRD-stage invoke emission (`gate_doc`, `emit_resolve`, `emit_verify`, each gated on
+    /// `Deferred::PostPrd`) and `false` at every terminal PRD-stage outcome (`run_gate_cleared`'s
+    /// PostPrd arm covers clean/fail-open/approved/verified; `freeze_critical` covers the
+    /// critical-freeze arm). Deliberately `#[serde(skip)]` — an in-flight invoke can never survive
+    /// a daemon restart or lease transfer, so it is NOT persisted and always deserializes to
+    /// `false`. That is exactly what makes it the authoritative "no gate outcome can ever arrive"
+    /// signal for [`self_heal_stale_prd_gate`] in kernel.rs: a project freshly loaded from disk has
+    /// this `false` regardless of what a pre-migration build's in-memory state looked like, so a
+    /// settling research binding heals the gate on first settle instead of wedging forever.
+    #[serde(skip)]
+    pub gate_invoke_live_hint: bool,
     pub seq: u64,
 }
 

@@ -366,6 +366,8 @@ fn panel_msg_config_set_project_create_archive_prd_get_task_detail() {
             assumption_check: Some(false),
             // Autonomous-safeguard pivot: assumptionMode parses through end-to-end.
             assumption_mode: Some("ask".to_string()),
+            research_mode: None,
+            drafter_model: None,
         }
     );
 

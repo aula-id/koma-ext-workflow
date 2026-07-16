@@ -161,6 +161,9 @@ fn seed_project(store: &Store, slug: &str) {
         outbox: Vec::new(),
         trace: Vec::new(),
         interrupted_from: None,
+        gate_cleared: false,
+        gate_invoke_live_hint: false,
+        pending_breakdown: None,
         seq: 0,
     };
     store.save_project(&p).unwrap();
