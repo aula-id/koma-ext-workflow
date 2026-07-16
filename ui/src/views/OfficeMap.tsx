@@ -5,8 +5,9 @@ import {
   DESK,
   TABLE,
   PersonaPresence,
+  ForbiddenRect,
   idleAssignmentsFor,
-  idlePersonasFor,
+  idleWanderPoolFor,
   isAuditLive,
   isDraftingFamilyActivity,
   isResearchLive,
@@ -47,6 +48,32 @@ const BUB_W = 36;
 const BUB_H = 30;
 const STAFF = 48;
 
+/** 1-tile margin unit for ambient idle-life forbidden zones (feature: ambient-idle-life bug 1) —
+ * matches the floor tile background size / a worker sprite's footprint, so a wander waypoint
+ * never lands within "arm's reach" of a desk/table/cooler, not just literally on top of one. */
+const IDLE_FORBID_MARGIN = 48;
+
+/** Converts a fixture's pixel-space bounding box (as already used to render it) into a
+ * `ForbiddenRect` normalized to the ambient-idle-life wander box's 0..1 space, expanded by
+ * `IDLE_FORBID_MARGIN` on every side. Pure/deterministic — same box, same fraction, every call. */
+function toForbiddenRect(
+  left: number,
+  top: number,
+  w: number,
+  h: number,
+  box: { left: number; top: number; right: number; bottom: number },
+  margin: number = IDLE_FORBID_MARGIN,
+): ForbiddenRect {
+  const boxW = Math.max(1, box.right - box.left);
+  const boxH = Math.max(1, box.bottom - box.top);
+  return {
+    x0: (left - margin - box.left) / boxW,
+    y0: (top - margin - box.top) / boxH,
+    x1: (left + w + margin - box.left) / boxW,
+    y1: (top + h + margin - box.top) / boxH,
+  };
+}
+
 interface OfficeMapProps {
   project: Project;
   onTaskClick: (taskId: string) => void;
@@ -72,13 +99,32 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
+/** Cross-mount tick memory (feature: ambient-idle-life bug 2b): `OfficeMap` unmounts whenever
+ * Board.tsx switches away from the office tab and remounts when the user switches back. A plain
+ * `useState(0)` restarts the whole animation/idle-life clock from zero on every remount, which
+ * reads as every idle sprite (and the PM pacing, monitor blink, etc.) snapping back to its tick-0
+ * pose on every tab switch. A module-level value survives that unmount/remount (it only resets on
+ * a full page reload), so switching tabs resumes the clock instead of restarting it. */
+let sharedTick = 0;
+
+/** Test-only: reset the cross-mount tick so each test starts from a known tick=0, the same
+ * guarantee a fresh page load gives production. Without this, `sharedTick` would leak across
+ * `it()` blocks in the same test file/process and any test asserting "at mount" behavior (e.g. the
+ * meeting-room ceremony's first transcript line) would depend on run order. */
+export function __resetOfficeTickForTests(): void {
+  sharedTick = 0;
+}
+
 /** A single monotonic animation clock. All frames derive from this one tick, so the office
- * needs exactly one interval; `enabled=false` (reduced motion) freezes it at 0. */
+ * needs exactly one interval; `enabled=false` (reduced motion) freezes it wherever it last was. */
 function useTick(baseMs: number, enabled: boolean): number {
-  const [tick, setTick] = useState(0);
+  const [tick, setTick] = useState(sharedTick);
   useEffect(() => {
     if (!enabled) return;
-    const id = setInterval(() => setTick((t) => (t + 1) % 1_000_000), baseMs);
+    const id = setInterval(() => {
+      sharedTick = (sharedTick + 1) % 1_000_000;
+      setTick(sharedTick);
+    }, baseMs);
     return () => clearInterval(id);
   }, [baseMs, enabled]);
   return tick;
@@ -152,8 +198,13 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
   // else — no extra timers, so it's free while the office tab is hidden (OfficeMap unmounts when
   // Board.tsx switches tabs, which clears `useTick`'s interval) and inert when reduced motion
   // freezes `tick` at 0.
-  const idlePersonas = idlePersonasFor(presence, sprintReview ? attendees : []);
-  const idleAssignments = useMemo(() => idleAssignmentsFor(idlePersonas, tick), [idlePersonas, tick]);
+  //
+  // Population cap: the office only *employs* `maxWorkers` bodies total (desks + idle wanderers
+  // combined) — `idleWanderPoolFor` returns at most `maxWorkers - occupiedCount` personas (zero
+  // when every employed slot is already at a desk), preferring personas with a track record on
+  // this project before padding from the roster. This is what keeps a maxWorkers=2 project from
+  // showing all 8 unused roster personas milling around the floor.
+  const idlePersonas = idleWanderPoolFor(project as any, presence, sprintReview ? attendees : []);
 
   // Derived animation frames (all from the single tick).
   const typeFrame = Math.floor(tick / 2) % 2 === 0 ? 'type_a' : 'type_b';
@@ -172,15 +223,51 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
   const meetingRows = Math.max(1, Math.ceil(attendees.length / TABLE.cols));
   const meetingContentBottom = TABLE.padY + TABLE.seatH * (meetingRows + 1) + 40;
   const contentBottom = sprintReview ? Math.max(deskContentBottom, meetingContentBottom) : deskContentBottom;
-  const IDLE_LANE_H = 64; // ambient idle-life band, between the desks/table area and the PM lane
+  // ambient idle-life band, between the desks/table area and the PM lane — tall enough for
+  // genuine 2D wandering (both axes), not just a thin horizontal strip.
+  const IDLE_LANE_H = 170;
   const width = Math.max(cols + DESK.cellW + DESK.padX, 520) + 120; // +120 left bookshelf lane
   const height = contentBottom + IDLE_LANE_H + 120; // +120 bottom PM lane
   const floorLeft = 120; // desks + staff shift right of the bookshelf lane
-  const idleLaneY = contentBottom + 14;
+
+  // Fixed idle-life furniture (water cooler, gossip/commons table) anchors near the top of the
+  // band, same spot the old single-row lane used.
+  const furnitureY = contentBottom + 14;
   const coolerX = floorLeft + 20;
   const commonsX = floorLeft + 130;
-  const wanderLeft = floorLeft + 230;
-  const wanderRight = Math.max(wanderLeft + 100, width - 140);
+
+  // The 2D wander box (feature: ambient-idle-life bug 1): the whole band, not a horizontal lane —
+  // `idleAssignmentsFor` samples waypoints as 0..1 fractions of this box on BOTH axes.
+  const wanderBoxLeft = floorLeft + 20;
+  const wanderBoxRight = Math.max(wanderBoxLeft + 200, width - 100);
+  const wanderBoxTop = contentBottom + 8;
+  const wanderBoxBottom = contentBottom + IDLE_LANE_H - 8;
+
+  // Forbidden zones for wander waypoints (feature: ambient-idle-life bug 1): desks (or, during a
+  // review, the meeting table + its seats), plus the gossip/commons table and the water cooler —
+  // each margin-expanded by `toForbiddenRect` so a waypoint never lands on or hugging a fixture.
+  const forbidden = useMemo<ForbiddenRect[]>(() => {
+    const box = { left: wanderBoxLeft, top: wanderBoxTop, right: wanderBoxRight, bottom: wanderBoxBottom };
+    const rects: ForbiddenRect[] = [];
+    if (!sprintReview) {
+      for (const d of desks) {
+        rects.push(toForbiddenRect(floorLeft + d.x, d.y, DESK.cellW, DESK.cellH, box));
+      }
+    } else {
+      rects.push(toForbiddenRect(floorLeft + TABLE.padX - 20, TABLE.padY + 40, TABLE.seatW * 2 + 40, 110, box));
+      for (const seat of seats) {
+        rects.push(toForbiddenRect(floorLeft + seat.x, seat.y, WORKER, WORKER + 46, box));
+      }
+    }
+    rects.push(toForbiddenRect(commonsX - 34, furnitureY - 8, 140, 56, box));
+    rects.push(toForbiddenRect(coolerX - 10, furnitureY - 34, 40, 50, box));
+    return rects;
+  }, [sprintReview, desks, seats, floorLeft, commonsX, coolerX, furnitureY, wanderBoxLeft, wanderBoxTop, wanderBoxRight, wanderBoxBottom]);
+
+  const idleAssignments = useMemo(
+    () => idleAssignmentsFor(idlePersonas, tick, forbidden),
+    [idlePersonas, tick, forbidden],
+  );
 
   const phaseKind = project?.phase?.kind;
   const pmPacing = phaseKind === 'drafting' || phaseKind === 'ready';
@@ -487,10 +574,12 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
           )}
 
           {/* Ambient idle life (feature: ambient-idle-life): personas with no active task (and,
-              during a review, not seated at the meeting table) wander the floor, gossip-pair at
-              the empty commons table, or visit the water cooler, instead of standing frozen.
-              Positions are deterministic per `(idlePersonas, tick)` (`idleAssignmentsFor` — see
-              officeLayout.ts, no `Math.random`), so this is reproducible frame-to-frame. */}
+              during a review, not seated at the meeting table) wander the floor in genuine 2D
+              (both axes, avoiding desks/table/cooler — see the `forbidden` zones above),
+              gossip-pair at the empty commons table, or visit the water cooler, instead of
+              standing frozen. Positions are deterministic per `(idlePersonas, tick, forbidden)`
+              (`idleAssignmentsFor` — see officeLayout.ts, no `Math.random`), so this is
+              reproducible frame-to-frame. */}
           <React.Fragment>
             {/* Water cooler — a fixture on the map like the researcher's bookshelf, present even
                 when nobody is visiting it. */}
@@ -499,7 +588,7 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
               style={{
                 position: 'absolute',
                 left: coolerX - 2,
-                top: idleLaneY - 30,
+                top: furnitureY - 30,
                 width: 22,
                 height: 34,
                 background: 'var(--wf-panel)',
@@ -514,7 +603,7 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
               style={{
                 position: 'absolute',
                 left: coolerX - 30,
-                top: idleLaneY + 6,
+                top: furnitureY + 6,
                 width: 80,
                 textAlign: 'center',
                 fontSize: '0.58rem',
@@ -526,12 +615,13 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
             </div>
 
             {/* Commons table — an empty desk + two chairs, the gossip spot. */}
-            <Sprite src={`${S}desk.png`} left={commonsX - 4} top={idleLaneY - 4} w={DESK_W} h={DESK_H} z={1} />
-            <Sprite src={`${S}chair.png`} left={commonsX - 30} top={idleLaneY - 2} w={36} h={36} z={1} />
-            <Sprite src={`${S}chair.png`} left={commonsX + 62} top={idleLaneY - 2} w={36} h={36} z={1} flip />
+            <Sprite src={`${S}desk.png`} left={commonsX - 4} top={furnitureY - 4} w={DESK_W} h={DESK_H} z={1} />
+            <Sprite src={`${S}chair.png`} left={commonsX - 30} top={furnitureY - 2} w={36} h={36} z={1} />
+            <Sprite src={`${S}chair.png`} left={commonsX + 62} top={furnitureY - 2} w={36} h={36} z={1} flip />
 
             {idleAssignments.map((a) => {
               let left: number;
+              let top: number = furnitureY;
               let flip = false;
               if (a.activity === 'cooler') {
                 left = coolerX + 10;
@@ -540,11 +630,15 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
                 left = isLeftSeat ? commonsX - 14 : commonsX + 46;
                 flip = !isLeftSeat;
               } else {
-                const wA = a.waypointA ?? 0;
-                const wB = a.waypointB ?? 0;
-                const frac = wA + (wB - wA) * a.t;
-                left = wanderLeft + frac * (wanderRight - wanderLeft);
-                flip = wB < wA;
+                // Wander: genuine 2D — interpolate BOTH axes between the two sampled waypoints
+                // (dwelling holds `a.t` at 0, which resolves to waypointA — i.e. stay put).
+                const wA = a.waypointA ?? { x: 0, y: 0 };
+                const wB = a.waypointB ?? { x: 0, y: 0 };
+                const fracX = wA.x + (wB.x - wA.x) * a.t;
+                const fracY = wA.y + (wB.y - wA.y) * a.t;
+                left = wanderBoxLeft + fracX * (wanderBoxRight - wanderBoxLeft);
+                top = wanderBoxTop + fracY * (wanderBoxBottom - wanderBoxTop);
+                flip = a.flip ?? false;
               }
               return (
                 <div
@@ -552,7 +646,8 @@ export const OfficeMap: React.FC<OfficeMapProps> = ({ project, onTaskClick }) =>
                   data-testid="idle-sprite"
                   data-persona={a.persona}
                   data-activity={a.activity}
-                  style={{ position: 'absolute', left, top: idleLaneY, width: WORKER, height: WORKER + 20, zIndex: 2 }}
+                  data-dwelling={a.dwelling ? 'true' : 'false'}
+                  style={{ position: 'absolute', left, top, width: WORKER, height: WORKER + 20, zIndex: 2 }}
                 >
                   <Sprite src={`${S}worker_${a.persona}_idle.png`} left={0} top={0} w={WORKER} h={WORKER} z={2} flip={flip} />
                   {a.bubble && !reduced && (
