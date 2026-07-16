@@ -26,6 +26,39 @@ export interface Epic {
   stories: string[];
 }
 
+/** One line of a sprint-review ceremony transcript (feature: sprints), per office-core
+ * digest.rs's wire shape (the domain `SprintLine { speaker, line }` renamed on the wire —
+ * `text`, not `line`). */
+export interface SprintTranscriptLine {
+  speaker: string;
+  text: string;
+}
+
+/** One sprint of a project-track plan (feature: sprints), per office-core digest.rs's
+ * `sprints[]` wire entry. `status` is the wire string exactly as emitted — note `'inreview'`
+ * (lowercase, no camelCase), unlike `ActiveSprint.inReview` below. `transcript` is present only
+ * while `status === 'inreview'`. */
+export interface Sprint {
+  index: number;
+  goal: string;
+  status: 'pending' | 'active' | 'inreview' | 'done';
+  total: number;
+  done: number;
+  tasks: string[];
+  transcript?: SprintTranscriptLine[];
+}
+
+/** Pointer to the project's CURRENT sprint (feature: sprints), per office-core digest.rs's
+ * `activeSprint` wire object. Present only when a sprint is Active or InReview. */
+export interface ActiveSprint {
+  index: number;
+  count: number;
+  goal: string;
+  total: number;
+  done: number;
+  inReview: boolean;
+}
+
 export interface Story {
   id: string;
   title: string;
@@ -100,6 +133,11 @@ export interface Project {
   /** SDLC intake track (feature: sdlc-triage): `'project'` | `'enhancement'` | `'patch'`.
    * Optional — absent on older snapshots renders no badge (back-compat). */
   track?: string;
+  /** Full sprint list + the current-sprint pointer (feature: sprints), full snapshot only.
+   * Both absent on a pre-sprints / no-sprint-track snapshot (back-compat: the office view
+   * renders its classic desk-grid scene unchanged). */
+  sprints?: Sprint[];
+  activeSprint?: ActiveSprint | null;
 }
 
 const COLUMNS: { key: ColumnKey; label: string }[] = [
